@@ -1,0 +1,217 @@
+package gitops
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func run(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@example.com",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out)
+}
+
+// newRepo는 커밋 하나가 있는 저장소를 만든다.
+func newRepo(t *testing.T) (repoPath, worktreeRoot string) {
+	t.Helper()
+	base := t.TempDir()
+	repoPath = filepath.Join(base, "repo")
+	worktreeRoot = filepath.Join(base, "worktrees")
+
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, repoPath, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repoPath, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, repoPath, "add", "README.md")
+	run(t, repoPath, "commit", "-q", "-m", "initial")
+	return repoPath, worktreeRoot
+}
+
+func TestBranchAndPathAreDeterministic(t *testing.T) {
+	repo, root := newRepo(t)
+	m := New(repo, root)
+
+	if got, want := m.BranchName("run-1"), "taskyard/run/run-1"; got != want {
+		t.Errorf("BranchName = %q, want %q", got, want)
+	}
+	if m.WorktreePath("run-1") != m.WorktreePath("run-1") {
+		t.Error("WorktreePath is not stable across calls")
+	}
+}
+
+func TestEnsureCreatesWorktreeOnBranch(t *testing.T) {
+	repo, root := newRepo(t)
+	m := New(repo, root)
+
+	ws, err := m.Ensure(context.Background(), "run-1", "main")
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if !ws.Created {
+		t.Error("Created = false on first Ensure")
+	}
+	if _, err := os.Stat(filepath.Join(ws.Path, "README.md")); err != nil {
+		t.Fatalf("worktree is missing repo content: %v", err)
+	}
+
+	branch := strings.TrimSpace(run(t, ws.Path, "rev-parse", "--abbrev-ref", "HEAD"))
+	if branch != "taskyard/run/run-1" {
+		t.Fatalf("worktree branch = %q, want taskyard/run/run-1", branch)
+	}
+}
+
+func TestEnsureIsIdempotent(t *testing.T) {
+	repo, root := newRepo(t)
+	m := New(repo, root)
+	ctx := context.Background()
+
+	first, err := m.Ensure(ctx, "run-1", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 같은 run.start 명령이 재전송돼도 worktree가 또 생기면 안 된다(GH-09).
+	second, err := m.Ensure(ctx, "run-1", "main")
+	if err != nil {
+		t.Fatalf("second Ensure: %v", err)
+	}
+	if second.Created {
+		t.Error("Created = true on repeat Ensure; must reuse")
+	}
+	if second.Path != first.Path {
+		t.Errorf("path changed: %q then %q", first.Path, second.Path)
+	}
+
+	out := run(t, repo, "worktree", "list")
+	if n := strings.Count(out, "taskyard/run/run-1"); n != 1 {
+		t.Fatalf("worktree list mentions the branch %d times, want 1:\n%s", n, out)
+	}
+}
+
+func TestStatusReportsDirtyPaths(t *testing.T) {
+	repo, root := newRepo(t)
+	m := New(repo, root)
+	ctx := context.Background()
+
+	ws, err := m.Ensure(ctx, "run-1", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clean, err := m.Status(ctx, "run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clean.Dirty {
+		t.Error("fresh worktree reported dirty")
+	}
+
+	if err := os.WriteFile(filepath.Join(ws.Path, "new.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dirty, err := m.Status(ctx, "run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dirty.Dirty {
+		t.Fatal("worktree with a new file reported clean")
+	}
+	if len(dirty.ChangedPaths) != 1 || dirty.ChangedPaths[0] != "new.txt" {
+		t.Fatalf("ChangedPaths = %v, want [new.txt]", dirty.ChangedPaths)
+	}
+}
+
+func TestSalvageCommitsUncommittedWork(t *testing.T) {
+	repo, root := newRepo(t)
+	m := New(repo, root)
+	ctx := context.Background()
+
+	ws, err := m.Ensure(ctx, "run-1", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws.Path, "wip.txt"), []byte("half done\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sha, saved, err := m.Salvage(ctx, "run-1")
+	if err != nil {
+		t.Fatalf("Salvage: %v", err)
+	}
+	if !saved {
+		t.Fatal("saved = false despite uncommitted changes")
+	}
+	if sha == "" {
+		t.Fatal("Salvage returned an empty sha")
+	}
+
+	after, err := m.Status(ctx, "run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Dirty {
+		t.Error("worktree still dirty after Salvage")
+	}
+
+	body := run(t, ws.Path, "show", "--stat", "--format=%s", sha)
+	if !strings.Contains(body, "wip.txt") {
+		t.Fatalf("salvage commit does not contain wip.txt:\n%s", body)
+	}
+}
+
+func TestSalvageIsNoOpOnCleanWorktree(t *testing.T) {
+	repo, root := newRepo(t)
+	m := New(repo, root)
+	ctx := context.Background()
+
+	if _, err := m.Ensure(ctx, "run-1", "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	sha, saved, err := m.Salvage(ctx, "run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved {
+		t.Errorf("saved = true on a clean worktree (sha %q)", sha)
+	}
+}
+
+func TestDiffShowsChangesAgainstBase(t *testing.T) {
+	repo, root := newRepo(t)
+	m := New(repo, root)
+	ctx := context.Background()
+
+	ws, err := m.Ensure(ctx, "run-1", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws.Path, "README.md"), []byte("hello\nworld\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	diff, err := m.Diff(ctx, "run-1", "main")
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	if !strings.Contains(diff, "+world") {
+		t.Fatalf("diff does not show the added line:\n%s", diff)
+	}
+}
