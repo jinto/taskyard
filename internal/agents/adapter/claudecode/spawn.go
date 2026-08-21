@@ -44,6 +44,14 @@ var bannedEnvKeys = []string{
 	"ANTHROPIC_AWS_WORKSPACE_ID",
 	"ANTHROPIC_FOUNDRY_API_KEY",
 	"ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+
+	// Workload Identity Federation / Anthropic 프로필: 문서에 "/login 자격증명보다
+	// 우선한다"고 명시되어 있다. 즉 /login 구독 로그인이 남아 있어도 이 값들이
+	// 있으면 과금이 다른 신원으로 넘어간다.
+	"ANTHROPIC_FEDERATION_RULE_ID",
+	"ANTHROPIC_ORGANIZATION_ID",
+	"ANTHROPIC_WORKSPACE_ID",
+	"ANTHROPIC_PROFILE",
 }
 
 type SpawnOptions struct {
