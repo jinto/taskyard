@@ -228,6 +228,7 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID,
 	cmd := exec.CommandContext(ctx, m.cfg.ClaudeBinary, args...)
 	cmd.Dir = ws.Path
 	cmd.Env = claudecode.ScrubEnv(os.Environ())
+	cmd.Stderr = os.Stderr
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -301,13 +302,17 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID,
 	switch {
 	case parseErr != nil:
 		record.State = m.terminalState(runID)
-		_ = m.cfg.Spool.SaveRun(record)
+		// 반드시 보존이 먼저다(Reconcile과 같은 순서, reconcile.go 참고).
+		// 여기서 죽으면 재시작 후 Reconcile이 이미 종결 상태를 보고
+		// 이 Run을 다시 살펴보지 않으므로, salvage를 SaveRun보다 앞에
+		// 둬야 그 창에서 실행이 끊겨도 보존이 유실되지 않는다.
 		m.salvage(runID)
+		_ = m.cfg.Spool.SaveRun(record)
 		m.fail(runID, fmt.Errorf("parse stream: %w", parseErr))
 	case waitErr != nil:
 		record.State = m.terminalState(runID)
-		_ = m.cfg.Spool.SaveRun(record)
 		m.salvage(runID)
+		_ = m.cfg.Spool.SaveRun(record)
 		m.fail(runID, fmt.Errorf("agent exited: %w", waitErr))
 	case session.APIKeySource != "none":
 		// init이 아예 없었거나(APIKeySource == "") 왔지만 구독 로그인임을
@@ -315,8 +320,8 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID,
 		// 조기 검사가 한 번도 실행되지 못한 경우(예: init 다음에 곧바로
 		// result만 오는 스트림)의 마지막 방어선이기도 하다(PRD §13.2).
 		record.State = "failed"
-		_ = m.cfg.Spool.SaveRun(record)
 		m.salvage(runID)
+		_ = m.cfg.Spool.SaveRun(record)
 		m.fail(runID, fmt.Errorf("agent's billing identity is not a verified subscription login (apiKeySource=%q); refusing to continue", session.APIKeySource))
 	default:
 		record.State = "succeeded"

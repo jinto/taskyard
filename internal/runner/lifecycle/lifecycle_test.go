@@ -361,6 +361,70 @@ func TestRunFailsWhenInitOmitsAPIKeySource(t *testing.T) {
 	}
 }
 
+// TestRunSalvagesUncommittedWorkWhenAgentExitsNonZero은 execute의 waitErr
+// 분기를 검증한다. 이 분기는 지금까지 어떤 테스트도 건드리지 않았다.
+// salvage가 실제로 커밋을 남기는지 확인해, SaveRun보다 salvage를 앞에 두는
+// 순서로 바꾼 뒤에도 보존 자체는 여전히 일어남을 보장한다(reconcile.go의
+// "반드시 보존이 먼저다"와 같은 순서).
+func TestRunSalvagesUncommittedWorkWhenAgentExitsNonZero(t *testing.T) {
+	col := &collector{}
+	repo, worktrees := newRepo(t)
+	sp, err := spool.Open(filepath.Join(t.TempDir(), "spool.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sp.Close() })
+
+	git := gitops.New(repo, worktrees)
+
+	// worktree를 더럽힌 뒤 0이 아닌 코드로 종료하는 가짜 Agent.
+	script := filepath.Join(t.TempDir(), "dirty-then-fail")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho dirty > uncommitted.txt\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := lifecycle.New(lifecycle.Config{
+		Spool:        sp,
+		Git:          git,
+		Broker:       approval.New("tok"),
+		BaseBranch:   "main",
+		BrokerURL:    "http://127.0.0.1:9999/mcp",
+		BrokerToken:  "tok",
+		ClaudeBinary: script,
+		Publish:      col.publish,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := m.HandleCommand(ctx, startCommand(t, "run-1", "say pong")); err != nil {
+		t.Fatalf("HandleCommand: %v", err)
+	}
+
+	waitFor(t, "terminal state change", func() bool {
+		return col.count(protocol.EvRunStateChanged) >= 2
+	})
+
+	runs, err := sp.LoadRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].State != "failed" {
+		t.Fatalf("ledger = %+v, want exactly one failed run", runs)
+	}
+
+	log, err := exec.Command("git", "-C", git.WorktreePath("run-1"), "log", "--oneline", "-1").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git log: %v\n%s", err, log)
+	}
+	if !strings.Contains(string(log), "taskyard salvage run-1") {
+		t.Fatalf("salvage commit missing, git log: %s", log)
+	}
+}
+
 func newJSONRequest(t *testing.T, body, token string) *http.Request {
 	t.Helper()
 	r := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
