@@ -315,7 +315,20 @@ func TestApprovalRequestBecomesAnEventAndDecisionFlowsBack(t *testing.T) {
 	}
 
 	<-done
-	if !strings.Contains(rec.Body.String(), `"behavior":"allow"`) {
-		t.Fatalf("blocked tools/call did not resolve to an allow result: %s", rec.Body.String())
+	var rpcResp struct {
+		Result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &rpcResp); err != nil {
+		t.Fatalf("unmarshal tools/call response: %v (body: %s)", err, rec.Body.String())
+	}
+	if len(rpcResp.Result.Content) != 1 {
+		t.Fatalf("tools/call response has %d content blocks, want 1 (body: %s)", len(rpcResp.Result.Content), rec.Body.String())
+	}
+	if !strings.Contains(rpcResp.Result.Content[0].Text, `"behavior":"allow"`) {
+		t.Fatalf("blocked tools/call did not resolve to an allow result: %s", rpcResp.Result.Content[0].Text)
 	}
 }
