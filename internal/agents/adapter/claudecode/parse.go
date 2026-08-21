@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/jinto/taskyard/internal/agents/adapter"
 	"github.com/jinto/taskyard/internal/protocol"
@@ -19,14 +20,21 @@ import (
 const maxLineBytes = 8 << 20 // 8MB
 
 type Parser struct {
+	mu      sync.RWMutex
 	session adapter.SessionInfo
 }
 
 func NewParser() *Parser { return &Parser{} }
 
-// Session은 init 이벤트에서 읽은 세션 정보를 돌려준다. Parse 도중이나
-// 이후에 호출한다.
-func (p *Parser) Session() adapter.SessionInfo { return p.session }
+// Session은 init 이벤트에서 읽은 세션 정보를 돌려준다. mu로 보호되므로
+// Parse가 다른 goroutine에서 스트림을 읽는 동안 호출해도 안전하다.
+// Task 9의 감독 goroutine은 init이 도착하는 즉시 UsesAPIKey()로 조기
+// 중단을 판단해야 하므로, Parse가 끝나기를 기다리지 않고 동시에 호출한다.
+func (p *Parser) Session() adapter.SessionInfo {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.session
+}
 
 // Parse는 NDJSON을 끝까지 읽으며 정규화 이벤트마다 emit을 호출한다.
 // 깨진 줄 하나가 스트림 전체를 죽이지 않도록, 파싱 실패는 error 이벤트로
@@ -72,12 +80,14 @@ func (p *Parser) dispatch(msg streamMessage, raw json.RawMessage, emit func(adap
 	switch msg.Type {
 	case "system":
 		if msg.Subtype == "init" {
+			p.mu.Lock()
 			p.session = adapter.SessionInfo{
 				SessionID:    msg.SessionID,
 				Model:        msg.Model,
 				Version:      msg.ClaudeCodeVersion,
 				APIKeySource: msg.APIKeySource,
 			}
+			p.mu.Unlock()
 		}
 		// hook_started, hook_response, plugin_install 등은 정규화 대상이 아니다.
 		return nil

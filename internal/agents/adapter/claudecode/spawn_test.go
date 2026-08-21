@@ -127,20 +127,63 @@ func TestBuildArgsRejectsMissingBroker(t *testing.T) {
 	}
 }
 
-func TestScrubEnvRemovesBillingKeys(t *testing.T) {
-	in := []string{
-		"PATH=/usr/bin",
-		"ANTHROPIC_API_KEY=sk-secret",
-		"ANTHROPIC_AUTH_TOKEN=tok",
-		"OPENAI_API_KEY=sk-other",
-		"CODEX_API_KEY=sk-codex",
-		"HOME=/Users/dev",
+func TestBuildArgsRejectsLeadingDashPrompt(t *testing.T) {
+	opts := baseOpts()
+	// Prompt는 "-p" 다음 값으로 그대로 argv에 들어간다. "-"로 시작하면
+	// claude가 이를 값이 아니라 별도 플래그(예: "--bare")로 파싱할 수 있다.
+	opts.Prompt = "--dangerously-skip-permissions"
+
+	if _, err := BuildArgs(opts); err == nil {
+		t.Fatal("BuildArgs accepted a Prompt starting with '-'; it could be parsed as a CLI flag")
 	}
+}
+
+func TestBuildArgsRejectsLeadingDashResumeSessionID(t *testing.T) {
+	opts := baseOpts()
+	opts.ResumeSessionID = "--bare"
+
+	if _, err := BuildArgs(opts); err == nil {
+		t.Fatal("BuildArgs accepted a ResumeSessionID starting with '-'; it could be parsed as a CLI flag")
+	}
+}
+
+func TestScrubEnvRemovesBillingKeys(t *testing.T) {
+	// 과금 우회 후보 변수 목록. https://code.claude.com/docs/en/env-vars 기준으로,
+	// 구독이 아니라 API 키/클라우드 제공자/임의 엔드포인트로 과금을 돌리는
+	// 변수만 담는다(see spawn.go의 bannedEnvKeys 주석).
+	bannedKeys := []string{
+		"ANTHROPIC_API_KEY",
+		"ANTHROPIC_AUTH_TOKEN",
+		"OPENAI_API_KEY",
+		"CODEX_API_KEY",
+		"CLAUDE_CODE_USE_BEDROCK",
+		"CLAUDE_CODE_USE_VERTEX",
+		"CLAUDE_CODE_USE_FOUNDRY",
+		"CLAUDE_CODE_USE_ANTHROPIC_AWS",
+		"CLAUDE_CODE_USE_MANTLE",
+		"ANTHROPIC_BASE_URL",
+		"ANTHROPIC_BEDROCK_BASE_URL",
+		"ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+		"ANTHROPIC_VERTEX_BASE_URL",
+		"ANTHROPIC_FOUNDRY_BASE_URL",
+		"ANTHROPIC_AWS_BASE_URL",
+		"AWS_BEARER_TOKEN_BEDROCK",
+		"ANTHROPIC_AWS_API_KEY",
+		"ANTHROPIC_AWS_WORKSPACE_ID",
+		"ANTHROPIC_FOUNDRY_API_KEY",
+		"ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+	}
+
+	in := []string{"PATH=/usr/bin"}
+	for _, k := range bannedKeys {
+		in = append(in, k+"=leaked-value")
+	}
+	in = append(in, "HOME=/Users/dev")
 
 	got := ScrubEnv(in)
 
 	for _, e := range got {
-		for _, banned := range []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY"} {
+		for _, banned := range bannedKeys {
 			if strings.HasPrefix(e, banned+"=") {
 				t.Errorf("%s survived scrubbing", banned)
 			}

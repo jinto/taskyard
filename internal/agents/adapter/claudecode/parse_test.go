@@ -3,6 +3,7 @@ package claudecode
 import (
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/jinto/taskyard/internal/agents/adapter"
@@ -197,6 +198,36 @@ func TestMalformedLineBecomesErrorEventAndParsingContinues(t *testing.T) {
 	if got[1].Type != protocol.EvTurnCompleted {
 		t.Errorf("got[1].Type = %q, want %q", got[1].Type, protocol.EvTurnCompleted)
 	}
+}
+
+func TestSessionIsSafeForConcurrentReadDuringParse(t *testing.T) {
+	// Task 9의 감독 goroutine은 Parse가 끝나기를 기다리지 않고 init이
+	// 도착하는 즉시 Session().UsesAPIKey()로 조기 중단을 판단한다. 이
+	// 테스트는 그 패턴이 -race 아래서도 안전한지 확인한다.
+	var lines []string
+	lines = append(lines, `{"type":"system","subtype":"init","session_id":"s1","model":"claude-opus-5","claude_code_version":"2.1.238","apiKeySource":"none"}`)
+	for i := 0; i < 500; i++ {
+		lines = append(lines, `{"type":"assistant","session_id":"s1","message":{"role":"assistant","content":[{"type":"text","text":"tick"}]}}`)
+	}
+	input := strings.Join(lines, "\n") + "\n"
+
+	p := NewParser()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			_ = p.Session()
+		}
+	}()
+
+	if err := p.Parse(strings.NewReader(input), func(e adapter.Event) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	wg.Wait()
 }
 
 func TestLongLinesAreHandled(t *testing.T) {
