@@ -1,0 +1,30 @@
+{{define "layout"}}<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} · Taskyard</title>
+<style>
+  :root { color-scheme: light dark; --fg: #16181d; --bg: #fbfbfa; --muted: #6b7280; --line: #e5e7eb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #e8e8e6; --bg: #16181d; --muted: #9ca3af; --line: #2c2f36; }
+  }
+  body { margin: 0; padding: 2rem; background: var(--bg); color: var(--fg);
+         font: 15px/1.6 ui-sans-serif, -apple-system, "Segoe UI", sans-serif; }
+  h1 { font-size: 1.25rem; margin: 0 0 1.5rem; }
+  a { color: inherit; }
+  .run { padding: .75rem 0; border-bottom: 1px solid var(--line); }
+  .state { font-size: .8rem; color: var(--muted); }
+  #events { margin-top: 1rem; border: 1px solid var(--line); border-radius: 6px;
+            max-height: 60vh; overflow-y: auto; }
+  .ev { padding: .5rem .75rem; border-bottom: 1px solid var(--line);
+        font-family: ui-monospace, SFMono-Regular, monospace; font-size: .8rem; }
+  .ev-type { color: var(--muted); margin-right: .5rem; }
+  .approval { margin: 1rem 0; padding: 1rem; border: 2px solid #d97706; border-radius: 6px; }
+  button { font: inherit; padding: .4rem .9rem; margin-right: .5rem; cursor: pointer; }
+</style>
+</head>
+<body>
+{{template "content" .}}
+</body>
+</html>{{end}}

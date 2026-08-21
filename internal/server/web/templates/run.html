@@ -1,0 +1,63 @@
+{{define "content"}}
+<h1><a href="/">←</a> {{.Run.ID}}</h1>
+<div class="state">{{.Run.State}} · {{.Run.Branch}}</div>
+
+<div class="approval" id="approval" hidden>
+  <div id="approval-text"></div>
+  <div class="state" id="approval-tool-use-id"></div>
+  <div style="margin-top:.75rem">
+    <button onclick="decide(true)">승인</button>
+    <button onclick="decide(false)">거절</button>
+  </div>
+</div>
+
+<div id="events">
+{{range .Events}}
+  <div class="ev"><span class="ev-type">{{.Type}}</span>{{.Summary}}</div>
+{{end}}
+</div>
+
+<!-- JS 아일랜드: 이 화면만 실시간 상태를 가진다(PRD §11.4.1) -->
+<script>
+(function () {
+  const runID = {{.Run.ID}};
+  const list = document.getElementById("events");
+  const panel = document.getElementById("approval");
+  const text = document.getElementById("approval-text");
+  const toolUseIDLabel = document.getElementById("approval-tool-use-id");
+  let pendingRequestID = null;
+
+  const source = new EventSource("/runs/" + runID + "/stream");
+
+  source.onmessage = function (msg) {
+    const ev = JSON.parse(msg.data);
+
+    const row = document.createElement("div");
+    row.className = "ev";
+    row.innerHTML = '<span class="ev-type"></span><span class="ev-body"></span>';
+    row.querySelector(".ev-type").textContent = ev.type;
+    row.querySelector(".ev-body").textContent = ev.summary;
+    list.appendChild(row);
+    list.scrollTop = list.scrollHeight;
+
+    if (ev.type === "approval_requested") {
+      pendingRequestID = ev.request_id;
+      text.textContent = ev.summary;
+      toolUseIDLabel.textContent = ev.tool_use_id ? "tool_use_id: " + ev.tool_use_id : "";
+      panel.hidden = false;
+    }
+  };
+
+  window.decide = function (allow) {
+    if (!pendingRequestID) return;
+    fetch("/runs/" + runID + "/approve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: pendingRequestID, allow: allow })
+    });
+    panel.hidden = true;
+    pendingRequestID = null;
+  };
+})();
+</script>
+{{end}}

@@ -1,0 +1,11 @@
+{{define "content"}}
+<h1>Runs</h1>
+{{range .Runs}}
+  <div class="run">
+    <a href="/runs/{{.ID}}">{{.ID}}</a>
+    <div class="state">{{.State}} · seq {{.LastAckedSeq}}{{if .Branch}} · {{.Branch}}{{end}}</div>
+  </div>
+{{else}}
+  <p class="state">아직 실행이 없습니다.</p>
+{{end}}
+{{end}}
