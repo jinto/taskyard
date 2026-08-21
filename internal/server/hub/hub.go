@@ -224,7 +224,7 @@ func (h *Hub) readLoop(ctx context.Context, conn *websocket.Conn) {
 			continue
 		}
 
-		if env.Kind != protocol.KindEvent {
+		if env.Kind != protocol.KindEvent || env.Type == protocol.EvHeartbeat {
 			// heartbeat 등 이벤트가 아닌 것은 읽은 것만으로 생존 신호가 된다.
 			continue
 		}

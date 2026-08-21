@@ -1,7 +1,10 @@
 package hub_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -9,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
+
+	"github.com/jinto/taskyard/internal/buildinfo"
 	"github.com/jinto/taskyard/internal/protocol"
 	"github.com/jinto/taskyard/internal/runner/link"
 	"github.com/jinto/taskyard/internal/runner/spool"
@@ -219,4 +225,96 @@ func TestWrongPairingTokenIsRejected(t *testing.T) {
 	if r.hub.Connected() {
 		t.Fatal("hub accepted a runner with a wrong pairing token")
 	}
+}
+
+// TestHeartbeatIsNotAppliedAsEvent은 heartbeat 봉투(run_id·seq 없음)가
+// store.ApplyEvent까지 흘러들어가지 않는지 확인한다. link.go의 writeLoop이
+// 보내는 heartbeat와 정확히 같은 모양의 봉투를 raw websocket으로 직접 써서,
+// hub의 readLoop이 실제로 거치는 경로를 그대로 태운다.
+func TestHeartbeatIsNotAppliedAsEvent(t *testing.T) {
+	r := newRig(t, nil)
+	if err := r.st.UpsertRun(store.Run{ID: "run-1", State: store.StateRunning, Kind: "structured"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var logBuf bytes.Buffer
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	defer slog.SetDefault(prevLogger)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, r.wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.CloseNow()
+
+	helloBody, err := json.Marshal(protocol.Hello{
+		ProtocolVersion: buildinfo.ProtocolVersion(),
+		RunnerID:        "runner-hb",
+		PairingToken:    testToken,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestEnvelope(t, ctx, conn, protocol.Envelope{
+		V:    buildinfo.ProtocolVersion(),
+		Kind: protocol.KindHello,
+		TS:   time.Now().UTC(),
+		Body: helloBody,
+	})
+	if env := readTestEnvelope(t, ctx, conn); env.Kind != protocol.KindWelcome {
+		t.Fatalf("first reply kind = %q, want %q", env.Kind, protocol.KindWelcome)
+	}
+
+	// link.go의 writeLoop이 보내는 것과 정확히 같은 모양: run_id도, seq도 없다.
+	heartbeat, err := protocol.NewEvent(protocol.EvHeartbeat, "", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestEnvelope(t, ctx, conn, heartbeat)
+
+	// 뒤이어 정상 이벤트를 하나 보내고 그 ack을 기다린다. readLoop은 한
+	// 고루틴에서 순차적으로 메시지를 처리하므로, 이 ack을 받았다는 것은
+	// heartbeat 처리가 이미 끝났다는 뜻이다.
+	realEvent, err := protocol.NewEvent(protocol.EvMessageDelta, "run-1", 1, map[string]int{"i": 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestEnvelope(t, ctx, conn, realEvent)
+
+	ack := readTestEnvelope(t, ctx, conn)
+	if ack.Kind != protocol.KindAck || ack.Seq != 1 {
+		t.Fatalf("ack = %+v, want kind=%q seq=1", ack, protocol.KindAck)
+	}
+
+	if strings.Contains(logBuf.String(), "apply event failed") {
+		t.Fatalf("heartbeat reached ApplyEvent and logged an error:\n%s", logBuf.String())
+	}
+}
+
+func writeTestEnvelope(t *testing.T, ctx context.Context, conn *websocket.Conn, env protocol.Envelope) {
+	t.Helper()
+	raw, err := json.Marshal(env)
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	if err := conn.Write(ctx, websocket.MessageText, raw); err != nil {
+		t.Fatalf("write envelope: %v", err)
+	}
+}
+
+func readTestEnvelope(t *testing.T, ctx context.Context, conn *websocket.Conn) protocol.Envelope {
+	t.Helper()
+	_, raw, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("read envelope: %v", err)
+	}
+	var env protocol.Envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	return env
 }
