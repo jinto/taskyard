@@ -552,6 +552,8 @@ Phase 0에서는 이 메커니즘을 구현하지 않는다. 프로젝트 기억
 - `cancelled`
 - `orphaned`
 
+`orphaned`는 종료 상태가 아니라 조정 대기 상태다. §11.7의 조정 결과(`alive` / `resumable` / `lost`)는 Run 상태가 아니라 `Run.reconcile_state`에 기록하며, `lost`로 판정된 Run은 최종적으로 `failed`가 된다.
+
 ### 9.4 Runner 상태
 
 - `online`
@@ -605,7 +607,7 @@ Taskyard를 열면 프로젝트별 보드를 가장 먼저 보여준다.
 
 - `Overview`: 설명, 완료조건, 관계, 외부 링크
 - `Plan`: 제안 계획, 분할, DAG, 승인
-- `Runs`: Agent별 상태와 터미널
+- `Runs`: Agent별 상태와 이벤트 타임라인 (`interactive` Run만 터미널)
 - `Changes`: branch, commit, diff, 테스트, PR
 - `Activity`: 결정과 이벤트 타임라인
 
@@ -622,8 +624,8 @@ Taskyard를 열면 프로젝트별 보드를 가장 먼저 보여준다.
 
 - 역할, Provider, Agent Profile, Runner
 - 할당된 범위와 완료조건
-- 구조화된 진행 이벤트
-- 실시간 또는 재생 가능한 터미널
+- 구조화된 진행 이벤트와 원시 stdout/stderr 로그 (`structured` Run의 기본 뷰)
+- `interactive` Run인 경우에만 실시간 또는 재생 가능한 터미널 (§11.6.5)
 - 도구 호출 및 승인 요청
 - 변경 파일과 diff
 - 테스트 결과
@@ -1328,6 +1330,7 @@ Codex 어댑터는 Phase 1에서 두 번째로 붙이며, 그때 §11.6.2의 공
 | 명세화 대화 지연 | Runner 경유 왕복이 대화 UX로 견딜 만하다 | Phase 0에서 p95 실측 (§11.2.1) |
 | 승인 브로커 부하 | 사전 허용 정책이 있으면 실행 속도에 큰 영향이 없다 | Phase 0에서 도구 호출당 왕복 측정 |
 | 구독 기반 자동화 허용 범위 | 공식 인터페이스 사용은 약관상 허용된다 | 상용 배포 전 Provider별 확인 (§13.3) |
+| Codex App Server의 인증 경로 | `codex login` 구독 인증으로 기동·과금된다 | Phase 0에서 실행으로 확인. App Server의 `--ws-auth`류 옵션은 클라이언트→서버 전송 인증이며 Provider 인증과 별개다 |
 | 기본 Runner 배치 | 사용자 개발 머신 한 대 | 다중 머신 사용 패턴 관찰 |
 | Agent 선택 정책 | Plan에서 역할별 추천, 사용자 정책 우선 | 품질·한도·재시도 데이터 측정 |
 | Coordinator 기억 | Phase 0은 단일 파일 주입, 이후 구조화 기억으로 전환 | §8.4.1 설계 문서 선행 후 장기 프로젝트에서 맥락 손실 평가 |
@@ -1353,6 +1356,7 @@ Codex 어댑터는 Phase 1에서 두 번째로 붙이며, 그때 §11.6.2의 공
 13. 신뢰하지 않는 저장소의 `.claude/settings.json` hook과 `.mcp.json`을 어떤 기본값으로 차단할 것인가? (§13.2.1)
 14. `interactive` Run으로 인계한 뒤 다시 `structured`로 되돌릴 수 있어야 하는가? (§11.6.5)
 15. Codex App Server를 Runner당 하나의 장기 실행 서비스로 둘 것인가, 프로젝트당 하나로 둘 것인가? (§11.6.5)
+16. Codex App Server가 API 키 없이 `codex login` 구독 인증만으로 기동하고 구독에 과금되는가? Claude Code의 `--bare`처럼 인증 경로를 바꾸는 옵션이 App Server 쪽에도 있는가? (§13.2.1)
 
 ---
 
