@@ -42,7 +42,18 @@ type Manager struct {
 	cfg Config
 
 	mu     sync.Mutex
-	active map[string]context.CancelFunc
+	active map[string]*runHandle
+}
+
+// runHandle은 실행 중인 Run 하나에 대해 Manager가 들고 있는 상태다.
+// ws/startedAt은 handleRunCancel이 원장에 종결 기록을 남길 때 필요하고,
+// cancelled는 execute의 종결 switch가 "failed"와 "cancelled"를 구분하는 데
+// 쓴다 — 취소로 죽은 프로세스도 parseErr/waitErr로 나타나기 때문이다.
+type runHandle struct {
+	cancel    context.CancelFunc
+	ws        gitops.Workspace
+	startedAt int64
+	cancelled bool
 }
 
 func New(cfg Config) (*Manager, error) {
@@ -62,7 +73,7 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.BaseBranch == "" {
 		cfg.BaseBranch = "main"
 	}
-	return &Manager{cfg: cfg, active: map[string]context.CancelFunc{}}, nil
+	return &Manager{cfg: cfg, active: map[string]*runHandle{}}, nil
 }
 
 // eventBody는 lifecycle이 발행하는 모든 이벤트의 공통 껍데기다. Task 11의
@@ -135,16 +146,6 @@ type runStartBody struct {
 }
 
 func (m *Manager) handleRunStart(ctx context.Context, env protocol.Envelope) error {
-	// 멱등성 관문. 이미 본 command_id면 아무것도 하지 않는다.
-	_, first, err := m.cfg.Spool.RememberCommand(env.ID, []byte(`{"accepted":true}`))
-	if err != nil {
-		return fmt.Errorf("remember command: %w", err)
-	}
-	if !first {
-		slog.Info("ignoring replayed run.start", "command_id", env.ID, "run_id", env.RunID)
-		return nil
-	}
-
 	var body runStartBody
 	if err := json.Unmarshal(env.Body, &body); err != nil {
 		return fmt.Errorf("unmarshal run.start body: %w", err)
@@ -153,6 +154,27 @@ func (m *Manager) handleRunStart(ctx context.Context, env protocol.Envelope) err
 	ws, err := m.cfg.Git.Ensure(ctx, env.RunID, m.cfg.BaseBranch)
 	if err != nil {
 		return fmt.Errorf("ensure worktree: %w", err)
+	}
+
+	// 멱등성 관문. 실패할 수 있는 준비(본문 해석, worktree 보장)가 모두 끝난
+	// 뒤에야 명령을 "적용됨"으로 기록한다. 더 앞에서 기록하면 그 사이의
+	// 실패가 재전송을 영원히 무시당하게 만든다 — 명령 로그 자신이 재시도
+	// 경로를 막아버리는 셈이다. Ensure는 멱등이므로(Task 6), 이 관문을
+	// 통과하기 전에 같은 command_id가 다시 와도 같은 worktree를 재사용할
+	// 뿐 새로 만들지 않는다.
+	//
+	// 이 관문을 SaveRun보다도 앞에 두는 이유는 따로 있다: 관문을 통과하는
+	// 것 자체가 "이번이 이 command_id의 처음이자 유일한 적용"이라는 뜻이어야
+	// 한다. SaveRun을 관문보다 먼저 하면, 이미 끝난 실행이 재전송됐을 때
+	// SaveRun이 원장의 종결 상태(SessionID·PID 포함)를 "running"으로
+	// 되돌려 쓴 뒤에야 관문에서 멈추게 된다.
+	_, first, err := m.cfg.Spool.RememberCommand(env.ID, []byte(`{"accepted":true}`))
+	if err != nil {
+		return fmt.Errorf("remember command: %w", err)
+	}
+	if !first {
+		slog.Info("ignoring replayed run.start", "command_id", env.ID, "run_id", env.RunID)
+		return nil
 	}
 
 	startedAt := time.Now().Unix()
@@ -170,7 +192,7 @@ func (m *Manager) handleRunStart(ctx context.Context, env protocol.Envelope) err
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	m.mu.Lock()
-	m.active[env.RunID] = cancel
+	m.active[env.RunID] = &runHandle{cancel: cancel, ws: ws, startedAt: startedAt}
 	m.mu.Unlock()
 
 	go m.execute(runCtx, cancel, env.RunID, body.Prompt, startedAt, ws)
@@ -191,6 +213,7 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID,
 		BrokerToken: m.cfg.BrokerToken,
 	})
 	if err != nil {
+		m.recordEarlyFailure(runID, ws, startedAt)
 		m.fail(runID, fmt.Errorf("build args: %w", err))
 		return
 	}
@@ -201,13 +224,30 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID,
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		m.recordEarlyFailure(runID, ws, startedAt)
 		m.fail(runID, fmt.Errorf("stdout pipe: %w", err))
 		return
 	}
 
 	if err := cmd.Start(); err != nil {
+		m.recordEarlyFailure(runID, ws, startedAt)
 		m.fail(runID, fmt.Errorf("start agent: %w", err))
 		return
+	}
+
+	// PID를 확보하는 즉시 원장에 반영한다. Task 10의 재시작 후 조정은 이
+	// PID로 프로세스 생존을 판정하므로(PRD §11.7), 0으로 남아 있으면 살아
+	// 있는 Run을 영원히 알아보지 못한다.
+	pid := cmd.Process.Pid
+	if err := m.cfg.Spool.SaveRun(spool.RunRecord{
+		RunID:         runID,
+		State:         "running",
+		Branch:        ws.Branch,
+		WorktreePath:  ws.Path,
+		StartedAtUnix: startedAt,
+		PID:           pid,
+	}); err != nil {
+		slog.Error("save run pid failed", "run_id", runID, "err", err)
 	}
 
 	parser := claudecode.NewParser()
@@ -216,14 +256,18 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID,
 	// cmd.Wait() 뒤로 미루면 API 과금으로 이미 턴이 끝난 뒤에야 실패
 	// 처리하게 되어 실질적 과금을 막지 못한다(PRD §13.2). billingChecked는
 	// Parse가 단일 goroutine에서 emit을 순차 호출하므로 잠금 없이 안전하다.
+	//
+	// SessionID != ""는 init이 왔다는 것만 증명한다. 구독 로그인이라는
+	// 증거는 apiKeySource == "none"뿐이다 — 비어 있거나 다른 값이면 어느
+	// 신원으로 과금됐는지 증명되지 않은 것이므로 똑같이 막는다.
 	billingChecked := false
 	parseErr := parser.Parse(stdout, func(e adapter.Event) error {
 		if !billingChecked {
 			if info := parser.Session(); info.SessionID != "" {
 				billingChecked = true
-				if info.UsesAPIKey() {
+				if info.APIKeySource != "none" {
 					cancel()
-					return fmt.Errorf("agent ran on API billing (apiKeySource=%q); refusing to continue", info.APIKeySource)
+					return fmt.Errorf("agent's billing identity is not a verified subscription login (apiKeySource=%q); refusing to continue", info.APIKeySource)
 				}
 			}
 		}
@@ -244,39 +288,60 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID,
 		Branch:        ws.Branch,
 		WorktreePath:  ws.Path,
 		StartedAtUnix: startedAt,
+		PID:           pid,
 	}
 
 	switch {
 	case parseErr != nil:
-		record.State = "failed"
+		record.State = m.terminalState(runID)
 		_ = m.cfg.Spool.SaveRun(record)
 		m.salvage(runID)
 		m.fail(runID, fmt.Errorf("parse stream: %w", parseErr))
 	case waitErr != nil:
-		record.State = "failed"
+		record.State = m.terminalState(runID)
 		_ = m.cfg.Spool.SaveRun(record)
 		m.salvage(runID)
 		m.fail(runID, fmt.Errorf("agent exited: %w", waitErr))
-	case session.SessionID == "":
-		// init이 오기 전에 스트림이 끝났다. 어떤 신원으로 과금됐는지
-		// 확인할 방법이 없으므로 성공으로 볼 수 없다(PRD §13.2).
+	case session.APIKeySource != "none":
+		// init이 아예 없었거나(APIKeySource == "") 왔지만 구독 로그인임을
+		// 증명하지 못했다. system/init은 emit하지 않으므로, emit 콜백의
+		// 조기 검사가 한 번도 실행되지 못한 경우(예: init 다음에 곧바로
+		// result만 오는 스트림)의 마지막 방어선이기도 하다(PRD §13.2).
 		record.State = "failed"
 		_ = m.cfg.Spool.SaveRun(record)
 		m.salvage(runID)
-		m.fail(runID, errors.New("stream ended before init; billing identity unverified"))
-	case session.UsesAPIKey():
-		// init 이후 emit이 한 번도 없었다면(system 메시지는 emit하지 않는다)
-		// emit 콜백의 조기 검사가 한 번도 실행되지 못한다. 여기가 그 경우의
-		// 마지막 방어선이다(PRD §13.2).
-		record.State = "failed"
-		_ = m.cfg.Spool.SaveRun(record)
-		m.salvage(runID)
-		m.fail(runID, fmt.Errorf("agent ran on API billing (apiKeySource=%q); refusing to continue", session.APIKeySource))
+		m.fail(runID, fmt.Errorf("agent's billing identity is not a verified subscription login (apiKeySource=%q); refusing to continue", session.APIKeySource))
 	default:
 		record.State = "succeeded"
 		_ = m.cfg.Spool.SaveRun(record)
 		m.emitState(runID, "succeeded", "")
 	}
+}
+
+// recordEarlyFailure는 Agent 프로세스를 아예 띄우지 못한 경우의 원장
+// 기록이다. 이 실패들은 어떤 세션도 시작되기 전에 일어나므로 SessionID·PID는
+// 비운다.
+func (m *Manager) recordEarlyFailure(runID string, ws gitops.Workspace, startedAt int64) {
+	_ = m.cfg.Spool.SaveRun(spool.RunRecord{
+		RunID:         runID,
+		State:         "failed",
+		Branch:        ws.Branch,
+		WorktreePath:  ws.Path,
+		StartedAtUnix: startedAt,
+	})
+}
+
+// terminalState는 parseErr/waitErr로 끝난 Run이 사람이 취소해서 죽었는지,
+// 아니면 정말로 실패했는지 구분한다. 취소된 Run도 프로세스가 죽으면서
+// parseErr나 waitErr로 나타나므로, m.active에 남은 cancelled 플래그를 봐야만
+// 구분할 수 있다.
+func (m *Manager) terminalState(runID string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if h, ok := m.active[runID]; ok && h.cancelled {
+		return "cancelled"
+	}
+	return "failed"
 }
 
 // salvage는 종료 전 미커밋 변경을 보존한다(PRD §8.7.1).
@@ -307,13 +372,27 @@ func (m *Manager) salvage(runID string) {
 
 func (m *Manager) handleRunCancel(env protocol.Envelope) error {
 	m.mu.Lock()
-	cancel, ok := m.active[env.RunID]
+	h, ok := m.active[env.RunID]
+	if ok {
+		// cancel()보다 먼저 표시해야 한다. execute의 종결 switch가 이
+		// 플래그로 "failed"와 "cancelled"를 가르기 때문이다.
+		h.cancelled = true
+	}
 	m.mu.Unlock()
 
 	if !ok {
 		return nil
 	}
-	cancel()
+	h.cancel()
+	// 원장에도 남긴다. PID는 execute가 종결 시점에 마지막으로 쓰므로
+	// 여기서는 비워 둔다 — execute의 기록이 항상 이 기록 뒤에 온다.
+	_ = m.cfg.Spool.SaveRun(spool.RunRecord{
+		RunID:         env.RunID,
+		State:         "cancelled",
+		Branch:        h.ws.Branch,
+		WorktreePath:  h.ws.Path,
+		StartedAtUnix: h.startedAt,
+	})
 	m.emitState(env.RunID, "cancelled", "cancelled by user")
 	return nil
 }
