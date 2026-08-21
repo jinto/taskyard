@@ -118,7 +118,13 @@ func (m *Manager) Status(ctx context.Context, runID string) (Status, error) {
 			continue
 		}
 		// porcelain v1: 상태 두 글자 + 공백 + 경로
-		paths = append(paths, strings.TrimSpace(line[3:]))
+		path := strings.TrimSpace(line[3:])
+		// rename(R)/copy(C)는 "old -> new" 형태다. 호출자에게 의미 있는
+		// 것은 새 경로이므로 그 부분만 취한다.
+		if idx := strings.Index(path, " -> "); idx != -1 {
+			path = path[idx+len(" -> "):]
+		}
+		paths = append(paths, path)
 	}
 	return Status{Dirty: len(paths) > 0, ChangedPaths: paths}, nil
 }

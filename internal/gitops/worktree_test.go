@@ -215,3 +215,65 @@ func TestDiffShowsChangesAgainstBase(t *testing.T) {
 		t.Fatalf("diff does not show the added line:\n%s", diff)
 	}
 }
+
+func TestStatusReportsRenamedPathAsNewName(t *testing.T) {
+	repo, root := newRepo(t)
+	m := New(repo, root)
+	ctx := context.Background()
+
+	ws, err := m.Ensure(ctx, "run-1", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(ws.Path, "old.txt"), []byte("content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, ws.Path, "add", "old.txt")
+	run(t, ws.Path, "commit", "-q", "-m", "add old.txt")
+
+	run(t, ws.Path, "mv", "old.txt", "new.txt")
+
+	status, err := m.Status(ctx, "run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.Dirty {
+		t.Fatal("rename not reported as dirty")
+	}
+	if len(status.ChangedPaths) != 1 || status.ChangedPaths[0] != "new.txt" {
+		t.Fatalf("ChangedPaths = %v, want [new.txt]", status.ChangedPaths)
+	}
+}
+
+func TestEnsureRecreatesWhenDirectoryMissingButBranchExists(t *testing.T) {
+	repo, root := newRepo(t)
+	m := New(repo, root)
+	ctx := context.Background()
+
+	first, err := m.Ensure(ctx, "run-1", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// worktree 디렉터리만 사라지고 branch는 남는 상황을 재현한다
+	// (runner 재시작 후 reconciliation, Task 10). 삭제는 이 테스트의
+	// 픽스처 구성용일 뿐이며, gitops 패키지 자체에는 삭제 경로가 없다.
+	run(t, repo, "worktree", "remove", "--force", first.Path)
+
+	second, err := m.Ensure(ctx, "run-1", "main")
+	if err != nil {
+		t.Fatalf("Ensure after directory loss: %v", err)
+	}
+	if second.Path != first.Path {
+		t.Errorf("path changed: %q then %q", first.Path, second.Path)
+	}
+	if second.Branch != "taskyard/run/run-1" {
+		t.Errorf("branch = %q, want taskyard/run/run-1", second.Branch)
+	}
+
+	branch := strings.TrimSpace(run(t, second.Path, "rev-parse", "--abbrev-ref", "HEAD"))
+	if branch != "taskyard/run/run-1" {
+		t.Fatalf("worktree branch = %q, want taskyard/run/run-1", branch)
+	}
+}
