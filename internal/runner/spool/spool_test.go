@@ -181,3 +181,53 @@ func TestActiveRunsListsRunsWithPendingEvents(t *testing.T) {
 		t.Fatalf("ActiveRuns = %v, want [run-b]", runs)
 	}
 }
+
+func TestSaveAndLoadRuns(t *testing.T) {
+	s := openTemp(t)
+
+	want := RunRecord{
+		RunID:         "run-1",
+		State:         "running",
+		SessionID:     "sess-1",
+		Branch:        "taskyard/run/run-1",
+		WorktreePath:  "/tmp/wt/run-1",
+		PID:           4242,
+		StartedAtUnix: 1700000000,
+	}
+	if err := s.SaveRun(want); err != nil {
+		t.Fatalf("SaveRun: %v", err)
+	}
+
+	got, err := s.LoadRuns()
+	if err != nil {
+		t.Fatalf("LoadRuns: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("LoadRuns returned %d records, want 1", len(got))
+	}
+	if got[0] != want {
+		t.Fatalf("record = %+v, want %+v", got[0], want)
+	}
+}
+
+func TestSaveRunOverwritesByRunID(t *testing.T) {
+	s := openTemp(t)
+
+	if err := s.SaveRun(RunRecord{RunID: "run-1", State: "running", SessionID: ""}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveRun(RunRecord{RunID: "run-1", State: "succeeded", SessionID: "sess-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.LoadRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1", len(got))
+	}
+	if got[0].State != "succeeded" || got[0].SessionID != "sess-1" {
+		t.Fatalf("record = %+v, want the later values", got[0])
+	}
+}
