@@ -109,7 +109,7 @@ func (c *collector) count(evType string) int {
 	return n
 }
 
-func newManager(t *testing.T, col *collector) (*lifecycle.Manager, *spool.Spool, *gitops.Manager) {
+func newManagerWithFixture(t *testing.T, col *collector, fixture string) (*lifecycle.Manager, *spool.Spool, *gitops.Manager) {
 	t.Helper()
 
 	repo, worktrees := newRepo(t)
@@ -120,7 +120,6 @@ func newManager(t *testing.T, col *collector) (*lifecycle.Manager, *spool.Spool,
 	t.Cleanup(func() { _ = sp.Close() })
 
 	git := gitops.New(repo, worktrees)
-	fixture := "../../agents/adapter/claudecode/testdata/session-pong.ndjson"
 
 	m, err := lifecycle.New(lifecycle.Config{
 		Spool:        sp,
@@ -136,6 +135,33 @@ func newManager(t *testing.T, col *collector) (*lifecycle.Manager, *spool.Spool,
 		t.Fatal(err)
 	}
 	return m, sp, git
+}
+
+func newManager(t *testing.T, col *collector) (*lifecycle.Manager, *spool.Spool, *gitops.Manager) {
+	t.Helper()
+	return newManagerWithFixture(t, col, "../../agents/adapter/claudecode/testdata/session-pong.ndjson")
+}
+
+// failureDetail은 발행된 이벤트에서 종결 "failed" 상태의 detail을 꺼낸다.
+// 없으면 빈 문자열이다(예: 이 run이 성공으로 끝난 경우).
+func failureDetail(t *testing.T, col *collector) string {
+	t.Helper()
+	for _, e := range col.snapshot() {
+		if e.Type != protocol.EvRunStateChanged {
+			continue
+		}
+		var wrapper struct {
+			Body map[string]any `json:"body"`
+		}
+		if err := json.Unmarshal(e.Body, &wrapper); err != nil {
+			t.Fatal(err)
+		}
+		if state, _ := wrapper.Body["state"].(string); state == "failed" {
+			detail, _ := wrapper.Body["detail"].(string)
+			return detail
+		}
+	}
+	return ""
 }
 
 func startCommand(t *testing.T, runID, prompt string) protocol.Envelope {
@@ -227,6 +253,109 @@ func TestDuplicateRunStartIsAppliedOnce(t *testing.T) {
 	listCmd := exec.Command("git", "worktree", "list")
 	listCmd.Dir = filepath.Dir(git.WorktreePath("run-1"))
 	_ = listCmd // worktree 재사용은 gitops 테스트가 보장한다
+}
+
+// TestRunFailsWhenAgentBillsToAPIKey는 init이 API 키 등 구독이 아닌 경로로
+// 과금됐다고 밝히는 경우를 검증한다. emit 콜백의 조기 검사가 첫 emit 대상
+// 이벤트(여기서는 result 한 줄) 이전에 취소해야 하므로, turn_completed도
+// message_delta도 하나도 발행되지 않아야 한다.
+func TestRunFailsWhenAgentBillsToAPIKey(t *testing.T) {
+	col := &collector{}
+	m, sp, _ := newManagerWithFixture(t, col, "testdata/session-apikey-billing.ndjson")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := m.HandleCommand(ctx, startCommand(t, "run-1", "say pong")); err != nil {
+		t.Fatalf("HandleCommand: %v", err)
+	}
+
+	waitFor(t, "terminal state change", func() bool {
+		return col.count(protocol.EvRunStateChanged) >= 2
+	})
+
+	if got := col.count(protocol.EvTurnCompleted); got != 0 {
+		t.Errorf("turn_completed count = %d, want 0 (billing abort must land before the event is published)", got)
+	}
+	if got := col.count(protocol.EvMessageDelta); got != 0 {
+		t.Errorf("message_delta count = %d, want 0", got)
+	}
+
+	if detail := failureDetail(t, col); !strings.Contains(detail, "billing") {
+		t.Errorf("failure detail = %q, want it to name the billing boundary", detail)
+	}
+
+	runs, err := sp.LoadRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].State != "failed" {
+		t.Fatalf("ledger = %+v, want exactly one failed run", runs)
+	}
+}
+
+// TestRunFailsWhenStreamEndsWithoutInit은 init이 전혀 오지 않은 채 스트림이
+// 끝나는 경우를 검증한다. 어떤 신원으로 과금됐는지 확인할 방법이 없으므로
+// 성공으로 볼 수 없다.
+func TestRunFailsWhenStreamEndsWithoutInit(t *testing.T) {
+	col := &collector{}
+	m, sp, _ := newManagerWithFixture(t, col, "testdata/session-no-init.ndjson")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := m.HandleCommand(ctx, startCommand(t, "run-1", "say pong")); err != nil {
+		t.Fatalf("HandleCommand: %v", err)
+	}
+
+	waitFor(t, "terminal state change", func() bool {
+		return col.count(protocol.EvRunStateChanged) >= 2
+	})
+
+	if detail := failureDetail(t, col); detail == "" {
+		t.Fatal("expected a failure reason; run must not succeed without an established session")
+	}
+
+	runs, err := sp.LoadRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].State != "failed" {
+		t.Fatalf("ledger = %+v, want exactly one failed run", runs)
+	}
+}
+
+// TestRunFailsWhenInitOmitsAPIKeySource는 init은 왔지만 apiKeySource 필드
+// 자체가 없는(빈 문자열인) 경우를 검증한다. SessionID != ""만으로는 구독
+// 과금인지 증명하지 못한다 — apiKeySource == "none"이어야 증명된다. 이
+// 테스트는 고쳐지기 전 코드에서는 실패한다(RED): 고치기 전에는 SessionID가
+// 비어 있지 않고 UsesAPIKey()도 false를 돌려주므로 "succeeded"로 끝난다.
+func TestRunFailsWhenInitOmitsAPIKeySource(t *testing.T) {
+	col := &collector{}
+	m, sp, _ := newManagerWithFixture(t, col, "testdata/session-init-missing-apikeysource.ndjson")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := m.HandleCommand(ctx, startCommand(t, "run-1", "say pong")); err != nil {
+		t.Fatalf("HandleCommand: %v", err)
+	}
+
+	waitFor(t, "terminal state change", func() bool {
+		return col.count(protocol.EvRunStateChanged) >= 2
+	})
+
+	if detail := failureDetail(t, col); detail == "" {
+		t.Fatal("expected a failure reason; apiKeySource missing from init proves nothing about billing")
+	}
+
+	runs, err := sp.LoadRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].State != "failed" {
+		t.Fatalf("ledger = %+v, want exactly one failed run", runs)
+	}
 }
 
 func newJSONRequest(t *testing.T, body, token string) *http.Request {
