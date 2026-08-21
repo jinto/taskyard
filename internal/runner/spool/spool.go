@@ -35,6 +35,16 @@ CREATE TABLE IF NOT EXISTS command_log (
   command_id TEXT PRIMARY KEY,
   result     BLOB NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS runs (
+  run_id        TEXT    PRIMARY KEY,
+  state         TEXT    NOT NULL,
+  session_id    TEXT    NOT NULL DEFAULT '',
+  branch        TEXT    NOT NULL DEFAULT '',
+  worktree_path TEXT    NOT NULL DEFAULT '',
+  pid           INTEGER NOT NULL DEFAULT 0,
+  started_at    INTEGER NOT NULL DEFAULT 0
+);
 `
 
 // Spool은 SQLite로 뒷받침되는 이벤트 대기열이다.
@@ -195,4 +205,57 @@ func (s *Spool) RememberCommand(commandID string, result []byte) ([]byte, bool, 
 		return nil, false, fmt.Errorf("commit: %w", err)
 	}
 	return result, true, nil
+}
+
+// RunRecord는 Runner가 로컬에 남기는 실행 기록이다. 재시작 후 조정
+// (PRD §11.7)이 이 원장에서 시작한다.
+type RunRecord struct {
+	RunID         string
+	State         string
+	SessionID     string
+	Branch        string
+	WorktreePath  string
+	PID           int
+	StartedAtUnix int64
+}
+
+// SaveRun은 실행 기록을 만들거나 덮어쓴다.
+func (s *Spool) SaveRun(r RunRecord) error {
+	_, err := s.db.Exec(
+		`INSERT INTO runs (run_id, state, session_id, branch, worktree_path, pid, started_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(run_id) DO UPDATE SET
+		   state         = excluded.state,
+		   session_id    = excluded.session_id,
+		   branch        = excluded.branch,
+		   worktree_path = excluded.worktree_path,
+		   pid           = excluded.pid,
+		   started_at    = excluded.started_at`,
+		r.RunID, r.State, r.SessionID, r.Branch, r.WorktreePath, r.PID, r.StartedAtUnix,
+	)
+	if err != nil {
+		return fmt.Errorf("save run: %w", err)
+	}
+	return nil
+}
+
+// LoadRuns는 모든 실행 기록을 돌려준다.
+func (s *Spool) LoadRuns() ([]RunRecord, error) {
+	rows, err := s.db.Query(
+		`SELECT run_id, state, session_id, branch, worktree_path, pid, started_at FROM runs ORDER BY run_id`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query runs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []RunRecord
+	for rows.Next() {
+		var r RunRecord
+		if err := rows.Scan(&r.RunID, &r.State, &r.SessionID, &r.Branch, &r.WorktreePath, &r.PID, &r.StartedAtUnix); err != nil {
+			return nil, fmt.Errorf("scan run: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
