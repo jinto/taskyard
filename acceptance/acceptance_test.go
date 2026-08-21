@@ -128,7 +128,15 @@ func newStack(t *testing.T, dbDir string) *stack {
 
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	waitForWithin(t, what, 20*time.Second, cond)
+}
+
+// waitForWithin은 waitFor과 같지만 호출자가 데드라인을 고른다. link의
+// 재연결 backoff는 정상 초기화되면 대개 minBackoff 근방이지만, 벨트-앤-브레이스로
+// 여유를 더 주고 싶은 지점(예: 판정 1의 재연결 대기)에 쓴다.
+func waitForWithin(t *testing.T, what string, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
@@ -152,17 +160,36 @@ func TestCriterion1_TenDisconnectsLoseNothing(t *testing.T) {
 	go s.link.Run(ctx)
 	waitFor(t, "initial connection", s.hub.Connected)
 
+	// perRound개 중 outagePerRound개는 연결이 끊긴 동안 발행한다. link.Publish는
+	// 끊겨 있어도 spool에 적히기만 하고 성공한다(link.go의 "연결이 끊겨 있어도
+	// 성공한다") — 그 이벤트들은 재연결 후 drain의 재전송 경로를 통해서만
+	// Server에 닿을 수 있다. 발행을 재연결 뒤로만 몰아두면 빠른 기계에서는
+	// drop 신호가 도착하기 전에 send→apply→ack이 다 끝나버려 재전송 경로가
+	// 한 번도 실제로 실행되지 않고도 테스트가 통과할 수 있다. 발행을 단절
+	// 구간에 걸치게 해 재전송 경로를 우연이 아니라 구조로 강제한다.
 	const perRound = 20
+	const outagePerRound = perRound / 2
 	for round := 0; round < 10; round++ {
-		for i := 0; i < perRound; i++ {
-			env, _ := protocol.NewEvent(protocol.EvMessageDelta, "run-1", 0, map[string]int{"round": round, "i": i})
-			if err := s.link.Publish("run-1", env); err != nil {
-				t.Fatalf("publish: %v", err)
-			}
-		}
 		s.hub.DropConnection()
 		waitFor(t, "disconnect to register", func() bool { return !s.hub.Connected() })
-		waitFor(t, "reconnect", s.hub.Connected)
+
+		for i := 0; i < outagePerRound; i++ {
+			env, _ := protocol.NewEvent(protocol.EvMessageDelta, "run-1", 0, map[string]any{"round": round, "i": i, "phase": "outage"})
+			if err := s.link.Publish("run-1", env); err != nil {
+				t.Fatalf("publish during outage: %v", err)
+			}
+		}
+
+		// backoff 리셋 수정 이후로는 빠르게 재연결되지만, 벨트-앤-브레이스로
+		// 여유 있는 데드라인을 둔다.
+		waitForWithin(t, "reconnect", 30*time.Second, s.hub.Connected)
+
+		for i := outagePerRound; i < perRound; i++ {
+			env, _ := protocol.NewEvent(protocol.EvMessageDelta, "run-1", 0, map[string]any{"round": round, "i": i, "phase": "connected"})
+			if err := s.link.Publish("run-1", env); err != nil {
+				t.Fatalf("publish after reconnect: %v", err)
+			}
+		}
 	}
 
 	want := uint64(perRound * 10)
