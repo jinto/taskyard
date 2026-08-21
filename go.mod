@@ -3,6 +3,7 @@ module github.com/jinto/taskyard
 go 1.26.3
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/google/uuid v1.6.0
 	modernc.org/sqlite v1.57.0
 )
