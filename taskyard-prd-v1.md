@@ -6,13 +6,35 @@
 
 | 항목 | 내용 |
 |---|---|
-| 문서 버전 | v1.0 Draft |
+| 문서 버전 | v1.1 Draft |
 | 작성일 | 2026-08-21 |
+| 최종 수정 | 2026-08-21 — v1.1 (검토 반영: Agent 어댑터 사실 검증, 범위 재정의, 미해결 설계 항목 명시) |
 | 1차 대상 | 여러 소프트웨어 프로젝트를 동시에 운영하는 1인 개발자 |
 | 제품 형태 | 자체 호스팅 웹 서버 + 사용자 머신의 실행 러너 |
 | 구현 언어 | Go 중심 |
 | 핵심 제약 | 모델 API 비용 대신 사용자가 직접 로그인한 공식 Claude/Codex CLI 구독 사용 |
 | 협업 기능 | MVP 제외, 다음 단계 |
+
+---
+
+## 0. v1.1 변경 요약
+
+v1.0 검토에서 제기된 지적을 반영했다. Provider 자동화 표면은 공식 문서로 직접 검증했고(2026-08 기준), 검증 결과가 설계를 바꾼 부분은 해당 절에 근거와 함께 반영했다.
+
+| # | 변경 | 위치 |
+|---|---|---|
+| 1 | Claude Code·Codex의 공식 자동화 표면을 검증하고 어댑터 설계를 사실 기반으로 다시 씀 | §11.6 |
+| 2 | tmux를 실행 제어 경로에서 제외하고 사람의 탈출구로 강등. 웹 터미널의 의미를 재정의 | §8.6, §11.6.4, §11.6.5 |
+| 3 | 두 Provider의 승인 흐름 비대칭을 명시하고 Runner에 로컬 승인 브로커 책임을 추가 | §11.3, §11.6.3 |
+| 4 | "서버는 추론하지 않는다"의 대가(Runner 오프라인 시 AI 기능 전면 불가)를 트레이드오프로 명문화 | §11.2.1 |
+| 5 | `--bare` 모드가 구독이 아닌 API 과금 경로라는 사실을 반영해 실행 플래그 금지 목록 신설 | §13.2.1 |
+| 6 | 충돌 예측과 병렬 스케줄러의 연결을 데이터 모델과 요구사항으로 구체화 | §7.4, §8.5, §12 |
+| 7 | worktree 미커밋 변경 보존을 P0 규칙으로 상세화 | §8.7.1 |
+| 8 | `orphaned` Run 조정 절차를 알고리즘으로 기술 | §11.7 |
+| 9 | Coordinator 기억 메커니즘을 별도 설계 문서 선행 항목으로 격상 | §8.4.1 |
+| 10 | 웹 UI를 "HTMX 셸 + JS 아일랜드" 하이브리드로 확정 | §11.4.1 |
+| 11 | 기존 P0 7묶음을 Phase 1로 재분류하고 실제 착수 범위인 Phase 0 수직 스파이크를 신설 | §16.0, §20 |
+| 12 | 위험표·결정기록·출시 전 질문을 위 내용에 맞춰 갱신 | §19, §21, §22 |
 
 ---
 
@@ -27,7 +49,7 @@ Taskyard는 자체 티켓 관리기를 기본 시스템 오브 레코드로 사�
 실행은 두 개의 Go 바이너리로 분리한다.
 
 - `taskyard-server`: 웹 UI, 티켓, 계획, 정책, 스케줄링, 실행 상태, 알림 및 러너 관리를 담당한다.
-- `taskyard-runner`: 사용자의 개발 머신에서 저장소, tmux/PTY, 공식 Claude/Codex CLI, Git worktree, 테스트 및 diff를 담당한다.
+- `taskyard-runner`: 사용자의 개발 머신에서 저장소, 공식 Claude/Codex CLI의 구조화 실행, 승인 브로커, Git worktree, 테스트 및 diff를 담당한다. tmux/PTY는 사용자가 직접 개입하는 대화형 세션에만 쓴다.
 
 러너가 서버로 아웃바운드 연결하므로, 서버가 사용자의 소스코드나 Claude/Codex 인증정보를 직접 소유할 필요가 없다.
 
@@ -264,6 +286,10 @@ AI는 티켓 복잡도에 따라 아래 형태 중 하나를 추천한다. 사�
 - 각 구현 Work Item은 기본적으로 전용 Git branch와 worktree를 가진다.
 - Worker는 자신에게 할당된 범위와 완료조건만 받는다.
 - 공유 파일 충돌 가능성이 높은 작업은 Planner가 순차화하거나 통합 순서를 명시한다.
+- Planner의 충돌 예측은 산문이 아니라 구조화된 값으로 스케줄러에 전달된다. 각 Work Item은 `expected_paths`(건드릴 것으로 예상되는 경로 glob), `exclusive_paths`(동시 편집을 허용하지 않는 경로), `conflict_risk`(low/medium/high)를 가진다.
+- **스케줄러 규칙:** 두 Work Item의 `exclusive_paths`가 겹치면 의존성이 없어도 동시에 배치하지 않고 순차화한다. 이것이 EX-02의 "즉시 병렬"에 대한 유일한 예외이며, 본 절과 §8.5의 표면적 충돌은 이 규칙으로 해소된다.
+- `expected_paths`만 겹치는 경우는 병렬 실행하되 통합 순서를 지정하고 사용자에게 충돌 가능성을 표시한다.
+- 예측은 완벽할 수 없다. 실제 변경 경로가 다른 Work Item의 `exclusive_paths`를 침범하면 Runner가 이를 이벤트로 보고하고, Integrator 단계에서 우선 처리한다.
 - 동시 실행 수는 Provider, Runner, Project 정책에 의해 제한된다.
 - 구독 한도나 세션 제한이 감지되면 실행을 안전하게 일시정지하고 재개할 수 있어야 한다.
 
@@ -368,6 +394,23 @@ MVP의 기본 완료 정책은 다음과 같이 가정한다.
 | CO-07 | 전역 Coordinator는 모든 프로젝트의 진행, 병목, 구독·Runner 용량을 요약한다. | P1 |
 | CO-08 | 기억 항목은 출처, 생성 시점, 적용 범위, 폐기 상태를 가진다. | P1 |
 
+#### 8.4.1 미해결: Coordinator 기억 메커니즘
+
+§6의 다음 문장은 이 제품에서 가장 새롭고 가장 덜 정의된 메커니즘이다.
+
+> 필요할 때 러너에서 새로운 Agent 실행을 시작하고 해당 기억을 다시 주입한다.
+
+PRD 수준의 서술로는 구현할 수 없다. **Phase 1 착수 전에 별도 설계 문서(`docs/design/coordinator-memory.md`)를 작성한다.** 설계 문서가 답해야 할 질문은 다음과 같다.
+
+1. **승격 기준** — 어떤 대화와 결정이 영속 기억이 되는가? 사용자 답변은 항상 승격하는가? Coordinator의 자체 판단도 승격 대상인가?
+2. **표현 형식** — 자유 텍스트 요약인가, 구조화된 주장(claim) 목록인가? `CoordinatorMemory.kind`의 실제 값 집합은 무엇인가?
+3. **주입 예산** — 프롬프트 용량은 유한하다. 관련성 순위를 무엇으로 매기는가? Work Item의 `expected_paths`와 연결해 코드 영역별로 선택할 수 있는가?
+4. **폐기와 충돌** — 오래된 결정이 새 결정과 모순될 때 무엇이 이기는가? 폐기 권한은 사용자에게만 있는가?
+5. **확신도** — CO-05의 "확신도 임계값"은 정확히 무엇을 재는 수치인가? Agent의 자기보고 확신도를 신뢰할 수 있는가, 아니면 규칙 기반 중요도 분류가 더 안전한가?
+6. **검증** — 장기 프로젝트에서 맥락 손실을 어떻게 측정하는가?
+
+Phase 0에서는 이 메커니즘을 구현하지 않는다. 프로젝트 기억은 **파일 하나(`.taskyard/memory.md`)를 Agent 프롬프트에 통째로 주입하는 가장 단순한 형태**로 시작하고, 그 한계가 실제로 관측된 뒤에 위 설계로 넘어간다.
+
 ### 8.5 스케줄링과 병렬 Agent 실행
 
 | ID | 요구사항 | 우선순위 |
@@ -380,16 +423,19 @@ MVP의 기본 완료 정책은 다음과 같이 가정한다.
 | EX-06 | 구독 한도·로그인 만료·승인 대기를 구분해 표시한다. | P0 |
 | EX-07 | Provider 자동 전환은 명시적으로 승인된 정책이 있을 때만 수행한다. | P0 |
 | EX-08 | 예상 충돌도가 높은 Work Item을 경고하거나 순차화한다. | P1 |
+| EX-09 | Plan의 충돌 예측을 `expected_paths`·`exclusive_paths`·`conflict_risk`로 구조화하고, 스케줄러는 `exclusive_paths`가 겹치는 Work Item을 동시에 배치하지 않는다(§7.4). | P0 |
+| EX-10 | 동시 실행 한도는 Provider·Runner·Project 한도의 최솟값을 적용하고, 현재 어떤 한도에 걸려 대기 중인지 UI에 표시한다. | P0 |
 
 ### 8.6 실행 관찰과 터미널 제어
 
 | ID | 요구사항 | 우선순위 |
 |---|---|---|
 | RU-01 | Run의 구조화된 이벤트, 현재 단계, 경과시간, 마지막 활동을 표시한다. | P0 |
-| RU-02 | 필요할 때 xterm.js 기반 터미널에 연결해 직접 관찰·입력한다. | P0 |
+| RU-02 | `structured` Run은 이벤트 타임라인과 원시 로그 뷰로 관찰하고, 메시지 주입·승인 응답·중단으로 개입한다(§11.6.5). | P0 |
+| RU-02b | 사용자가 요청하면 현재 세션을 `interactive` Run으로 인계해 xterm.js 터미널에서 직접 조작한다. | P1 |
 | RU-03 | 터미널 접속과 사용자 입력을 감사 이벤트로 남긴다. | P0 |
-| RU-04 | tmux 세션이 웹 연결과 독립적으로 유지된다. | P0 |
-| RU-05 | Runner 재시작 후 기존 세션과 Run을 재발견하고 상태를 조정한다. | P0 |
+| RU-04 | `interactive` Run의 tmux 세션이 웹 연결과 독립적으로 유지된다. | P1 |
+| RU-05 | Runner 재시작 후 Provider 세션 ID로 Run을 재발견하고 §11.7 절차로 조정한다. | P0 |
 | RU-06 | 긴 원시 로그는 Runner에 보관하고 Server에는 구조화 이벤트와 제한된 출력만 보낸다. | P1 |
 
 ### 8.7 Git, worktree와 GitHub
@@ -404,6 +450,20 @@ MVP의 기본 완료 정책은 다음과 같이 가정한다.
 | GH-06 | PR 상태와 병합 여부를 Task에 반영한다. | P1 |
 | GH-07 | GitHub Issues를 내부 Task에 링크하거나 가져온다. | P1 |
 | GH-08 | GitHub App과 webhook 기반 양방향 상태 동기화를 지원한다. | P2 |
+| GH-09 | branch와 worktree 이름을 `run_id`에서 결정론적으로 파생해 명령 재전송 시 중복 생성하지 않는다. | P0 |
+
+#### 8.7.1 worktree 보존 정책 (P0)
+
+미커밋 변경 손실은 사용자 신뢰를 가장 빨리 무너뜨리는 실패다. GH-04를 다음 규칙으로 구체화한다.
+
+- Taskyard는 **어떤 경우에도 worktree를 자동 삭제하지 않는다.** 삭제는 항상 사용자의 명시적 행동이다.
+- Run이 `failed`, `cancelled`, 또는 조정 결과 `lost`로 끝나면 Runner는 종료 처리 전에 다음을 수행한다.
+  1. `git status --porcelain`으로 미커밋 변경 유무를 확인한다.
+  2. 변경이 있으면 `taskyard/salvage/<run_id>` 참조로 커밋 또는 stash를 만들어 보존한다.
+  3. 해당 참조를 `GitArtifact`(`type=salvage`)로 Server에 보고한다.
+- 사용자에게 제시할 정리 선택지는 `유지` / `보존 후 정리` / `삭제`이며 기본값은 `유지`다.
+- 보존 기간 기본값은 30일이고, 만료 시 자동 삭제가 아니라 Attention Item으로 알린다.
+- worktree 삭제 전에는 미커밋 변경과 push되지 않은 커밋을 항상 재확인한다.
 
 ### 8.8 Attention과 검토
 
@@ -582,8 +642,11 @@ flowchart LR
     S --> D[("Server DB")]
     R["taskyard-runner"] -->|Outbound WSS| S
     R --> L[("Local DB / Spool")]
-    R --> T["tmux / PTY"]
-    T --> A["Claude / Codex CLI"]
+    R -->|"stream-json / JSON-RPC"| A["Claude Code / Codex App Server"]
+    R --> AB["승인 브로커 (MCP)"]
+    AB -.->|permission prompt| A
+    R -.->|interactive Run 전용| T["tmux / PTY"]
+    T -.-> A
     R --> G["Git repos / worktrees"]
 ```
 
@@ -601,17 +664,35 @@ flowchart LR
 
 서버는 AI의 인지 작업을 직접 API 호출로 수행하지 않는다. Planner와 Coordinator의 AI 추론도 선택된 Runner에서 구독 CLI Run으로 실행한다. 서버는 상태, 정책, 명령, 결과를 조율한다.
 
+#### 11.2.1 이 결정이 치르는 대가
+
+이 원칙은 인증·비용·보안 측면에서 옳지만 공짜가 아니다. 설계상 받아들이는 비용이므로 숨기지 않고 명시한다.
+
+- **Runner가 오프라인이면 Taskyard는 AI 기능이 없는 티켓 보드가 된다.** 명세화 대화(SP-01), 계획 수립(PL-01), Coordinator 응답(CO-04)이 전부 온라인 Runner와 로그인된 CLI를 요구한다.
+- **AI 대화의 왕복 경로가 길다.** 매 턴이 `브라우저 → Server → WSS → Runner → CLI 프로세스`와 그 역방향을 통과한다. 채팅형 명세화가 견딜 수 있는 지연인지는 Phase 0에서 실측한다(§16.0).
+- **노트북을 닫은 상태에서는 티켓 다듬기조차 AI 없이 해야 한다.**
+
+허용 가능한 예외는 두 가지이며, 둘 다 MVP에서 채택하지 않고 실측 후 결정한다.
+
+1. 명세화 대화만 Server 측 API 호출로 예외 처리한다. §13.2와 정면으로 충돌하므로 사용자의 명시적 동의가 전제다.
+2. 항상 켜져 있는 Runner 한 대를 권장 설치 형태로 안내한다(홈서버, 상시 가동 개발 머신).
+
+UI는 Runner 오프라인 상태를 숨기지 않고 "AI 기능 사용 불가"로 분명히 표시해야 한다.
+
 ### 11.3 `taskyard-runner` 책임
 
 - 서버로 아웃바운드 WebSocket 연결
 - 로컬 저장소 탐색과 허용 경로 검증
-- tmux 세션 및 PTY 생성·재연결
+- `interactive` Run용 tmux 세션 및 PTY 생성·재연결
 - Claude Code 및 Codex CLI 실행 어댑터
 - Git branch/worktree 생성과 정리
 - 명령 실행, 테스트, diff와 상태 수집
 - 구조화 이벤트, hook, 출력 파싱
 - 연결 단절 중 이벤트 spool과 재전송
 - 로컬 인증 상태 감지하되 인증 비밀은 읽거나 전송하지 않음
+- **로컬 승인 브로커 호스팅** — Claude Code용 MCP 권한 도구를 노출하고 Codex App Server의 승인 요청을 수신해, 두 경로를 하나의 승인 이벤트로 정규화한다(§11.6.3)
+- Provider가 diff를 제공하든 아니든 **Git 기반 diff를 정본으로 산출** (Provider diff는 보조 지표)
+- Agent 프로세스를 API 키 환경변수가 제거된 환경으로 기동(§13.2.1)
 
 ### 11.4 Go 프로젝트 구조 제안
 
@@ -628,6 +709,10 @@ internal/
   protocol/
   scheduler/
   agents/
+    adapter/            # 공통 어댑터 계약 (§11.6.2)
+    adapter/claudecode/
+    adapter/codex/
+  approval/             # 로컬 승인 브로커 (§11.6.3)
   gitops/
   security/
 web/
@@ -638,13 +723,28 @@ web/
 권장 초기 구성:
 
 - Go `net/http` 또는 가벼운 라우터
-- 서버 렌더링 템플릿 + HTMX/Alpine.js
-- 터미널에 xterm.js
+- 하이브리드 UI: 서버 렌더링 템플릿 + HTMX가 기본 셸, 실시간 화면만 JS 아일랜드(§11.4.1)
+- `interactive` Run의 터미널에만 xterm.js
 - 정적 자산은 `embed.FS`로 바이너리에 포함
 - Server DB는 SQLite, 향후 PostgreSQL 선택 지원
 - Runner 상태와 spool은 로컬 SQLite
-- PTY는 검증된 Go PTY 라이브러리, 세션 지속은 tmux 사용
+- PTY와 tmux는 `interactive` Run 전용. 기본 실행 경로에는 사용하지 않는다(§11.6.4)
 - GitHub 작업은 사용자의 `git` 및 `gh` CLI 우선
+
+#### 11.4.1 웹 UI 방침 — HTMX 셸 + JS 아일랜드
+
+"전부 HTMX"도 "전부 SPA"도 아니다. 경계를 미리 명시하고 Phase 0에서 검증한다.
+
+| HTMX / 서버 렌더링 | JS 아일랜드 (클라이언트 상태 보유) |
+|---|---|
+| 보드, 리스트, 티켓 상세 폼 | Run 이벤트 스트림 뷰 |
+| 계획 승인 화면 | xterm.js 터미널 |
+| Attention Inbox | 의존성 DAG와 병렬 실행 뷰 |
+| 설정, Runner 목록 | diff 뷰어 |
+
+- 아일랜드는 SSE 또는 WebSocket으로 자기 데이터를 직접 구독한다. HTMX 영역은 일반 HTTP 요청과 부분 갱신만 사용한다.
+- 아일랜드 간 공유 전역 상태를 만들지 않는다. 각 아일랜드는 `run_id` 하나에 종속된다.
+- Phase 0에서 Run 이벤트 스트림 뷰 하나를 만들어 이 경계가 실제로 유지되는지 확인한다. 유지되지 않으면 그때 SPA 전환을 재검토한다.
 
 ### 11.5 프로토콜 요구사항
 
@@ -687,23 +787,136 @@ Server와 Runner 간 프로토콜은 버전이 명시된 구조화 메시지를 
 
 ### 11.6 Agent 어댑터
 
-공통 인터페이스는 다음 역량 차이를 흡수해야 한다.
+#### 11.6.1 검증된 Provider 표면 (2026-08 확인)
 
-- 시작, 재개, 중단, 취소
-- 구조화 이벤트 또는 hook 수신
-- 사용자/Coordinator 메시지 전달
-- 승인 요청 수신과 응답
-- 세션 식별자 저장
-- 구독 한도, 로그인 만료, CLI 오류 구분
-- 최종 결과와 사용 통계 수집
+v1.0은 Provider의 자동화 표면을 가정으로 두었다. 공식 문서 확인 결과 **두 Provider 모두 터미널 화면 파싱 없이 완전한 구조화 제어가 가능하다.** 이는 아래 어댑터 우선순위의 근거이며, tmux를 실행 경로에서 제외할 수 있는 이유다.
 
-어댑터 우선순위:
+**Codex — App Server (양방향 JSON-RPC 2.0)**
 
-1. Codex의 공식 구조화 인터페이스가 제공하는 이벤트와 승인 흐름 활용
-2. Claude Code의 공식 CLI 및 hook 활용
-3. 모든 Agent에 대한 tmux/PTY 터미널 fallback
+| 용도 | 인터페이스 |
+|---|---|
+| 세션 | `thread/start`, `thread/resume`, `thread/fork`, `thread/read`, `thread/list` |
+| 턴 | `turn/start`, `turn/steer`(진행 중인 턴에 입력 추가), `turn/interrupt` |
+| 진행 이벤트 | `thread/started`, `thread/status/changed`, `item/started`, `item/completed`, `item/agentMessage/delta`, `item/commandExecution/outputDelta` |
+| 계획·변경 | `turn/plan/updated`, `turn/diff/updated`(턴 전체의 통합 diff) |
+| 사용량 | `thread/tokenUsage/updated` |
+| 승인 | `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval` → 클라이언트가 `accept` / `acceptForSession` / `decline` / `cancel`로 응답하고 `serverRequest/resolved`로 종료 |
 
-구조화 이벤트를 정본으로 사용하고, 터미널 파싱은 최후 수단으로 제한한다.
+출처: <https://learn.chatgpt.com/docs/app-server>, <https://learn.chatgpt.com/docs/codex-sdk>
+
+**Claude Code — headless CLI**
+
+| 용도 | 인터페이스 |
+|---|---|
+| 실행 | `claude -p "<prompt>"` |
+| 이벤트 | `--output-format stream-json --verbose` (NDJSON). `--include-partial-messages`로 토큰 델타 수신 |
+| 이벤트 종류 | `system`(`init`, `api_retry`, `plugin_install`), `assistant`, `user`, `stream_event`, 마지막 줄의 `result`(최종 텍스트·비용·세션 메타데이터) |
+| 세션 | `system:init`/`result`의 `session_id`, `--resume <id>`, `--continue`, `--fork-session` |
+| 입력 주입 | `--input-format stream-json` |
+| 승인 | `--permission-prompt-tool <mcp-tool>`(비대화 모드의 권한 프롬프트를 MCP 도구로 위임), `--allowedTools`, `--permission-mode`, `PreToolUse` hook |
+| 작업 범위 | `--add-dir`, `--mcp-config`, `--strict-mcp-config` |
+| 중단 | SIGINT는 턴을 종료. SIGTERM은 턴을 미완으로 두고 exit 143이며, 재개 시 미완 턴을 이어감 |
+| 하위 Agent | subagent 메시지는 `parent_tool_use_id`로 추적 |
+
+출처: <https://code.claude.com/docs/en/headless>, <https://code.claude.com/docs/en/cli-reference>
+
+> 버전 의존성 주의: `--permission-prompt-tool`의 일부 제약(v2.1.199+), `system:init`의 `capabilities` 배열(v2.1.205+), `--mcp-config` 시작 대기(v2.1.221+)처럼 동작이 CLI 버전에 따라 다르다. 어댑터는 버전 문자열 비교 대신 `capabilities`로 기능을 탐지하고, 지원 최소 버전을 명시한다.
+
+#### 11.6.2 공통 어댑터 계약
+
+두 표면의 최소 공통 집합을 어댑터 인터페이스로 삼는다.
+
+- `Start(workItem, workdir, policy) → sessionRef`
+- `Resume(sessionRef)`
+- `Send(sessionRef, message)` — Codex는 `turn/steer`, Claude Code는 `--input-format stream-json`
+- `Interrupt(sessionRef)` / `Cancel(sessionRef)`
+- `Events(sessionRef) → <-chan Event`
+- `RespondApproval(requestID, decision)`
+- `Status()` — 로그인 상태, 구독 한도, CLI 버전, capability
+
+정규화 이벤트 타입: `message_delta`, `tool_started`, `tool_finished`, `file_changed`, `plan_updated`, `approval_requested`, `usage_updated`, `turn_completed`, `error`.
+
+어댑터는 Provider 이벤트를 버리지 않는다. 정규화하지 못한 필드는 `raw`에 보존해 나중에 활용할 수 있게 한다.
+
+#### 11.6.3 승인 흐름의 비대칭 — Runner 아키텍처에 영향
+
+두 Provider의 가장 큰 구조적 차이이며, Runner 설계를 바꾼다.
+
+| | Codex | Claude Code |
+|---|---|---|
+| 방향 | 대역 내(in-band). App Server가 JSON-RPC 요청을 보내고 클라이언트가 응답 | 대역 외(out-of-band). Runner가 **MCP 서버를 직접 호스팅**하고 `--permission-prompt-tool`로 지정해야 함 |
+| 구현 부담 | 어댑터가 채널 하나로 처리 | Runner에 로컬 MCP 엔드포인트와 요청/응답 상관관계 관리가 필요 |
+
+따라서 **Runner는 "로컬 승인 브로커"를 상시 컴포넌트로 가진다.** 브로커의 책임은 네 가지다.
+
+1. Claude Code용 MCP 권한 도구를 노출한다.
+2. Codex App Server의 승인 요청을 수신한다.
+3. 두 경로를 하나의 `approval_requested` 이벤트로 정규화해 Server에 올린다.
+4. Server의 결정을 원래 경로로 되돌린다.
+
+MCP 서버 연결 대기 기본값이 30초(`MCP_TIMEOUT`)이므로, Run 시작 시퀀스는 브로커 준비 완료를 확인한 뒤 첫 턴을 시작해야 한다.
+
+승인 왕복이 매 도구 호출마다 발생하면 실행이 느려진다. 프로젝트 정책으로 사전 허용된 도구는 Server를 거치지 않고 통과시킨다. Claude Code는 `--allowedTools`와 `--permission-mode`로, Codex는 `acceptForSession`과 정책 수정으로 표현한다. 기본 사전 허용 집합은 §22의 미해결 질문이다.
+
+#### 11.6.4 어댑터 우선순위와 tmux의 새 위치
+
+1. **Codex:** App Server JSON-RPC를 정본으로 사용한다. 단순 실행만 필요하면 Codex SDK도 가능하지만, 승인·steering·diff 이벤트가 필요한 Taskyard에는 App Server가 맞다.
+2. **Claude Code:** headless CLI + `stream-json` + `--permission-prompt-tool`을 정본으로 사용한다.
+3. **tmux/PTY:** 실행 제어 경로에서 **제외한다.** 두 용도로만 남긴다.
+   - 사용자가 "직접 개입"을 선택했을 때 여는 대화형 세션
+   - 구조화 표면이 없는 미래 Provider를 위한 fallback
+
+터미널 화면을 파싱해 Agent 상태를 판정하는 로직은 만들지 않는다.
+
+#### 11.6.5 결과: 웹 터미널의 의미가 바뀐다
+
+구조화 실행에는 붙을 TUI가 없다. v1.0이 전제한 "모든 Run은 tmux 세션이며 xterm.js로 붙을 수 있다"는 더 이상 성립하지 않는다. Run을 두 종류로 나눈다.
+
+| Run 종류 | 프로세스 | 웹에서 보는 것 | 사람의 개입 방식 |
+|---|---|---|---|
+| `structured` (기본) | Runner가 관리하는 CLI 또는 App Server 프로세스 | 구조화 이벤트 타임라인 + 원시 stdout/stderr 로그 뷰 | 메시지 주입(`Send`), 승인 응답, 중단 |
+| `interactive` (탈출구) | tmux 세션 | xterm.js 터미널 | 직접 타이핑 |
+
+- 기본은 `structured`다. 프로세스 지속은 tmux가 아니라 **Runner의 프로세스 관리 + Provider 세션 재개**(`thread/resume`, `claude --resume`)로 확보한다.
+- 사용자가 "터미널에서 직접 이어받기"를 선택하면 Runner가 같은 세션 ID로 `interactive` Run을 시작한다. 원래 Run은 `paused_user`가 된다.
+- Runner 수명과 Agent 프로세스 수명의 관계는 Provider마다 다르다.
+  - **Codex:** App Server를 장기 실행 로컬 서비스로 띄우고 Runner가 로컬 소켓으로 접속한다. Runner를 재시작해도 Agent는 살아 있다.
+  - **Claude Code:** 프로세스가 Runner에 종속된다. Runner 재시작 시 진행 중이던 턴의 스트리밍 출력 일부는 잃지만, `--resume <session_id>`가 미완 턴을 이어받는다. 이 손실은 허용하고, 이벤트 중복 적용은 허용하지 않는다.
+
+### 11.7 Run 조정(reconciliation) 절차
+
+`orphaned`는 "Server가 Run의 실제 상태를 모른다"는 뜻이지 실패가 아니다. heartbeat 누락만으로 Run을 실패 처리하지 않는다(§11.5).
+
+**진입 조건**
+
+- Runner heartbeat가 `T_miss`(기본 60초) 이상 없음, 또는
+- Runner가 재연결했으나 Server가 `running`으로 알고 있는 Run을 Runner가 보고하지 않음
+
+**Server 측**
+
+1. `running` Run을 `orphaned`로 전이한다. worktree와 branch는 손대지 않는다.
+2. `T_grace`(기본 15분) 동안 재연결을 기다린다. UI에는 "연결 확인 중"으로 표시한다.
+3. 재연결되면 `run.reconcile` 명령을 보낸다.
+4. `T_grace` 경과 후에도 미해결이면 Attention Item(`type=reconcile_needed`)을 만들고 사용자에게 선택지를 제시한다: 재개 / 현재 결과 채택 후 종료 / 폐기(worktree는 보존).
+
+**Runner 측 (`run.reconcile` 수신 또는 재시작 직후)**
+
+1. 로컬 원장(SQLite)에서 종료 상태가 아닌 Run을 모두 읽는다.
+2. 각 Run의 실제 상태를 판정한다.
+   - Agent 프로세스 생존 여부 (PID + 프로세스 시작시각 대조로 PID 재사용 방지)
+   - Provider 세션 재개 가능 여부 (`thread/resume` 또는 `claude --resume`)
+   - worktree 존재 여부와 현재 branch 일치 여부
+3. 세 가지 중 하나로 보고한다.
+   - `alive` — 프로세스 생존. 이벤트 스트림을 다시 연결하고 spool을 재전송한다.
+   - `resumable` — 프로세스는 죽었으나 세션 ID로 재개 가능. 미커밋 변경 요약과 함께 보고한다.
+   - `lost` — 세션 재개 불가. worktree 변경사항을 보존(§8.7.1)하고 보고한다.
+4. Server는 마지막으로 ACK한 `sequence` 이후의 이벤트만 적용한다.
+
+**멱등성 규칙**
+
+- `run.start`는 `command_id` 기준으로 한 번만 적용한다. 동일 `command_id`를 다시 받으면 기존 Run 상태를 응답으로 돌려준다.
+- branch와 worktree 이름은 `run_id`에서 결정론적으로 파생한다. 이미 존재하면 재사용하고 새로 만들지 않는다(GH-09).
+- Runner는 마지막으로 발행한 `sequence`를 로컬에 영속한다. 재개 후 첫 이벤트는 그 값에서 이어간다.
 
 ---
 
@@ -717,9 +930,9 @@ Server와 Runner 간 프로토콜은 버전이 명시된 구조화 메시지를 
 | Task | id, project_id, number, title, description, acceptance_criteria, status, priority, parent_id |
 | TaskRelation | source_task_id, target_task_id, type |
 | Plan | id, task_id, version, status, summary, merge_strategy, risk_summary |
-| WorkItem | id, plan_id, task_id, type, scope, status, parallel_group |
+| WorkItem | id, plan_id, task_id, type, scope, status, parallel_group, expected_paths, exclusive_paths, conflict_risk |
 | Dependency | predecessor_work_item_id, successor_work_item_id, type |
-| Run | id, work_item_id, agent_profile_id, runner_id, state, session_ref, branch, worktree_path |
+| Run | id, work_item_id, agent_profile_id, runner_id, state, kind(structured/interactive), provider_session_id, last_acked_sequence, reconcile_state, branch, worktree_path |
 | RunEvent | run_id, sequence, type, payload, occurred_at |
 | AgentProfile | id, provider, role, model_or_mode, permissions, prompt_policy |
 | CoordinatorMemory | id, scope_type, scope_id, kind, content, source_ref, confidence, status |
@@ -727,7 +940,8 @@ Server와 Runner 간 프로토콜은 버전이 명시된 구조화 메시지를 
 | AttentionItem | id, project_id, task_id, run_id, type, severity, status, recommendation |
 | Runner | id, name, status, capabilities, last_seen_at, revoked_at |
 | ExternalReference | id, task_id, provider, external_id, url, sync_mode, sync_cursor |
-| GitArtifact | id, run_id, type, ref, url, metadata |
+| GitArtifact | id, run_id, type(commit/branch/pr/salvage), ref, url, metadata |
+| ApprovalRequest | id, run_id, provider_request_id, channel(inband/mcp), kind, payload, decision, decided_by, decided_at |
 
 ### 12.1 이벤트와 감사
 
@@ -755,6 +969,15 @@ Server와 Runner 간 프로토콜은 버전이 명시된 구조화 메시지를 
 - `ANTHROPIC_AUTH_TOKEN`
 
 사용자가 프로젝트 정책에서 API 모드를 명시적으로 활성화한 경우에만 예외를 허용한다. MVP에서는 API 모드 자체를 제공하지 않아도 된다.
+
+#### 13.2.1 실행 플래그 금지·필수 목록
+
+문서 확인 결과, CLI 플래그 하나가 과금 경로를 통째로 바꿀 수 있다. Runner의 Agent 기동 명령은 다음을 강제한다.
+
+- **금지 — Claude Code의 `--bare`.** 이 모드는 OAuth 자격증명과 시스템 키체인을 읽지 않으며 `ANTHROPIC_API_KEY`를 요구한다. 즉 구독이 아니라 **API로 과금된다.** CI 재현성에는 적절하지만 Taskyard의 기본 실행 모델과 정면으로 어긋난다.
+- **결과적 주의사항.** `--bare`를 쓰지 않으면 작업 디렉터리의 `.claude/settings.json` hook과 `.mcp.json` MCP 서버가 로드된다. `-p` 세션에는 신뢰 확인 대화가 없으므로, 신뢰하지 않는 저장소의 설정이 그대로 실행될 수 있다. Runner는 프로젝트별로 어떤 로컬 설정을 허용할지 정책으로 관리하고, 필요하면 `--strict-mcp-config`로 MCP 구성을 브로커만으로 제한한다. §14.1의 프롬프트 인젝션 위협과 직접 연결된다.
+- **필수 — 승인 게이트.** `--permission-prompt-tool`과 브로커 MCP 설정(`--mcp-config`)을 항상 지정한다.
+- **환경 위생.** Run 시작 전 Runner는 §13.2의 API 키 환경변수를 제거한 환경으로 프로세스를 띄운다. 상속으로 흘러드는 것을 막는다.
 
 ### 13.3 상용화 전 확인 사항
 
@@ -832,8 +1055,8 @@ Runner에 저장:
 
 ### 15.3 신뢰성
 
-- Server 재시작이 tmux의 실행 프로세스를 종료하지 않아야 한다.
-- Runner 재시작 후 살아 있는 세션을 재발견해야 한다.
+- Server 재시작이 Runner의 실행 중 Agent 프로세스에 영향을 주지 않아야 한다.
+- Runner 재시작 후 Provider 세션 ID로 Run을 재발견하고 재개할 수 있어야 한다(§11.7). Codex는 App Server를 장기 실행 로컬 서비스로 두어 Runner 수명과 분리하고, Claude Code는 미완 턴을 `--resume`으로 이어받는다. 진행 중이던 턴의 스트리밍 출력 일부 손실은 허용하되, 이벤트 중복 적용은 허용하지 않는다.
 - 동일 명령 재전송이 branch, worktree, Run을 중복 생성하지 않아야 한다.
 - 이벤트는 at-least-once 전송하되 Server에서 멱등 적용한다.
 - 상태 불일치는 자동 reconciliation 또는 사용자에게 명확한 복구 선택지를 제공한다.
@@ -847,9 +1070,39 @@ Runner에 저장:
 
 ---
 
-## 16. MVP 출시 범위
+## 16. 출시 범위
 
-### 16.1 P0 기능 묶음
+v1.0의 "MVP P0" 7묶음은 사실상 제품 셋(내장 티켓 관리 시스템, 분산 실행 인프라, 멀티 Agent 오케스트레이션)이다. 한 번에 진행하면 어느 것도 완성되지 않는다. 따라서 **아래 §16.1은 Phase 1(Solo Developer MVP)의 범위로 재분류하고**, 실제 착수 범위는 §16.0으로 둔다.
+
+### 16.0 Phase 0 착수 범위 — 수직 스파이크
+
+UI의 폭을 넓히기 전에 가장 위험한 가정을 먼저 관통한다. 목표는 기능이 아니라 **아키텍처 전제의 실증**이다.
+
+> **스파이크 정의:** 하드코딩된 Task 하나로, Runner가 저장소에 worktree를 만들고 → Claude Code를 headless로 실행하고 → 구조화 이벤트를 Server로 스트리밍하고 → 승인 요청을 웹에서 응답하고 → 연결을 끊었다 붙여도 이벤트 유실·중복 없이 복구되고 → diff를 회수한다. UI는 이벤트 스트림 한 화면.
+
+포함:
+
+1. Go 모노레포, 두 바이너리, 프로토콜 v0과 버전 협상
+2. Runner 페어링, 아웃바운드 WSS, heartbeat
+3. `command_id` 멱등성, `sequence` ACK, 로컬 spool과 재전송
+4. Claude Code 어댑터 하나 (`-p --output-format stream-json --resume`)
+5. 로컬 승인 브로커(MCP 권한 도구)와 웹 승인 UI
+6. `run_id` 기반 결정론적 branch/worktree 생성과 salvage 커밋
+7. Run 이벤트 스트림 뷰 (JS 아일랜드 1개)
+8. Runner 재시작 후 세션 재개(§11.7)
+
+제외: 보드 UI, 티켓 CRUD, Planner, Coordinator, 병렬 스케줄러, Codex 어댑터, PR 생성.
+
+완료 판정:
+
+- 임의 시점에 연결을 10회 끊었다 붙여도 이벤트 유실과 중복 적용이 0이다.
+- 실행 중 Runner를 재시작해도 Run이 `lost`가 아니라 `resumable`로 복구된다.
+- 승인 요청이 웹에 뜨고, 응답이 Agent에 전달되어 실행이 계속된다.
+- 브라우저에서 Agent까지의 왕복 지연을 측정해 §11.2.1의 판단 근거를 만든다.
+
+이 네 가지가 성립하면 §11의 아키텍처 전제가 실증된 것이고, 성립하지 않으면 보드 UI를 만들기 전에 알게 된다.
+
+### 16.1 Phase 1(Solo Developer MVP) 기능 묶음
 
 1. **내장 티켓 보드**
    - 여러 프로젝트
@@ -868,9 +1121,9 @@ Runner에 저장:
 
 4. **Claude/Codex 실행**
    - 공식 CLI의 사용자 로그인 사용
-   - tmux/PTY 세션
-   - 구조화 이벤트 또는 hook
-   - 터미널 fallback
+   - 구조화 인터페이스를 정본으로 사용 (§11.6.1)
+   - 로컬 승인 브로커
+   - 필요 시 `interactive` Run으로 인계
 
 5. **병렬 개발 실행**
    - 의존성 DAG
@@ -889,7 +1142,7 @@ Runner에 저장:
    - `gh`를 이용한 PR 생성
    - AI Review와 사용자 완료 승인
 
-### 16.2 MVP에서 의도적으로 미루는 기능
+### 16.2 Phase 1에서도 의도적으로 미루는 기능
 
 - Jira·Linear 양방향 동기화
 - GitHub App 기반 고급 연동
@@ -924,10 +1177,12 @@ Runner에 저장:
 ### 시나리오 B: 연결 장애 복구
 
 1. Run 실행 중 Server와 Runner 연결을 끊는다.
-2. tmux의 Agent 작업은 가능한 범위에서 계속된다.
-3. Runner가 이벤트를 로컬에 보존한다.
-4. 연결 복구 후 이벤트가 순서대로 동기화된다.
+2. Runner에서 실행 중인 Agent 작업은 가능한 범위에서 계속된다.
+3. Runner가 이벤트를 로컬 spool에 보존한다.
+4. 연결 복구 후 이벤트가 순서대로, 유실과 중복 적용 없이 동기화된다.
 5. 중복 명령이나 중복 worktree 없이 Server 상태가 실제 상태와 일치한다.
+6. 실행 중 Runner를 재시작해도 §11.7 절차로 Run이 `resumable`로 복구되고 세션이 이어진다.
+7. 세션 재개가 불가능한 경우에도 worktree의 미커밋 변경이 salvage 참조로 보존된다(§8.7.1).
 
 ### 시나리오 C: 구독 인증 경계
 
@@ -968,8 +1223,14 @@ Runner에 저장:
 
 | 위험 | 영향 | 대응 |
 |---|---|---|
-| 공식 CLI 자동화 또는 구독 조건 변경 | 핵심 실행 방식 제약 | 인증 비밀 비취급, 공식 인터페이스 우선, Provider별 어댑터, 상용화 전 약관 확인 |
-| tmux 화면 파싱의 취약성 | 상태 오판·승인 누락 | 구조화 이벤트/hook 우선, 터미널은 fallback |
+| Provider 인터페이스의 버전 드리프트 | 어댑터 파손 | (2026-08 표면 검증 완료, §11.6.1) capability 기반 기능 탐지, 최소 지원 버전 명시, Provider별 계약 테스트를 CI에 유지 |
+| 구독으로 허용되는 자동화 범위의 변경 | 핵심 실행 방식 제약 | 인증 비밀 비취급, 공식 인터페이스만 사용, 상용화 전 Provider별 약관 확인(§13.3) |
+| 잘못된 플래그로 API 과금 발생 | 예상 밖 비용 | `--bare` 등 금지 목록 강제, API 키 환경변수 제거 후 기동(§13.2.1) |
+| 신뢰하지 않는 저장소의 로컬 설정 실행 | 프롬프트 인젝션·임의 명령 | 프로젝트별 로컬 설정 허용 정책, `--strict-mcp-config`, 승인 게이트(§13.2.1) |
+| Runner 오프라인 시 AI 기능 전면 중단 | 제품 가치 상실 | 상태를 숨기지 않고 표시, 상시 Runner 권장, 예외 정책은 실측 후 결정(§11.2.1) |
+| 범위 팽창으로 어느 것도 완성되지 않음 | 출시 지연 | Phase 0 수직 스파이크 우선(§16.0), 기존 P0 묶음은 Phase 1로 재분류 |
+| Coordinator 기억 메커니즘 미정의 | Phase 1 착수 불가 | 별도 설계 문서 선행, Phase 0은 단일 파일 주입으로 시작(§8.4.1) |
+| 승인 왕복이 실행 속도를 저해 | 사용성 저하 | 사전 허용 도구 정책, 세션 단위 승인(`acceptForSession`), Phase 0에서 실측(§11.6.3) |
 | 병렬 작업의 Git 충돌 | 통합 비용 증가 | Planner 충돌 예측, worktree 격리, 병합 전략 사전 승인, Integrator 역할 |
 | Coordinator의 잘못된 판단 | 제품 품질·보안 문제 | 중요도 정책, 확신도 임계값, 결정 기록, 사용자 수정의 기억 반영 |
 | Server 탈취로 Runner 악용 | 로컬 코드와 머신 위험 | 최소 권한, 경로 allowlist, 위험 명령 승인, 자격증명 취소, 감사로그 |
@@ -982,13 +1243,16 @@ Runner에 저장:
 
 ## 20. 단계별 로드맵
 
-### Phase 0 — 내부 Dogfood
+### Phase 0 — 수직 스파이크 (실제 착수 범위)
 
-- Go 모노레포와 두 바이너리
-- 단일 사용자·단일 Server·복수 Runner 기반
-- 프로젝트, 기본 보드, Task 상세
-- 한 Provider의 CLI Run과 tmux 재연결
-- 수동 worktree와 실행 이벤트
+상세는 §16.0. 요약하면 **"Task 하나 · Provider 하나 · 화면 하나"**로 실행·복구·승인 경로를 실증한다. 보드와 티켓 CRUD는 이 단계에 없다.
+
+Provider 순서는 **Claude Code 먼저**다. 이유는 두 가지다.
+
+- 프로세스 모델(`-p` 1회 실행 + `--resume`)이 단순해 복구 시나리오를 먼저 정립하기 좋다.
+- 승인 경로가 대역 외(MCP 브로커)라 더 어렵다. 어려운 쪽을 먼저 만들면 Codex 어댑터는 그 인터페이스에 맞추기 쉽다.
+
+Codex 어댑터는 Phase 1에서 두 번째로 붙이며, 그때 §11.6.2의 공통 계약을 일반화한다.
 
 ### Phase 1 — Solo Developer MVP
 
@@ -1047,6 +1311,11 @@ Runner에 저장:
 | 구현 언어 | 배포 편의를 위해 Go |
 | 프로세스 구조 | 처음부터 Server와 Runner 두 바이너리 |
 | 모델 이용 | API 키보다 공식 CLI 구독 사용 우선 |
+| 실행 제어 경로 | 구조화 인터페이스만 사용. tmux는 사람의 탈출구 전용 (§11.6.4) |
+| 승인 처리 | Runner가 로컬 승인 브로커를 호스팅해 두 Provider 경로를 정규화 (§11.6.3) |
+| 웹 UI | HTMX 셸 + 실시간 화면만 JS 아일랜드 (§11.4.1) |
+| 첫 Provider | Claude Code (§20) |
+| 착수 범위 | Phase 0 수직 스파이크 (§16.0) |
 
 ### 미확정 또는 검증이 필요한 결정
 
@@ -1055,10 +1324,13 @@ Runner에 저장:
 | Done 게이트 | 검증+AI Review 후 Review, PR 병합 또는 사용자 승인 후 Done | 초기 사용자 인터뷰와 Dogfood |
 | 첫 외부 티켓 연동 | GitHub Issues 우선 | 실제 사용 빈도 조사 |
 | Server DB | SQLite 우선, PostgreSQL 후속 | 프로젝트·이벤트 규모 측정 |
-| 웹 UI | 서버 렌더링+HTMX 중심 | 복잡한 실시간 UI 구현성 검증 |
+| JS 아일랜드 경계 | 실시간 화면만 아일랜드로 분리해도 유지 가능하다 | Phase 0에서 이벤트 스트림 뷰로 검증, 실패 시 SPA 재검토 |
+| 명세화 대화 지연 | Runner 경유 왕복이 대화 UX로 견딜 만하다 | Phase 0에서 p95 실측 (§11.2.1) |
+| 승인 브로커 부하 | 사전 허용 정책이 있으면 실행 속도에 큰 영향이 없다 | Phase 0에서 도구 호출당 왕복 측정 |
+| 구독 기반 자동화 허용 범위 | 공식 인터페이스 사용은 약관상 허용된다 | 상용 배포 전 Provider별 확인 (§13.3) |
 | 기본 Runner 배치 | 사용자 개발 머신 한 대 | 다중 머신 사용 패턴 관찰 |
 | Agent 선택 정책 | Plan에서 역할별 추천, 사용자 정책 우선 | 품질·한도·재시도 데이터 측정 |
-| Coordinator 기억 압축 | 출처 있는 구조화 기억+필요 시 대화 요약 | 장기 프로젝트에서 맥락 손실 평가 |
+| Coordinator 기억 | Phase 0은 단일 파일 주입, 이후 구조화 기억으로 전환 | §8.4.1 설계 문서 선행 후 장기 프로젝트에서 맥락 손실 평가 |
 | 자동 승인 범위 | MVP에서는 계획과 중요 결정에 사용자 승인 | Attention 피로도 측정 후 확대 |
 | 브랜드 | Taskyard 이름과 태그라인 사용 | 상표·도메인·패키지명 확인 |
 
@@ -1067,7 +1339,7 @@ Runner에 저장:
 ## 22. 출시 전 반드시 답할 질문
 
 1. 기본 `Done` 정책은 PR 병합 필수인가, 사용자 승인만으로 가능한가?
-2. Taskyard가 처음 지원할 Claude/Codex CLI 버전과 공식 자동화 표면은 무엇인가?
+2. (표면은 §11.6.1에서 확정) 지원할 CLI 버전 하한을 어디로 잡을 것인가? Claude Code는 `--permission-prompt-tool` 제약, `capabilities` 필드, `--mcp-config` 시작 대기가 각각 다른 버전부터 동작한다.
 3. Planner, Coordinator, Worker별 기본 Agent 선택은 어떻게 할 것인가?
 4. 사용자에게 올라갈 “중요한 판단”의 초기 규칙과 확신도 임계값은 무엇인가?
 5. 로그·diff의 Server 전송 기본값은 어느 수준이어야 하는가?
@@ -1076,6 +1348,11 @@ Runner에 저장:
 8. GitHub Issues, Linear, Jira 중 실제 첫 연동 수요는 무엇인가?
 9. 전역 Coordinator가 자동으로 프로젝트 우선순위를 바꿀 수 있는가, 추천만 하는가?
 10. 상용 제공 전에 각 Provider와 확인해야 할 구독·자동화 정책은 무엇인가?
+11. Runner가 오프라인일 때 AI 명세화만 Server 측에서 대신 처리하는 예외를 허용할 것인가? (§11.2.1)
+12. 승인 왕복을 줄이기 위한 기본 사전 허용 도구 집합은 무엇인가? (§11.6.3)
+13. 신뢰하지 않는 저장소의 `.claude/settings.json` hook과 `.mcp.json`을 어떤 기본값으로 차단할 것인가? (§13.2.1)
+14. `interactive` Run으로 인계한 뒤 다시 `structured`로 되돌릴 수 있어야 하는가? (§11.6.5)
+15. Codex App Server를 Runner당 하나의 장기 실행 서비스로 둘 것인가, 프로젝트당 하나로 둘 것인가? (§11.6.5)
 
 ---
 
