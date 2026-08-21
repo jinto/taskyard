@@ -264,6 +264,14 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID,
 		_ = m.cfg.Spool.SaveRun(record)
 		m.salvage(runID)
 		m.fail(runID, errors.New("stream ended before init; billing identity unverified"))
+	case session.UsesAPIKey():
+		// init 이후 emit이 한 번도 없었다면(system 메시지는 emit하지 않는다)
+		// emit 콜백의 조기 검사가 한 번도 실행되지 못한다. 여기가 그 경우의
+		// 마지막 방어선이다(PRD §13.2).
+		record.State = "failed"
+		_ = m.cfg.Spool.SaveRun(record)
+		m.salvage(runID)
+		m.fail(runID, fmt.Errorf("agent ran on API billing (apiKeySource=%q); refusing to continue", session.APIKeySource))
 	default:
 		record.State = "succeeded"
 		_ = m.cfg.Spool.SaveRun(record)
