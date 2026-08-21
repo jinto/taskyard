@@ -225,6 +225,9 @@ func TestRunStartCreatesWorktreeAndStreamsEvents(t *testing.T) {
 	if runs[0].SessionID == "" {
 		t.Error("ledger did not record the provider session id; resume would be impossible")
 	}
+	if runs[0].PID == 0 {
+		t.Error("ledger did not record the agent PID; Task 10's restart reconcile classifies liveness from it")
+	}
 }
 
 func TestDuplicateRunStartIsAppliedOnce(t *testing.T) {
