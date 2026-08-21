@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/google/uuid"
+
 	"github.com/jinto/taskyard/internal/protocol"
 	"github.com/jinto/taskyard/internal/server/hub"
 	"github.com/jinto/taskyard/internal/server/store"
@@ -43,6 +45,7 @@ func New(st *store.Store, h *hub.Hub) (*Server, error) {
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleIndex)
+	mux.HandleFunc("POST /runs", s.handleRunCreate)
 	mux.HandleFunc("GET /runs/{id}", s.handleRun)
 	mux.HandleFunc("GET /runs/{id}/stream", s.handleStream)
 	mux.HandleFunc("POST /runs/{id}/approve", s.handleApprove)
@@ -124,6 +127,52 @@ func (s *Server) handleIndex(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	s.render(w, s.runs, map[string]any{"Title": "실행 목록", "Runs": runs})
+}
+
+// handleRunCreate는 하드코딩된 Task 하나를 실제로 기동하는 유일한 문이다
+// (PRD §16.0). 폼 필드로 받는 이유는 승인 패널과 달리 이 화면은 JS 없이도
+// 동작해야 하는 순수 HTML 폼이기 때문이다.
+//
+// 명령을 보내기 전에 먼저 Run을 queued로 만들어야 한다: Runner가 run.start를
+// 받는 즉시 이벤트를 낼 수 있는데, store.ApplyEvent는 runs 테이블에 행이
+// 없으면 그 이벤트를 ErrRunNotFound로 버린다(store.go). 순서를 뒤집으면
+// 첫 이벤트가 조용히 유실된다.
+//
+// Runner가 연결돼 있지 않으면 명령이 갈 곳이 없다. 방금 만든 행을 queued로
+// 영영 남기면 사용자는 실행 중이라고 믿게 되므로, 그 자리에서 failed로
+// 정리하고 503을 돌려준다 — 성공한 척 위장하지 않는다.
+func (s *Server) handleRunCreate(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	prompt := r.FormValue("prompt")
+	if prompt == "" {
+		http.Error(w, "prompt is required", http.StatusBadRequest)
+		return
+	}
+
+	runID := "run-" + uuid.NewString()
+
+	cmd, err := protocol.NewCommand(protocol.CmdRunStart, runID, map[string]any{"prompt": prompt})
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := s.st.UpsertRun(store.Run{ID: runID, State: store.StateQueued, Kind: "structured"}); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := s.hub.SendCommand(cmd); err != nil {
+		slog.Warn("run.start could not be delivered", "run_id", runID, "err", err)
+		_ = s.st.UpsertRun(store.Run{ID: runID, State: store.StateFailed, Kind: "structured"})
+		http.Error(w, "runner is not connected", http.StatusServiceUnavailable)
+		return
+	}
+
+	http.Redirect(w, r, "/runs/"+runID, http.StatusSeeOther)
 }
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
