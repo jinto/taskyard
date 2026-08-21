@@ -134,8 +134,15 @@ func (m *Manager) HandleCommand(ctx context.Context, env protocol.Envelope) erro
 	case protocol.CmdApprovalDecision:
 		return m.handleApprovalDecision(env)
 	case protocol.CmdRunReconcile:
-		// Task 10이 m.Reconcile을 구현하면 이 한 줄만 바뀐다.
-		return errors.New("run.reconcile: not implemented until Task 10")
+		// Reconcile은 Run마다 git salvage를 돌릴 수 있어 수 초가 걸릴 수
+		// 있다. link.readLoop가 HandleCommand를 동기 호출하므로 여기서
+		// 기다리면 그 연결의 ack 처리와 spool 정리가 함께 멈춘다.
+		go func() {
+			if err := m.Reconcile(context.Background()); err != nil {
+				slog.Error("reconcile failed", "err", err)
+			}
+		}()
+		return nil
 	default:
 		return fmt.Errorf("lifecycle: unknown command %q", env.Type)
 	}
