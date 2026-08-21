@@ -174,11 +174,15 @@ func TestRunStartCreatesWorktreeAndStreamsEvents(t *testing.T) {
 		return col.count(protocol.EvTurnCompleted) == 1
 	})
 
+	// turn_completed는 스트림 처리 중에 나오지만, 종결 상태 변경과 그에 딸린
+	// 원장 저장(SessionID 포함)은 cmd.Wait() 이후 별도로 뒤따른다. 그 사이의
+	// 스케줄링 간극만큼 레이스이므로, 곧바로 확인하지 않고 여기서도 기다린다.
+	waitFor(t, "terminal state change", func() bool {
+		return col.count(protocol.EvRunStateChanged) >= 2
+	})
+
 	if col.count(protocol.EvMessageDelta) != 1 {
 		t.Errorf("message_delta count = %d, want 1 (types: %v)", col.count(protocol.EvMessageDelta), col.types())
-	}
-	if col.count(protocol.EvRunStateChanged) < 2 {
-		t.Errorf("expected at least a running and a terminal state change, got %v", col.types())
 	}
 
 	if _, err := os.Stat(filepath.Join(git.WorktreePath("run-1"), "README.md")); err != nil {
