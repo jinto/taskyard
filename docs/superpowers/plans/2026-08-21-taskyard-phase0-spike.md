@@ -5826,7 +5826,11 @@ func main() {
 	}()
 	slog.Info("approval broker listening", "url", brokerURL)
 
-	// lifecycle과 link이 서로를 참조하므로 publish를 나중에 채운다.
+	// lifecycle과 link이 서로를 참조하므로 publish 클로저가 l을 늦게 읽는다.
+	//
+	// 불변식: l 대입은 반드시 lm.Start와 lm.Reconcile 호출보다 앞서야 한다.
+	// 둘 다 이벤트를 발행할 수 있고, 발행은 이 클로저를 거쳐 l에 닿는다.
+	// 순서가 뒤집히면 첫 이벤트에서 nil 역참조로 죽는다.
 	var l *link.Link
 
 	lm, err := lifecycle.New(lifecycle.Config{
@@ -5858,6 +5862,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 여기부터 l이 유효하다. 위 불변식대로 발행자들을 그 뒤에 띄운다.
 	go lm.Start(ctx)
 
 	// 재시작 직후 남아 있는 Run의 실제 상태를 먼저 맞춘다(PRD §11.7).
@@ -5881,6 +5886,8 @@ func randomToken() string {
 ```
 
 import에 `crypto/rand`와 `encoding/hex`를 추가한다.
+
+> **순서 주의:** `l, err = link.New(...)` 대입이 `go lm.Start(ctx)`와 `lm.Reconcile(ctx)`보다 **먼저** 와야 한다. 두 호출 모두 이벤트를 발행하고, 발행 경로가 `Publish` 클로저를 통해 `l`을 읽는다. 위 코드는 그 순서를 지키고 있다. 리팩터링할 때 이 순서를 깨지 않는다.
 
 - [ ] **Step 3: 빌드 확인**
 
@@ -6132,7 +6139,9 @@ func TestCriterion3_ApprovalRoundTrip(t *testing.T) {
 	}
 }
 
-// 판정 4: 브라우저에서 Agent까지의 왕복 지연을 측정한다(§11.2.1의 근거).
+// 판정 4: 왕복 지연을 측정해 기록한다(§11.2.1의 판단 근거).
+//
+// 이 테스트는 통과·실패를 가르지 않는다. 숫자를 남기는 것이 목적이다.
 func TestCriterion4_MeasureRoundTripLatency(t *testing.T) {
 	dir := t.TempDir()
 	s := newStack(t, dir)
@@ -6168,19 +6177,26 @@ func TestCriterion4_MeasureRoundTripLatency(t *testing.T) {
 	}
 
 	avg := total / samples
-	t.Logf("Runner→Server 이벤트 왕복 평균: %v (%d samples)", avg, samples)
 
-	// 이 경계를 넘으면 PRD §11.2.1의 "명세화 대화가 견딜 만한가"가 흔들린다.
-	if avg > 250*time.Millisecond {
-		t.Fatalf("average round trip %v exceeds the 250ms budget", avg)
-	}
+	// 측정값을 기록만 한다. 실패 조건을 두지 않는 이유는 두 가지다.
+	//
+	// 첫째, 이 값의 하한은 전송이 아니라 위 폴링 간격(10ms)이다. 임계값을
+	// 걸면 전송 성능이 아니라 테스트 하네스를 재게 된다.
+	//
+	// 둘째, PRD §11.2.1의 열린 질문은 브라우저→Server→Runner→CLI 왕복이고
+	// 이 측정은 그 구간의 일부일 뿐이다. 숫자는 판단의 재료이지 판정 기준이
+	// 아니다. PRD §21의 "명세화 대화 지연" 행에 이 값을 기록하고,
+	// 실제 판단은 사람이 한다.
+	t.Logf("Runner→Server 이벤트 왕복 평균: %v (%d samples, localhost)", avg, samples)
 }
 ```
 
 - [ ] **Step 5: 완료 판정 실행**
 
 Run: `go test ./acceptance/ -race -v`
-Expected: PASS (4 tests). `TestCriterion4`의 로그로 실측 지연을 확인하고 PRD §21의 "명세화 대화 지연" 행에 기록한다.
+Expected: PASS (4 tests).
+
+판정 1~3이 실제 판정이다. 판정 4는 임계값 없이 숫자만 남긴다 — 하한이 폴링 간격이라 임계값을 걸면 전송이 아니라 테스트 하네스를 재게 되고, 부하가 걸린 머신에서 헛되이 깨져 나머지 세 판정의 신뢰도까지 떨어뜨린다. `TestCriterion4`의 로그를 읽어 PRD §21의 "명세화 대화 지연" 행에 기록하고, 견딜 만한 값인지는 사람이 판단한다.
 
 - [ ] **Step 6: 실제 CLI 스모크 테스트 작성**
 
