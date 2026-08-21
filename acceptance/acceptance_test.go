@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 	"github.com/jinto/taskyard/internal/runner/spool"
 	"github.com/jinto/taskyard/internal/server/hub"
 	"github.com/jinto/taskyard/internal/server/store"
+	"github.com/jinto/taskyard/internal/server/web"
 )
 
 const fixture = "../internal/agents/adapter/claudecode/testdata/session-pong.ndjson"
@@ -95,8 +97,11 @@ func newStack(t *testing.T, dbDir string) *stack {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// README.md에 한 줄을 덧붙여, 이 fake Agent가 실행된 Run은 base 대비
+	// 실제 diff를 남기게 한다 — Diff 회수를 검증하는 판정(트리거 테스트)이
+	// 빈 문자열이 아니라 실제 변경을 보고 확인한다.
 	fake := filepath.Join(dbDir, "fake-claude")
-	if err := os.WriteFile(fake, []byte("#!/bin/sh\ncat "+abs+"\n"), 0o755); err != nil {
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho agent-work >> README.md\ncat "+abs+"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -459,4 +464,92 @@ func TestCriterion4_MeasureRoundTripLatency(t *testing.T) {
 	// 아니다. PRD §21의 "명세화 대화 지연" 행에 이 값을 기록하고,
 	// 실제 판단은 사람이 한다.
 	t.Logf("Runner→Server 이벤트 왕복 평균: %v (%d samples, localhost)", avg, samples)
+}
+
+// TestPostRunsTriggersAssembledRunAndYieldsDiff는 §16.0이 요구하는 조립된
+// 경로 전체를 문 하나로 들어가 끝까지 움직인다: 브라우저가 누를 법한
+// POST /runs가 store.UpsertRun과 protocol.CmdRunStart를 실제로 발행하고,
+// Runner가 Agent를 띄워 이벤트를 흘리고, 종결 뒤 gitops.Diff로 변경을
+// 회수할 수 있는지까지 확인한다. 전체 브랜치 리뷰(C1)가 지적하기 전까지는
+// 이 문 자체가 어디에도 없었다 — Server·Runner·gitops.Diff는 각자 갖춰져
+// 있었지만 아무것도 서로를 부르지 않았다.
+func TestPostRunsTriggersAssembledRunAndYieldsDiff(t *testing.T) {
+	dir := t.TempDir()
+	s := newStack(t, dir)
+
+	ui, err := web.New(s.st, s.hub)
+	if err != nil {
+		t.Fatalf("web.New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.link.Run(ctx)
+	waitFor(t, "runner connection", s.hub.Connected)
+
+	form := url.Values{"prompt": {"say pong"}}
+	req := httptest.NewRequest(http.MethodPost, "/runs", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	ui.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST /runs status = %d, body=%s", rec.Code, rec.Body)
+	}
+	loc := rec.Header().Get("Location")
+	runID := strings.TrimPrefix(loc, "/runs/")
+	if runID == "" || runID == loc {
+		t.Fatalf("redirect location missing run id: %q", loc)
+	}
+
+	waitFor(t, "terminal run.state_changed event", func() bool {
+		events, err := s.st.Events(runID, 0, 100)
+		if err != nil {
+			return false
+		}
+		for _, env := range events {
+			if env.Type != protocol.EvRunStateChanged {
+				continue
+			}
+			if state, _ := stateOf(t, env); state == "succeeded" || state == "failed" || state == "cancelled" {
+				return true
+			}
+		}
+		return false
+	})
+
+	events, err := s.st.Events(runID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var finalState string
+	sawMessageDelta := false
+	for _, env := range events {
+		switch env.Type {
+		case protocol.EvRunStateChanged:
+			if state, _ := stateOf(t, env); state == "succeeded" || state == "failed" || state == "cancelled" {
+				finalState = state
+			}
+		case protocol.EvMessageDelta:
+			sawMessageDelta = true
+		}
+	}
+	if finalState != "succeeded" {
+		t.Fatalf("run did not reach succeeded, final state = %q", finalState)
+	}
+	if !sawMessageDelta {
+		t.Fatal("no message_delta event recorded; agent output never arrived through the assembled path")
+	}
+
+	// §16.0은 "diff를 회수한다"로 끝난다. newStack의 fake Agent가
+	// README.md에 한 줄을 덧붙이므로, 회수한 diff에 그 흔적이 있어야
+	// gitops.Diff가 이 실행에 실제로 연결됐다는 증거가 된다.
+	diff, err := s.git.Diff(context.Background(), runID, "main")
+	if err != nil {
+		t.Fatalf("gitops.Diff: %v", err)
+	}
+	if !strings.Contains(diff, "agent-work") {
+		t.Fatalf("diff does not contain the agent's change:\n%s", diff)
+	}
 }
