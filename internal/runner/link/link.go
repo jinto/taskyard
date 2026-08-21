@@ -86,9 +86,17 @@ func (l *Link) Run(ctx context.Context) error {
 			return ctx.Err()
 		}
 
-		err := l.session(ctx)
+		welcomed, err := l.session(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+
+		if welcomed {
+			// 이번 세션은 최소한 Welcome까지 받았다 — 즉 한 번은 정상적으로
+			// 붙었다가 끊긴 것이다. 페널티를 초기화한다. 초기화하지 않으면
+			// 과거에 여러 번 끊긴 적이 있는 Runner는 그 사이 세션이 아무리
+			// 오래 건강했어도 다음 재연결마다 상한(10초)까지 기다리게 된다.
+			backoff = minBackoff
 		}
 		slog.Warn("link session ended, reconnecting", "err", err, "backoff", backoff)
 
@@ -105,12 +113,14 @@ func (l *Link) Run(ctx context.Context) error {
 	}
 }
 
-func (l *Link) session(ctx context.Context) error {
+// session은 연결 하나의 수명이다. welcomed는 Welcome까지 받아 정상적으로
+// 붙었는지를 알려준다 — Run이 이걸로 재연결 backoff를 초기화할지 정한다.
+func (l *Link) session(ctx context.Context) (welcomed bool, err error) {
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	conn, _, err := websocket.Dial(dialCtx, l.cfg.ServerURL, nil)
 	cancel()
 	if err != nil {
-		return fmt.Errorf("dial: %w", err)
+		return false, fmt.Errorf("dial: %w", err)
 	}
 	defer conn.CloseNow()
 
@@ -122,7 +132,7 @@ func (l *Link) session(ctx context.Context) error {
 	}
 	body, err := json.Marshal(hello)
 	if err != nil {
-		return fmt.Errorf("marshal hello: %w", err)
+		return false, fmt.Errorf("marshal hello: %w", err)
 	}
 	if err := writeEnvelope(ctx, conn, protocol.Envelope{
 		V:    buildinfo.ProtocolVersion(),
@@ -130,12 +140,12 @@ func (l *Link) session(ctx context.Context) error {
 		TS:   time.Now().UTC(),
 		Body: body,
 	}); err != nil {
-		return fmt.Errorf("write hello: %w", err)
+		return false, fmt.Errorf("write hello: %w", err)
 	}
 
 	welcome, err := readWelcome(ctx, conn)
 	if err != nil {
-		return fmt.Errorf("read welcome: %w", err)
+		return false, fmt.Errorf("read welcome: %w", err)
 	}
 	slog.Info("connected to server", "server_version", welcome.ServerVersion, "runs", len(welcome.ResumeFrom))
 
@@ -153,7 +163,7 @@ func (l *Link) session(ctx context.Context) error {
 	// Server가 이미 받은 지점까지 spool을 정리한 뒤 나머지를 다시 보낸다.
 	for runID, seq := range welcome.ResumeFrom {
 		if err := l.cfg.Spool.Ack(runID, seq); err != nil {
-			return fmt.Errorf("trim spool for %s: %w", runID, err)
+			return true, fmt.Errorf("trim spool for %s: %w", runID, err)
 		}
 	}
 
@@ -173,11 +183,11 @@ func (l *Link) session(ctx context.Context) error {
 		errCh <- l.writeLoop(sessionCtx, conn)
 	}()
 
-	err = <-errCh
+	sessionErr := <-errCh
 	cancelSession()
 	_ = conn.Close(websocket.StatusNormalClosure, "session ending")
 	wg.Wait()
-	return err
+	return true, sessionErr
 }
 
 func (l *Link) readLoop(ctx context.Context, conn *websocket.Conn) error {
