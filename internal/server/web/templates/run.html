@@ -43,7 +43,7 @@
     if (ev.type === "approval_requested") {
       pendingRequestID = ev.request_id;
       text.textContent = ev.summary;
-      toolUseIDLabel.textContent = ev.tool_use_id ? "tool_use_id: " + ev.tool_use_id : "";
+      toolUseIDLabel.textContent = ev.tool_use_id ? "도구 호출 ID: " + ev.tool_use_id : "";
       panel.hidden = false;
     }
   };

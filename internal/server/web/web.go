@@ -84,7 +84,7 @@ func summarize(env protocol.Envelope) eventView {
 		name, _ := outer.Body["tool_name"].(string)
 		view.Summary = "→ " + name
 	case protocol.EvToolFinished:
-		view.Summary = "← done"
+		view.Summary = "← 완료"
 	case protocol.EvRunStateChanged:
 		state, _ := outer.Body["state"].(string)
 		detail, _ := outer.Body["detail"].(string)
@@ -123,7 +123,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, _ *http.Request) {
 		runs = append(runs, r)
 	}
 
-	s.render(w, s.runs, map[string]any{"Title": "Runs", "Runs": runs})
+	s.render(w, s.runs, map[string]any{"Title": "실행 목록", "Runs": runs})
 }
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
