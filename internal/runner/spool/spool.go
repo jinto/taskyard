@@ -43,9 +43,16 @@ CREATE TABLE IF NOT EXISTS runs (
   branch        TEXT    NOT NULL DEFAULT '',
   worktree_path TEXT    NOT NULL DEFAULT '',
   pid           INTEGER NOT NULL DEFAULT 0,
-  started_at    INTEGER NOT NULL DEFAULT 0
+  started_at    INTEGER NOT NULL DEFAULT 0,
+  repo_path     TEXT    NOT NULL DEFAULT ''
 );
 `
+
+// runsMigrations는 Phase 0 원장에 뒤늦게 추가된 컬럼이다. PRAGMA table_info로
+// 없는 것만 ALTER한다.
+var runsMigrations = []struct{ name, ddl string }{
+	{"repo_path", "TEXT NOT NULL DEFAULT ''"},
+}
 
 // Spool은 SQLite로 뒷받침되는 이벤트 대기열이다.
 type Spool struct {
@@ -65,7 +72,44 @@ func Open(path string) (*Spool, error) {
 		db.Close()
 		return nil, fmt.Errorf("create spool schema: %w", err)
 	}
+	if err := migrateRuns(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Spool{db: db}, nil
+}
+
+func migrateRuns(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(runs)`)
+	if err != nil {
+		return fmt.Errorf("inspect runs schema: %w", err)
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var (
+			cid, notnull, pk int
+			name, typ        string
+			dflt             sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan runs schema: %w", err)
+		}
+		have[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("inspect runs schema: %w", err)
+	}
+	for _, m := range runsMigrations {
+		if have[m.name] {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE runs ADD COLUMN ` + m.name + ` ` + m.ddl); err != nil {
+			return fmt.Errorf("add runs.%s: %w", m.name, err)
+		}
+	}
+	return nil
 }
 
 func (s *Spool) Close() error { return s.db.Close() }
@@ -217,21 +261,26 @@ type RunRecord struct {
 	WorktreePath  string
 	PID           int
 	StartedAtUnix int64
+	// RepoPath는 이 Run의 worktree가 속한 저장소의 정규화된 경로다. 재시작 후
+	// salvage가 어느 저장소의 관리자를 써야 하는지 여기서 읽는다. Phase 0
+	// 기록에는 없으며, 비어 있으면 첫 허용 저장소로 해석한다.
+	RepoPath string
 }
 
 // SaveRun은 실행 기록을 만들거나 덮어쓴다.
 func (s *Spool) SaveRun(r RunRecord) error {
 	_, err := s.db.Exec(
-		`INSERT INTO runs (run_id, state, session_id, branch, worktree_path, pid, started_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO runs (run_id, state, session_id, branch, worktree_path, pid, started_at, repo_path)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(run_id) DO UPDATE SET
 		   state         = excluded.state,
 		   session_id    = excluded.session_id,
 		   branch        = excluded.branch,
 		   worktree_path = excluded.worktree_path,
 		   pid           = excluded.pid,
-		   started_at    = excluded.started_at`,
-		r.RunID, r.State, r.SessionID, r.Branch, r.WorktreePath, r.PID, r.StartedAtUnix,
+		   started_at    = excluded.started_at,
+		   repo_path     = excluded.repo_path`,
+		r.RunID, r.State, r.SessionID, r.Branch, r.WorktreePath, r.PID, r.StartedAtUnix, r.RepoPath,
 	)
 	if err != nil {
 		return fmt.Errorf("save run: %w", err)
@@ -242,7 +291,7 @@ func (s *Spool) SaveRun(r RunRecord) error {
 // LoadRuns는 모든 실행 기록을 돌려준다.
 func (s *Spool) LoadRuns() ([]RunRecord, error) {
 	rows, err := s.db.Query(
-		`SELECT run_id, state, session_id, branch, worktree_path, pid, started_at FROM runs ORDER BY run_id`,
+		`SELECT run_id, state, session_id, branch, worktree_path, pid, started_at, repo_path FROM runs ORDER BY run_id`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query runs: %w", err)
@@ -252,7 +301,7 @@ func (s *Spool) LoadRuns() ([]RunRecord, error) {
 	var out []RunRecord
 	for rows.Next() {
 		var r RunRecord
-		if err := rows.Scan(&r.RunID, &r.State, &r.SessionID, &r.Branch, &r.WorktreePath, &r.PID, &r.StartedAtUnix); err != nil {
+		if err := rows.Scan(&r.RunID, &r.State, &r.SessionID, &r.Branch, &r.WorktreePath, &r.PID, &r.StartedAtUnix, &r.RepoPath); err != nil {
 			return nil, fmt.Errorf("scan run: %w", err)
 		}
 		out = append(out, r)

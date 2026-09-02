@@ -91,7 +91,14 @@ func newStack(t *testing.T, dbDir string) *stack {
 	repo := filepath.Join(dbDir, "repo")
 	initRepo(t, repo)
 
-	gm := gitops.New(repo, filepath.Join(dbDir, "wt"))
+	repos, err := lifecycle.NewRepoResolver([]string{repo}, filepath.Join(dbDir, "wt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gm, err := repos.Manager(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	abs, err := filepath.Abs(fixture)
 	if err != nil {
@@ -107,7 +114,7 @@ func newStack(t *testing.T, dbDir string) *stack {
 
 	var l *link.Link
 	lm, err := lifecycle.New(lifecycle.Config{
-		Spool: sp, Git: gm, Broker: approval.New("tok"),
+		Spool: sp, Repos: repos, Broker: approval.New("tok"),
 		BaseBranch: "main", BrokerURL: "http://127.0.0.1:1/mcp", BrokerToken: "tok",
 		ClaudeBinary: fake,
 		Publish: func(runID string, env protocol.Envelope) error {
@@ -245,7 +252,14 @@ func TestCriterion2_RunnerRestartYieldsResumable(t *testing.T) {
 	spoolPath := filepath.Join(dir, "runner.db")
 	repo := filepath.Join(dir, "repo")
 	initRepo(t, repo)
-	gm := gitops.New(repo, filepath.Join(dir, "wt"))
+	repos, err := lifecycle.NewRepoResolver([]string{repo}, filepath.Join(dir, "wt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gm, err := repos.Manager(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	const deadPID = 999999 // 이 값이 실제 프로세스일 가능성은 무시할 만큼 낮다.
 
@@ -280,7 +294,7 @@ func TestCriterion2_RunnerRestartYieldsResumable(t *testing.T) {
 
 	// 직접 Classify로도 판정 규칙 자체를 확인해 둔다(§16.0의 판정 기준 그 자체).
 	life1, err := lifecycle.New(lifecycle.Config{
-		Spool: sp1, Git: gm, Broker: approval.New("tok"),
+		Spool: sp1, Repos: repos, Broker: approval.New("tok"),
 		BaseBranch: "main", BrokerURL: "http://127.0.0.1:1/mcp", BrokerToken: "tok",
 		Publish: func(string, protocol.Envelope) error { return nil },
 	})
@@ -308,7 +322,7 @@ func TestCriterion2_RunnerRestartYieldsResumable(t *testing.T) {
 	var mu sync.Mutex
 	published := map[string]protocol.Envelope{}
 	life2, err := lifecycle.New(lifecycle.Config{
-		Spool: sp2, Git: gm, Broker: approval.New("tok"),
+		Spool: sp2, Repos: repos, Broker: approval.New("tok"),
 		BaseBranch: "main", BrokerURL: "http://127.0.0.1:1/mcp", BrokerToken: "tok",
 		Publish: func(runID string, env protocol.Envelope) error {
 			mu.Lock()

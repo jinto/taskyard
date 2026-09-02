@@ -41,7 +41,8 @@ func fakeClaudeRecording(t *testing.T, fixture, argsFile string) string {
 	path := filepath.Join(t.TempDir(), "fake-claude")
 	script := "#!/bin/sh\n"
 	if argsFile != "" {
-		script += "printf '%s\\n' \"$@\" > " + argsFile + "\n"
+		// 프롬프트에 줄바꿈이 들어가므로 인자 구분자는 NUL이다.
+		script += "printf '%s\\0' \"$@\" > " + argsFile + "\n"
 	}
 	script += "cat " + abs + "\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
@@ -597,7 +598,7 @@ func recordedPrompt(t *testing.T, argsFile string) string {
 	if err != nil {
 		t.Fatalf("agent args were not recorded: %v", err)
 	}
-	args := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	args := strings.Split(strings.TrimRight(string(raw), "\x00"), "\x00")
 	for i, a := range args {
 		if a == "-p" && i+1 < len(args) {
 			return args[i+1]
