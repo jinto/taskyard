@@ -646,6 +646,115 @@ func TestMemoryTokenBecomesEmptyWhenFileMissing(t *testing.T) {
 	}
 }
 
+// TestMemoryTokenIgnoresSymlinkEscape: 에이전트가 쓰는 저장소이므로
+// .taskyard/memory.md가 worktree 밖을 가리키는 심링크일 수 있다. 그런 파일은
+// 읽지 않는다.
+func TestMemoryTokenIgnoresSymlinkEscape(t *testing.T) {
+	col := &collector{}
+	argsFile := filepath.Join(t.TempDir(), "args")
+	h := newHarness(t, col, withBinary(fakeClaudeRecording(t, pongFixture, argsFile)))
+
+	secret := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(secret, []byte("SECRET\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(h.repo, ".taskyard"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(h.repo, ".taskyard", "memory.md")); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+	gitIn(t, h.repo, "add", ".taskyard")
+	gitIn(t, h.repo, "commit", "-q", "-m", "symlinked memory")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := h.m.HandleCommand(ctx, h.start(t, "run-1", "[{{memory}}]")); err != nil {
+		t.Fatal(err)
+	}
+	waitTerminal(t, col)
+
+	if got := recordedPrompt(t, argsFile); got != "[]" {
+		t.Fatalf("prompt = %q; a symlink escaping the worktree must read as empty", got)
+	}
+}
+
+func TestMemoryTokenIsBounded(t *testing.T) {
+	col := &collector{}
+	argsFile := filepath.Join(t.TempDir(), "args")
+	h := newHarness(t, col, withBinary(fakeClaudeRecording(t, pongFixture, argsFile)))
+	commitFile(t, h.repo, ".taskyard/memory.md", strings.Repeat("x", 200*1024))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := h.m.HandleCommand(ctx, h.start(t, "run-1", "{{memory}}")); err != nil {
+		t.Fatal(err)
+	}
+	waitTerminal(t, col)
+
+	got := recordedPrompt(t, argsFile)
+	if len(got) > 70*1024 {
+		t.Fatalf("prompt is %d bytes; memory must be capped", len(got))
+	}
+	if !strings.Contains(got, "truncated") {
+		t.Fatalf("truncation is silent; the agent should know the memory was cut")
+	}
+}
+
+// TestSecondRunStartWhileBusyFails: 러너는 동시에 하나만 돌린다(계획: 동시
+// 실행 1 유지). 활성 Run이 있는 동안 온 run.start는 그 Run의 실패로 끝나고
+// 프로세스는 뜨지 않는다.
+func TestSecondRunStartWhileBusyFails(t *testing.T) {
+	col := &collector{}
+	starts := filepath.Join(t.TempDir(), "starts")
+	sleeper := filepath.Join(t.TempDir(), "sleeper")
+	// 기동될 때마다 한 줄을 남기고 오래 잔다. 두 줄이면 두 번째가 떴다는 뜻이다.
+	if err := os.WriteFile(sleeper, []byte("#!/bin/sh\necho started >> "+starts+"\nsleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h := newHarness(t, col, withBinary(sleeper))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := h.m.HandleCommand(ctx, h.start(t, "run-1", "first")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "first run active", func() bool {
+		runs, _ := h.sp.LoadRuns()
+		return len(runs) == 1 && runs[0].PID != 0
+	})
+
+	if err := h.m.HandleCommand(ctx, h.start(t, "run-2", "second")); err != nil {
+		t.Fatalf("busy runner returned a command error %v; it should fail run-2 instead", err)
+	}
+	waitFor(t, "run-2 failed", func() bool {
+		for _, e := range col.snapshot() {
+			if e.RunID == "run-2" && e.Type == protocol.EvRunStateChanged {
+				return true
+			}
+		}
+		return false
+	})
+	if detail := failureDetail(t, col); !strings.Contains(detail, "busy") {
+		t.Fatalf("failure detail = %q, want it to say the runner is busy", detail)
+	}
+	runs, _ := h.sp.LoadRuns()
+	if len(runs) != 2 {
+		t.Fatalf("ledger = %+v, want run-1 running and run-2 failed", runs)
+	}
+	for _, r := range runs {
+		if r.RunID == "run-2" && r.State != "failed" {
+			t.Fatalf("run-2 state = %q, want failed", r.State)
+		}
+		if r.RunID == "run-1" && r.State != "running" {
+			t.Fatalf("run-1 was disturbed: %q", r.State)
+		}
+	}
+	if raw, _ := os.ReadFile(starts); strings.Count(string(raw), "started") != 1 {
+		t.Fatalf("agent starts = %q, want exactly one (second must not start while busy)", raw)
+	}
+}
+
 func TestTerminalAndCancelRecordsCarryRepoPath(t *testing.T) {
 	want := func(t *testing.T, h *harness) {
 		t.Helper()

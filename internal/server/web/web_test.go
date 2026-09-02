@@ -343,6 +343,33 @@ func TestRunPageLinksBackToIssue(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), `href="/projects/shop/issues/1"`) {
 		t.Errorf("run page does not link back to its issue:\n%s", rec.Body.String())
 	}
+	// html/template은 <script> 안의 문자열을 JSON으로 인용한다. 이 줄이 따옴표
+	// 없이 나오면 SSE 아일랜드 전체가 초기화되지 않는다.
+	if !strings.Contains(rec.Body.String(), `const runID = "run-1";`) {
+		t.Errorf("run id is not a quoted JS string:\n%s", rec.Body.String())
+	}
+}
+
+func TestRunIssueRejectsWhenARunIsActive(t *testing.T) {
+	st, h := newServer(t)
+	p := seedProject(t, st, "shop", "/repos/shop")
+	task := seedTask(t, st, p, "이슈", "")
+	_ = st.UpsertRun(store.Run{ID: "run-1", State: store.StateRunning, Kind: "structured", TaskID: task.ID, Stage: "execute"})
+
+	// 러너 유무와 무관하게, 활성 Run이 있는 이슈는 다시 시작하지 않는다.
+	if rec := postForm(h, "/projects/shop/issues/1/run", nil); rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", rec.Code)
+	}
+	runs, _ := st.RunsForTask(task.ID)
+	if len(runs) != 1 {
+		t.Fatalf("a second run was created: %+v", runs)
+	}
+
+	// 종결된 Run만 있으면 다시 시작할 수 있다(재시도 = 새 Run).
+	_ = st.UpsertRun(store.Run{ID: "run-1", State: store.StateFailed, Kind: "structured", TaskID: task.ID, Stage: "execute"})
+	if rec := postForm(h, "/projects/shop/issues/1/run", nil); rec.Code == http.StatusConflict {
+		t.Fatal("a terminal run must not block a retry")
+	}
 }
 
 func TestPostRunsIsGone(t *testing.T) {
@@ -361,10 +388,15 @@ func TestTemplatesEscapeHTML(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	seedTask(t, st, p, payload, payload)
-	_ = st.UpsertRun(store.Run{ID: "run-1", State: store.StateRunning, Kind: "structured", TaskID: p.ID, Branch: payload})
+	task := seedTask(t, st, p, payload, payload)
+	_ = st.UpsertRun(store.Run{ID: "run-1", State: store.StateRunning, Kind: "structured", TaskID: task.ID, Branch: payload})
+	env, _ := protocol.NewEvent(protocol.EvMessageDelta, "run-1", 1, map[string]any{"body": map[string]any{"text": payload}})
+	env.Seq = 1
+	if _, _, err := st.ApplyEvent(env); err != nil {
+		t.Fatal(err)
+	}
 
-	for _, path := range []string{"/", "/projects/shop", "/projects/shop/issues/1"} {
+	for _, path := range []string{"/", "/projects/shop", "/projects/shop/issues/1", "/runs/run-1"} {
 		rec := get(h, path)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("%s: status = %d", path, rec.Code)

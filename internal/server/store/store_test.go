@@ -426,6 +426,20 @@ func TestNewerRunningEventDoesNotRegressSucceededState(t *testing.T) {
 	}
 }
 
+func TestUnknownStateInEventIsStoredButNotApplied(t *testing.T) {
+	s := openTemp(t)
+	seedRun(t, s, "run-1")
+
+	accepted, _, err := s.ApplyEvent(stateEvent(t, "run-1", 1, "bogus"))
+	if err != nil || !accepted {
+		t.Fatalf("accepted=%v err=%v", accepted, err)
+	}
+	got, _ := s.GetRun("run-1")
+	if got.State != StateRunning {
+		t.Fatalf("state = %q; an unknown state must not reach runs.state", got.State)
+	}
+}
+
 func TestOpenMigratesExistingRunsTable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "old.db")
 
