@@ -74,6 +74,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /runs/{id}", s.handleRun)
 	mux.HandleFunc("GET /runs/{id}/stream", s.handleStream)
 	mux.HandleFunc("POST /runs/{id}/approve", sameOrigin(s.handleApprove))
+	mux.HandleFunc("POST /runs/{id}/cancel", sameOrigin(s.handleCancel))
+	mux.HandleFunc("POST /runs/{id}/retry", sameOrigin(s.handleRetry))
 	return mux
 }
 
@@ -212,9 +214,20 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	s.render(w, s.issue, map[string]any{
+	// 화면의 행동은 최신 Run 하나를 기준으로 한다: 활성이면 [취소], 정착이면
+	// 재시도 폼(과 needs_attention이면 [취소]도), 없으면 [실행].
+	data := map[string]any{
 		"Title": fmt.Sprintf("#%d %s", task.Number, task.Title), "Project": p, "Task": task, "Runs": runs,
-	})
+		"HasLatest": len(runs) > 0,
+	}
+	if len(runs) > 0 {
+		latest := runs[0]
+		data["Latest"] = latest
+		data["LatestSettled"] = store.IsSettled(latest.State)
+		data["LatestCancellable"] = !store.IsSettled(latest.State) || latest.State == store.StateNeedsAttention
+		data["LatestResumable"] = latest.ProviderSessionID != ""
+	}
+	s.render(w, s.issue, data)
 }
 
 // handleIssueRun은 파이프라인의 유일한 문이다. 실행 템플릿과 이슈로
@@ -231,42 +244,65 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 //     상태를 되돌리고 503 — queued로 영영 남겨 사용자가 실행 중이라고 믿게
 //     하지 않는다.
 //
-// 활성 Run이 있는 이슈는 다시 시작하지 않는다(409). 재시도는 종결된 뒤의
-// 새 Run이다(PRD §7.6).
+// 활성 Run이 있는 이슈는 다시 시작하지 않는다(409). 재시도는 정착된 뒤의
+// 새 Run이다(PRD §7.6, handleRetry).
 func (s *Server) handleIssueRun(w http.ResponseWriter, r *http.Request) {
 	p, task, ok := s.loadIssue(w, r)
 	if !ok {
 		return
 	}
+	s.launch(w, r, p, task, launch{})
+}
 
+// launch는 새 Run 하나를 시작하는 데 필요한 것이다. previous가 있으면 재시도다.
+type launch struct {
+	previous       store.Run
+	feedback       string
+	workspaceRunID string // 비어 있으면 새 Run 자신
+	resumeSession  string
+}
+
+func (s *Server) launch(w http.ResponseWriter, r *http.Request, p store.Project, task store.Task, l launch) {
 	runs, err := s.st.RunsForTask(task.ID)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	for _, existing := range runs {
-		if !store.IsTerminal(existing.State) {
+		if !store.IsSettled(existing.State) {
 			http.Error(w, "이미 실행 중인 Run이 있습니다: "+existing.ID, http.StatusConflict)
 			return
 		}
 	}
 
-	prompt := pipeline.Render(p.ExecuteTemplate, map[string]string{
-		"issue": pipeline.IssueText(task.Number, task.Title, task.Body),
-	})
 	runID := "run-" + uuid.NewString()
+	wsID := l.workspaceRunID
+	if wsID == "" {
+		wsID = runID
+	}
+
+	prompt := pipeline.Render(p.ExecuteTemplate, map[string]string{
+		"issue":        pipeline.IssueText(task.Number, task.Title, task.Body),
+		"previous_run": pipeline.PreviousRunText(l.previous.ID, l.previous.State, l.previous.Detail),
+		"feedback":     l.feedback,
+	})
 
 	cmd, err := protocol.NewCommand(protocol.CmdRunStart, runID, protocol.RunStartBody{
-		Prompt:     prompt,
-		RepoPath:   p.RepoPath,
-		BaseBranch: p.DefaultBranch,
+		Prompt:          prompt,
+		RepoPath:        p.RepoPath,
+		BaseBranch:      p.DefaultBranch,
+		WorkspaceRunID:  wsID,
+		ResumeSessionID: l.resumeSession,
 	})
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	run := store.Run{ID: runID, State: store.StateQueued, Kind: "structured", TaskID: task.ID, Stage: "execute"}
+	run := store.Run{
+		ID: runID, State: store.StateQueued, Kind: "structured", TaskID: task.ID, Stage: "execute",
+		PreviousRunID: l.previous.ID, Feedback: l.feedback, WorkspaceRunID: wsID,
+	}
 	if err := s.st.UpsertRun(run); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -285,6 +321,113 @@ func (s *Server) handleIssueRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/runs/"+runID, http.StatusSeeOther)
+}
+
+// handleCancel은 Run을 취소한다(PRD §7.6). 활성이면 러너에게 run.cancel을
+// 보내고 종결 이벤트를 기다린다. needs_attention이면 프로세스가 없으므로
+// 서버가 직접 cancelled로 옮긴다. 종결이면 취소할 것이 없다.
+func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
+	run, err := s.st.GetRun(r.PathValue("id"))
+	if errors.Is(err, store.ErrRunNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	switch {
+	case run.State == store.StateNeedsAttention:
+		if err := s.st.CancelSettledRun(run.ID); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+	case store.IsSettled(run.State):
+		http.Error(w, "이미 끝난 Run입니다: "+run.State, http.StatusConflict)
+		return
+	default:
+		cmd, err := protocol.NewCommand(protocol.CmdRunCancel, run.ID, nil)
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		if err := s.hub.SendCommand(cmd); err != nil {
+			slog.Warn("run.cancel could not be delivered", "run_id", run.ID, "err", err)
+			http.Error(w, "runner is not connected", http.StatusServiceUnavailable)
+			return
+		}
+	}
+	http.Redirect(w, r, s.backTo(run), http.StatusSeeOther)
+}
+
+// handleRetry는 정착된 Run 뒤에 새 Run을 단다(PRD §7.6). mode=continue는 같은
+// worktree와 세션을 잇고, mode=fresh는 새 worktree·새 세션이다. 세션이 없는데
+// continue를 고르면 409 — 조용히 fresh로 바꾸지 않는다.
+func (s *Server) handleRetry(w http.ResponseWriter, r *http.Request) {
+	prev, err := s.st.GetRun(r.PathValue("id"))
+	if errors.Is(err, store.ErrRunNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	mode := r.FormValue("mode")
+	if mode != "continue" && mode != "fresh" {
+		http.Error(w, "mode는 continue 또는 fresh여야 합니다", http.StatusBadRequest)
+		return
+	}
+	if !store.IsSettled(prev.State) {
+		http.Error(w, "아직 끝나지 않은 Run은 재시도할 수 없습니다", http.StatusConflict)
+		return
+	}
+	if prev.TaskID == "" {
+		http.Error(w, "이슈 없이 만들어진 Run은 재시도할 수 없습니다", http.StatusConflict)
+		return
+	}
+	task, err := s.st.GetTaskByID(prev.TaskID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	p, err := s.st.GetProjectByID(task.ProjectID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	l := launch{previous: prev, feedback: r.FormValue("feedback")}
+	if mode == "continue" {
+		if prev.ProviderSessionID == "" {
+			http.Error(w, "이어갈 세션이 없습니다 — 처음부터 재시도를 고르세요", http.StatusConflict)
+			return
+		}
+		l.resumeSession = prev.ProviderSessionID
+		// worktree 주인은 체인의 첫 Run이다.
+		l.workspaceRunID = prev.WorkspaceRunID
+		if l.workspaceRunID == "" {
+			l.workspaceRunID = prev.ID
+		}
+	}
+	s.launch(w, r, p, task, l)
+}
+
+// backTo는 Run이 속한 이슈 페이지, 이슈가 없으면 Run 페이지다.
+func (s *Server) backTo(run store.Run) string {
+	if run.TaskID != "" {
+		if task, err := s.st.GetTaskByID(run.TaskID); err == nil {
+			if p, err := s.st.GetProjectByID(task.ProjectID); err == nil {
+				return issuePath(p.Key, task.Number)
+			}
+		}
+	}
+	return "/runs/" + run.ID
 }
 
 func (s *Server) loadProject(w http.ResponseWriter, r *http.Request) (store.Project, bool) {
