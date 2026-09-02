@@ -1,0 +1,27 @@
+{{define "content"}}
+<h1><a href="/">←</a> {{.Project.Name}}</h1>
+<div class="state">{{.Project.Key}} · {{.Project.RepoPath}} · {{.Project.DefaultBranch}}</div>
+
+<h2>이슈</h2>
+<form method="post" action="/projects/{{.Project.Key}}/issues" class="form">
+  <label>제목 <input type="text" name="title" placeholder="로그인 이메일 대소문자 무시" required></label>
+  <label>본문 <textarea name="body" rows="4" placeholder="무엇이 문제이고 어떻게 되어야 하는지"></textarea></label>
+  <button type="submit">이슈 만들기</button>
+</form>
+
+{{range .Tasks}}
+  <div class="run">
+    <a href="/projects/{{$.Project.Key}}/issues/{{.Number}}">#{{.Number}} {{.Title}}</a>
+    <div class="state">{{.Status}}</div>
+  </div>
+{{else}}
+  <p class="state">아직 이슈가 없습니다.</p>
+{{end}}
+
+<h2>실행 템플릿</h2>
+<form method="post" action="/projects/{{.Project.Key}}/template" class="form">
+  <textarea name="execute_template" rows="14">{{.Project.ExecuteTemplate}}</textarea>
+  <p class="state"><code>{{"{{issue}}"}}</code>는 이슈 번호·제목·본문으로, <code>{{"{{memory}}"}}</code>는 저장소의 <code>.taskyard/memory.md</code>로 치환됩니다.</p>
+  <button type="submit">템플릿 저장</button>
+</form>
+{{end}}

@@ -1,0 +1,21 @@
+{{define "content"}}
+<h1><a href="/projects/{{.Project.Key}}">←</a> #{{.Task.Number}} {{.Task.Title}}</h1>
+<div class="state">{{.Task.Status}} · {{.Project.Key}}</div>
+
+{{if .Task.Body}}<pre class="body">{{.Task.Body}}</pre>{{end}}
+
+<form method="post" action="/projects/{{.Project.Key}}/issues/{{.Task.Number}}/run" class="form">
+  <button type="submit">실행</button>
+  <span class="state">프로젝트의 실행 템플릿으로 에이전트를 새 세션에서 띄웁니다.</span>
+</form>
+
+<h2>실행</h2>
+{{range .Runs}}
+  <div class="run">
+    <a href="/runs/{{.ID}}">{{.ID}}</a>
+    <div class="state">{{.State}} · {{.Stage}} · {{.CreatedAt.Format "2006-01-02 15:04:05"}}{{if .Branch}} · {{.Branch}}{{end}}</div>
+  </div>
+{{else}}
+  <p class="state">아직 실행이 없습니다.</p>
+{{end}}
+{{end}}

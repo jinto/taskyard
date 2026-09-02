@@ -7,8 +7,9 @@ GitHub PR까지 관리하는 개발 에이전트 관제 시스템입니다. 웹 
 에이전트 러너(`taskyard-runner`) 두 개의 Go 데몬으로 이루어지며, 러너는 서버로
 아웃바운드 연결만 겁니다.
 
-**상태: Phase 0 수직 스파이크.** 기능이 아니라 아키텍처 전제(이벤트 무손실 전달,
-러너 재시작 복구, 사람의 도구 승인, 구독 과금 경계)를 실증한 단계입니다.
+**상태: Phase 1 척추.** Phase 0이 아키텍처 전제(이벤트 무손실 전달, 러너 재시작
+복구, 사람의 도구 승인, 구독 과금 경계)를 실증했고, 지금은 그 배관 위에
+"프로젝트 → 이슈 → [실행] → 에이전트 → 결과가 이슈에 남음"이 도는 단계입니다.
 
 - 스펙: [`taskyard-prd-v1.md`](taskyard-prd-v1.md)
 - Phase 0 결과와 이월 사항: [`docs/phase0-findings.md`](docs/phase0-findings.md)
@@ -18,6 +19,19 @@ make build   # bin/taskyard-server, bin/taskyard-runner
 make test    # fixture 기반, 실제 claude CLI를 호출하지 않음
 make smoke   # 실제 claude CLI 1회 호출 (구독 할당량 소모)
 ```
+
+## 돌려 보기
+
+```sh
+bin/taskyard-server --pairing-token secret
+bin/taskyard-runner --pairing-token secret \
+  --allow-repo /Users/me/code/shop --allow-repo /Users/me/code/blog \
+  --worktrees /Users/me/.taskyard/worktrees
+```
+
+브라우저에서 `http://127.0.0.1:8080` → 프로젝트 만들기(저장소 경로는 러너의
+`--allow-repo` 중 하나) → 이슈 만들기 → [실행]. 프로젝트의 실행 템플릿이 이슈로
+채워져 에이전트에게 넘어가고, 이슈 상세에서 Run과 상태를 봅니다.
 
 ## 이름에 대하여
 

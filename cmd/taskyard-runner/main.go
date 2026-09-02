@@ -15,7 +15,6 @@ import (
 
 	"github.com/jinto/taskyard/internal/approval"
 	"github.com/jinto/taskyard/internal/buildinfo"
-	"github.com/jinto/taskyard/internal/gitops"
 	"github.com/jinto/taskyard/internal/protocol"
 	"github.com/jinto/taskyard/internal/runner/lifecycle"
 	"github.com/jinto/taskyard/internal/runner/link"
@@ -28,19 +27,30 @@ func main() {
 		runnerID    = flag.String("id", "runner-1", "runner id")
 		token       = flag.String("pairing-token", "", "pairing token issued by the server")
 		dbPath      = flag.String("db", "taskyard-runner.db", "sqlite path")
-		repo        = flag.String("repo", "", "repository path")
 		worktrees   = flag.String("worktrees", "", "worktree root")
-		baseBranch  = flag.String("base-branch", "main", "base branch for new worktrees")
+		baseBranch  = flag.String("base-branch", "main", "default base branch when run.start names none")
 		showVersion = flag.Bool("version", false, "print version and exit")
+		allowRepos  []string
 	)
+	// 프로젝트마다 저장소가 다르므로 하나가 아니라 목록이다(PRD RN-03).
+	// 여러 번 줄 수 있다: --allow-repo /a --allow-repo /b
+	flag.Func("allow-repo", "absolute path of a repository this runner may work in (repeatable)", func(v string) error {
+		allowRepos = append(allowRepos, v)
+		return nil
+	})
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Printf("taskyard-runner %s (protocol v%d)\n", buildinfo.Version(), buildinfo.ProtocolVersion())
 		return
 	}
-	if *repo == "" || *worktrees == "" || *token == "" {
-		fmt.Fprintln(os.Stderr, "taskyard-runner: --repo, --worktrees and --pairing-token are required")
+	if len(allowRepos) == 0 || *worktrees == "" || *token == "" {
+		fmt.Fprintln(os.Stderr, "taskyard-runner: --allow-repo (at least one), --worktrees and --pairing-token are required")
+		os.Exit(2)
+	}
+	repos, err := lifecycle.NewRepoResolver(allowRepos, *worktrees)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "taskyard-runner:", err)
 		os.Exit(2)
 	}
 
@@ -82,7 +92,7 @@ func main() {
 
 	lm, err := lifecycle.New(lifecycle.Config{
 		Spool:       sp,
-		Git:         gitops.New(*repo, *worktrees),
+		Repos:       repos,
 		Broker:      broker,
 		BaseBranch:  *baseBranch,
 		BrokerURL:   brokerURL,

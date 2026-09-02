@@ -38,6 +38,7 @@ type stack struct {
 	life  *lifecycle.Manager
 	git   *gitops.Manager
 	wsURL string
+	cmds  chan protocol.Envelope // 러너가 받은 명령의 사본. 트리거 테스트가 본다
 }
 
 func git(t *testing.T, dir string, args ...string) {
@@ -91,7 +92,14 @@ func newStack(t *testing.T, dbDir string) *stack {
 	repo := filepath.Join(dbDir, "repo")
 	initRepo(t, repo)
 
-	gm := gitops.New(repo, filepath.Join(dbDir, "wt"))
+	repos, err := lifecycle.NewRepoResolver([]string{repo}, filepath.Join(dbDir, "wt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gm, err := repos.Manager(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	abs, err := filepath.Abs(fixture)
 	if err != nil {
@@ -105,9 +113,10 @@ func newStack(t *testing.T, dbDir string) *stack {
 		t.Fatal(err)
 	}
 
+	cmds := make(chan protocol.Envelope, 16)
 	var l *link.Link
 	lm, err := lifecycle.New(lifecycle.Config{
-		Spool: sp, Git: gm, Broker: approval.New("tok"),
+		Spool: sp, Repos: repos, Broker: approval.New("tok"),
 		BaseBranch: "main", BrokerURL: "http://127.0.0.1:1/mcp", BrokerToken: "tok",
 		ClaudeBinary: fake,
 		Publish: func(runID string, env protocol.Envelope) error {
@@ -122,13 +131,19 @@ func newStack(t *testing.T, dbDir string) *stack {
 	l, err = link.New(link.Config{
 		ServerURL: wsURL, RunnerID: "runner-1", PairingToken: "tok",
 		Spool: sp, Capabilities: []string{protocol.CapClaudeCode},
-		OnCommand: lm.HandleCommand,
+		OnCommand: func(ctx context.Context, env protocol.Envelope) error {
+			select {
+			case cmds <- env:
+			default:
+			}
+			return lm.HandleCommand(ctx, env)
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	return &stack{st: st, hub: h, srv: srv, sp: sp, link: l, life: lm, git: gm, wsURL: wsURL}
+	return &stack{st: st, hub: h, srv: srv, sp: sp, link: l, life: lm, git: gm, wsURL: wsURL, cmds: cmds}
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -245,7 +260,14 @@ func TestCriterion2_RunnerRestartYieldsResumable(t *testing.T) {
 	spoolPath := filepath.Join(dir, "runner.db")
 	repo := filepath.Join(dir, "repo")
 	initRepo(t, repo)
-	gm := gitops.New(repo, filepath.Join(dir, "wt"))
+	repos, err := lifecycle.NewRepoResolver([]string{repo}, filepath.Join(dir, "wt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gm, err := repos.Manager(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	const deadPID = 999999 // 이 값이 실제 프로세스일 가능성은 무시할 만큼 낮다.
 
@@ -280,7 +302,7 @@ func TestCriterion2_RunnerRestartYieldsResumable(t *testing.T) {
 
 	// 직접 Classify로도 판정 규칙 자체를 확인해 둔다(§16.0의 판정 기준 그 자체).
 	life1, err := lifecycle.New(lifecycle.Config{
-		Spool: sp1, Git: gm, Broker: approval.New("tok"),
+		Spool: sp1, Repos: repos, Broker: approval.New("tok"),
 		BaseBranch: "main", BrokerURL: "http://127.0.0.1:1/mcp", BrokerToken: "tok",
 		Publish: func(string, protocol.Envelope) error { return nil },
 	})
@@ -308,7 +330,7 @@ func TestCriterion2_RunnerRestartYieldsResumable(t *testing.T) {
 	var mu sync.Mutex
 	published := map[string]protocol.Envelope{}
 	life2, err := lifecycle.New(lifecycle.Config{
-		Spool: sp2, Git: gm, Broker: approval.New("tok"),
+		Spool: sp2, Repos: repos, Broker: approval.New("tok"),
 		BaseBranch: "main", BrokerURL: "http://127.0.0.1:1/mcp", BrokerToken: "tok",
 		Publish: func(runID string, env protocol.Envelope) error {
 			mu.Lock()
@@ -466,40 +488,89 @@ func TestCriterion4_MeasureRoundTripLatency(t *testing.T) {
 	t.Logf("Runner→Server 이벤트 왕복 평균: %v (%d samples, localhost)", avg, samples)
 }
 
-// TestPostRunsTriggersAssembledRunAndYieldsDiff는 §16.0이 요구하는 조립된
-// 경로 전체를 문 하나로 들어가 끝까지 움직인다: 브라우저가 누를 법한
-// POST /runs가 store.UpsertRun과 protocol.CmdRunStart를 실제로 발행하고,
-// Runner가 Agent를 띄워 이벤트를 흘리고, 종결 뒤 gitops.Diff로 변경을
-// 회수할 수 있는지까지 확인한다. 전체 브랜치 리뷰(C1)가 지적하기 전까지는
-// 이 문 자체가 어디에도 없었다 — Server·Runner·gitops.Diff는 각자 갖춰져
-// 있었지만 아무것도 서로를 부르지 않았다.
-func TestPostRunsTriggersAssembledRunAndYieldsDiff(t *testing.T) {
+// postForm은 브라우저가 폼을 제출하듯 UI에 POST한다.
+func postForm(h http.Handler, path string, form url.Values) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// createProjectAndIssue는 브라우저가 할 법한 두 POST로 프로젝트와 이슈 #1을
+// 만든다. 저장소 경로는 t.TempDir() 아래의 테스트 저장소 그대로다 — macOS에서
+// /var → /private/var 심링크를 지나므로 러너의 경로 정규화까지 겸해 검증된다.
+func createProjectAndIssue(t *testing.T, ui http.Handler, repo string) {
+	t.Helper()
+	rec := postForm(ui, "/projects", url.Values{
+		"key": {"shop"}, "name": {"쇼핑몰"}, "repo_path": {repo}, "default_branch": {"main"},
+	})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST /projects status = %d, body=%s", rec.Code, rec.Body)
+	}
+	rec = postForm(ui, "/projects/shop/issues", url.Values{
+		"title": {"README에 한 줄 추가"}, "body": {"agent-work라는 줄을 덧붙인다"},
+	})
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/projects/shop/issues/1" {
+		t.Fatalf("POST issue status = %d location = %q", rec.Code, rec.Header().Get("Location"))
+	}
+}
+
+// TestIssueRunTriggersAssembledRunAndYieldsDiff는 §16.1의 척추를 문 하나로
+// 들어가 끝까지 움직인다: 브라우저가 누를 법한 프로젝트 생성 → 이슈 생성 →
+// [실행]이 실행 템플릿과 이슈로 조립한 run.start를 실제로 발행하고, Runner가
+// 그 저장소에 worktree를 만들어 Agent를 띄우고, 종결 뒤 Run과 이슈 상태가
+// 화면에 보이며 gitops.Diff로 변경을 회수할 수 있는지까지 확인한다.
+func TestIssueRunTriggersAssembledRunAndYieldsDiff(t *testing.T) {
 	dir := t.TempDir()
 	s := newStack(t, dir)
+	repo := filepath.Join(dir, "repo")
 
-	ui, err := web.New(s.st, s.hub)
+	uiServer, err := web.New(s.st, s.hub)
 	if err != nil {
 		t.Fatalf("web.New: %v", err)
 	}
+	ui := uiServer.Routes()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go s.link.Run(ctx)
 	waitFor(t, "runner connection", s.hub.Connected)
 
-	form := url.Values{"prompt": {"say pong"}}
-	req := httptest.NewRequest(http.MethodPost, "/runs", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	rec := httptest.NewRecorder()
-	ui.Routes().ServeHTTP(rec, req)
+	createProjectAndIssue(t, ui, repo)
 
+	rec := postForm(ui, "/projects/shop/issues/1/run", nil)
 	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("POST /runs status = %d, body=%s", rec.Code, rec.Body)
+		t.Fatalf("POST run status = %d, body=%s", rec.Code, rec.Body)
 	}
 	loc := rec.Header().Get("Location")
 	runID := strings.TrimPrefix(loc, "/runs/")
 	if runID == "" || runID == loc {
 		t.Fatalf("redirect location missing run id: %q", loc)
+	}
+
+	// (a) 러너가 받은 명령은 RunStartBody이고, 프로젝트의 저장소와 조립된
+	// 프롬프트를 담는다.
+	var cmd protocol.Envelope
+	select {
+	case cmd = <-s.cmds:
+	case <-time.After(10 * time.Second):
+		t.Fatal("runner never received run.start")
+	}
+	var body protocol.RunStartBody
+	if err := json.Unmarshal(cmd.Body, &body); err != nil {
+		t.Fatalf("run.start body is not RunStartBody: %v (%s)", err, cmd.Body)
+	}
+	if cmd.Type != protocol.CmdRunStart || cmd.RunID != runID || body.RepoPath != repo || body.BaseBranch != "main" {
+		t.Fatalf("run.start = %s/%s repo=%q base=%q, want %s repo=%q base=main", cmd.Type, cmd.RunID, body.RepoPath, body.BaseBranch, runID, repo)
+	}
+	for _, want := range []string{"#1 README에 한 줄 추가", "agent-work라는 줄을 덧붙인다"} {
+		if !strings.Contains(body.Prompt, want) {
+			t.Fatalf("assembled prompt lacks %q:\n%s", want, body.Prompt)
+		}
+	}
+	if strings.Contains(body.Prompt, "{{issue}}") {
+		t.Fatalf("{{issue}} was not rendered:\n%s", body.Prompt)
 	}
 
 	waitFor(t, "terminal run.state_changed event", func() bool {
@@ -542,7 +613,30 @@ func TestPostRunsTriggersAssembledRunAndYieldsDiff(t *testing.T) {
 		t.Fatal("no message_delta event recorded; agent output never arrived through the assembled path")
 	}
 
-	// §16.0은 "diff를 회수한다"로 끝난다. newStack의 fake Agent가
+	// (b) worktree는 그 저장소의 루트 아래에 생겼다.
+	if _, err := os.Stat(filepath.Join(s.git.WorktreePath(runID), "README.md")); err != nil {
+		t.Fatalf("worktree for %s missing under the project's repo: %v", runID, err)
+	}
+
+	// (c) Server의 Run 원장이 이벤트로 갱신됐다 — 목록 화면이 이 값을 보여준다.
+	waitFor(t, "runs.state = succeeded", func() bool {
+		run, err := s.st.GetRun(runID)
+		return err == nil && run.State == store.StateSucceeded
+	})
+
+	// (d) 이슈 상세에 Run이 succeeded로, 이슈가 review로 보인다.
+	page := httptest.NewRecorder()
+	ui.ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/projects/shop/issues/1", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("issue page status = %d", page.Code)
+	}
+	for _, want := range []string{runID, "succeeded", "review"} {
+		if !strings.Contains(page.Body.String(), want) {
+			t.Fatalf("issue page lacks %q:\n%s", want, page.Body.String())
+		}
+	}
+
+	// (e) §16.0은 "diff를 회수한다"로 끝난다. newStack의 fake Agent가
 	// README.md에 한 줄을 덧붙이므로, 회수한 diff에 그 흔적이 있어야
 	// gitops.Diff가 이 실행에 실제로 연결됐다는 증거가 된다.
 	diff, err := s.git.Diff(context.Background(), runID, "main")
@@ -551,5 +645,37 @@ func TestPostRunsTriggersAssembledRunAndYieldsDiff(t *testing.T) {
 	}
 	if !strings.Contains(diff, "agent-work") {
 		t.Fatalf("diff does not contain the agent's change:\n%s", diff)
+	}
+}
+
+// TestIssueRunWithoutRunnerLeavesTaskInBacklog: 러너가 붙지 않은 채 [실행]을
+// 누르면 503이고, Run은 failed로 정리되며, 이슈는 backlog 그대로다.
+func TestIssueRunWithoutRunnerLeavesTaskInBacklog(t *testing.T) {
+	dir := t.TempDir()
+	s := newStack(t, dir) // link.Run을 돌리지 않는다 — 러너 없음
+	uiServer, err := web.New(s.st, s.hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ui := uiServer.Routes()
+	createProjectAndIssue(t, ui, filepath.Join(dir, "repo"))
+
+	if rec := postForm(ui, "/projects/shop/issues/1/run", nil); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	p, err := s.st.GetProject("shop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := s.st.GetTask(p.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != store.TaskBacklog {
+		t.Fatalf("task status = %q, want backlog", task.Status)
+	}
+	runs, _ := s.st.RunsForTask(task.ID)
+	if len(runs) != 1 || runs[0].State != store.StateFailed {
+		t.Fatalf("runs = %+v, want one failed run", runs)
 	}
 }

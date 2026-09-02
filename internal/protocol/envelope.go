@@ -57,6 +57,18 @@ type Envelope struct {
 	Body  json.RawMessage `json:"body,omitempty"`
 }
 
+// RunStartBody는 run.start 명령의 본문이다. Server가 만들고 Runner가 읽는다.
+//
+// RepoPath는 Runner 머신의 저장소 절대 경로이며, Runner의 허용 목록에 있어야
+// 한다(PRD RN-03). 비어 있으면 Runner의 첫 허용 저장소 — Phase 0 형식의
+// 명령과 저장소 하나짜리 러너를 위한 기본값이다. BaseBranch가 비어 있으면
+// Runner 설정의 기본 브랜치를 쓴다.
+type RunStartBody struct {
+	Prompt     string `json:"prompt"`
+	RepoPath   string `json:"repo_path,omitempty"`
+	BaseBranch string `json:"base_branch,omitempty"`
+}
+
 func marshalBody(body any) (json.RawMessage, error) {
 	if body == nil {
 		return nil, nil

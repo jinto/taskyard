@@ -34,10 +34,10 @@ dead-letter도, 유계 재시도도 없다.
 - 일상적 진입: 러너 spool이 살아 있는 채로 `taskyard-server.db`를 지우면 모든 run이 unknown
 - 수정: `errors.Is(err, store.ErrRunNotFound)`를 일시적 오류와 구분해 ack를 보내 트림 가능하게
 
-### 3. `store.Run.State`가 이벤트로 갱신되지 않는다
-production 코드에 `UpsertRun` 호출은 `handleRunCreate` 두 곳뿐이다. `run.state_changed`를
-저장소에 반영하는 코드가 없어 목록 화면의 상태는 생성 후 영원히 `queued`다. 상세 페이지는
-이벤트 스트림으로 실제 상태를 보여주므로 상세는 정상. **목록 뷰만 오해를 부른다.**
+### 3. `store.Run.State`가 이벤트로 갱신되지 않는다 — 해소 (Phase 1 척추 PR)
+Phase 0에서는 `run.state_changed`를 저장소에 반영하는 코드가 없어 목록 화면의 상태가
+생성 후 영원히 `queued`였다. 척추 PR에서 `store.ApplyEvent`가 새로 저장한 상태 이벤트를
+`runs.state`에 반영한다(알려진 상태만, 종결 → 비종결 퇴행 없음).
 
 ### 4. 승인 침묵 클러스터 — 셋을 한 작업으로 다뤄야 한다
 - 승인 이벤트 `Publish` 실패 시 브로커 요청이 pending에 남아 에이전트가 영구 대기

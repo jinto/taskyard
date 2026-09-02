@@ -10,9 +10,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,9 +31,11 @@ import (
 type PublishFunc func(runID string, env protocol.Envelope) error
 
 type Config struct {
-	Spool        *spool.Spool
-	Git          *gitops.Manager
-	Broker       *approval.Broker
+	Spool *spool.Spool
+	// Repos는 허용 저장소 목록이다. run.start의 repo_path를 여기서 해석한다.
+	Repos  *RepoResolver
+	Broker *approval.Broker
+	// BaseBranch는 run.start의 base_branch가 비어 있을 때의 기본값이다.
 	BaseBranch   string
 	BrokerURL    string
 	BrokerToken  string
@@ -52,6 +57,8 @@ type Manager struct {
 type runHandle struct {
 	cancel    context.CancelFunc
 	ws        gitops.Workspace
+	git       *gitops.Manager // 이 Run의 저장소 관리자. salvage가 쓴다
+	repoPath  string          // 원장에 남기는 정규화 경로
 	startedAt int64
 	cancelled bool
 }
@@ -60,8 +67,8 @@ func New(cfg Config) (*Manager, error) {
 	switch {
 	case cfg.Spool == nil:
 		return nil, errors.New("lifecycle: Spool is required")
-	case cfg.Git == nil:
-		return nil, errors.New("lifecycle: Git is required")
+	case cfg.Repos == nil:
+		return nil, errors.New("lifecycle: Repos is required")
 	case cfg.Broker == nil:
 		return nil, errors.New("lifecycle: Broker is required")
 	case cfg.Publish == nil:
@@ -148,17 +155,30 @@ func (m *Manager) HandleCommand(ctx context.Context, env protocol.Envelope) erro
 	}
 }
 
-type runStartBody struct {
-	Prompt string `json:"prompt"`
-}
-
 func (m *Manager) handleRunStart(ctx context.Context, env protocol.Envelope) error {
-	var body runStartBody
+	var body protocol.RunStartBody
 	if err := json.Unmarshal(env.Body, &body); err != nil {
 		return fmt.Errorf("unmarshal run.start body: %w", err)
 	}
 
-	ws, err := m.cfg.Git.Ensure(ctx, env.RunID, m.cfg.BaseBranch)
+	git, repoPath, err := m.cfg.Repos.resolve(body.RepoPath)
+	if errors.Is(err, ErrRepoNotAllowed) {
+		// 허용 목록 밖의 저장소는 명령 처리 오류가 아니라 이 Run의 실패다.
+		return m.failBeforeStart(env, body.RepoPath, err)
+	}
+	if err != nil {
+		return fmt.Errorf("resolve repository: %w", err)
+	}
+	if m.otherRunActive(env.RunID) {
+		return m.failBeforeStart(env, repoPath, errRunnerBusy)
+	}
+
+	baseBranch := body.BaseBranch
+	if baseBranch == "" {
+		baseBranch = m.cfg.BaseBranch
+	}
+
+	ws, err := git.Ensure(ctx, env.RunID, baseBranch)
 	if err != nil {
 		return fmt.Errorf("ensure worktree: %w", err)
 	}
@@ -191,22 +211,114 @@ func (m *Manager) handleRunStart(ctx context.Context, env protocol.Envelope) err
 		Branch:        ws.Branch,
 		WorktreePath:  ws.Path,
 		StartedAtUnix: startedAt,
+		RepoPath:      repoPath,
 	}); err != nil {
 		return fmt.Errorf("save run record: %w", err)
 	}
 
 	m.emitState(env.RunID, "running", "")
 
+	// {{memory}}는 Server가 아니라 여기서 채운다 — 기억 파일은 저장소 안에 있고
+	// Server에는 저장소가 없다(PRD §8.4 ME-01). 다른 토큰은 손대지 않는다.
+	prompt := replaceMemoryToken(body.Prompt, ws.Path)
+
 	runCtx, cancel := context.WithCancel(context.Background())
 	m.mu.Lock()
-	m.active[env.RunID] = &runHandle{cancel: cancel, ws: ws, startedAt: startedAt}
+	m.active[env.RunID] = &runHandle{cancel: cancel, ws: ws, git: git, repoPath: repoPath, startedAt: startedAt}
 	m.mu.Unlock()
 
-	go m.execute(runCtx, cancel, env.RunID, body.Prompt, startedAt, ws)
+	go m.execute(runCtx, cancel, env.RunID, prompt, startedAt, ws, git, repoPath)
 	return nil
 }
 
-func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID, prompt string, startedAt int64, ws gitops.Workspace) {
+// maxMemoryBytes는 프롬프트에 주입하는 기억 파일의 상한이다. 그 위는 잘라
+// 내고 잘렸음을 알린다.
+const maxMemoryBytes = 64 * 1024
+
+// replaceMemoryToken은 prompt의 {{memory}}를 worktree의 .taskyard/memory.md
+// 내용으로 바꾼다. 파일이 없으면 빈 문자열이다. strings.ReplaceAll은 넣은
+// 값을 다시 훑지 않으므로 기억 파일 안에 {{memory}}가 있어도 그대로다.
+func replaceMemoryToken(prompt, worktree string) string {
+	const token = "{{memory}}"
+	if !strings.Contains(prompt, token) {
+		return prompt
+	}
+	return strings.ReplaceAll(prompt, token, readMemory(worktree))
+}
+
+// readMemory는 기억 파일을 읽되 두 가지를 지킨다. 저장소는 에이전트가 쓰는
+// 곳이므로 (1) worktree 밖을 가리키는 심링크는 읽지 않고 (2) 크기를
+// maxMemoryBytes로 자른다.
+func readMemory(worktree string) string {
+	path := filepath.Join(worktree, ".taskyard", "memory.md")
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return ""
+	}
+	root, err := filepath.EvalSymlinks(worktree)
+	if err != nil {
+		return ""
+	}
+	if real != root && !strings.HasPrefix(real, root+string(filepath.Separator)) {
+		slog.Warn("memory file escapes the worktree; ignoring", "path", path, "target", real)
+		return ""
+	}
+
+	f, err := os.Open(real)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	buf, err := io.ReadAll(io.LimitReader(f, maxMemoryBytes+1))
+	if err != nil {
+		return ""
+	}
+	if len(buf) > maxMemoryBytes {
+		return string(buf[:maxMemoryBytes]) + "\n…(memory.md truncated at 64KiB)\n"
+	}
+	return string(buf)
+}
+
+// errRunnerBusy는 활성 Run이 있는 동안 온 다른 run.start의 실패 이유다.
+// 러너는 동시에 하나만 돌린다 — runIDForApproval이 그 가정에 기대고, 동시
+// 실행 한도는 Phase 1 뒤쪽 항목이다(PRD EX-10).
+var errRunnerBusy = errors.New("runner busy: another run is active (concurrency limit 1)")
+
+// otherRunActive는 env.RunID가 아닌 Run이 돌고 있는지 본다. 같은 Run의
+// 재전송은 바쁨이 아니라 멱등성 관문의 몫이다.
+func (m *Manager) otherRunActive(runID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id := range m.active {
+		if id != runID {
+			return true
+		}
+	}
+	return false
+}
+
+// failBeforeStart는 프로세스를 띄우기 전에 정해진 실패(허용 목록 밖 저장소,
+// 바쁜 러너)를 기록한다. 관문을 먼저 통과시켜 재전송이 같은 실패를 다시
+// 발행하지 않게 하고, 원장에는 요청받은 경로를 그대로 남긴다.
+func (m *Manager) failBeforeStart(env protocol.Envelope, repoPath string, cause error) error {
+	_, first, err := m.cfg.Spool.RememberCommand(env.ID, []byte(`{"accepted":true}`))
+	if err != nil {
+		return fmt.Errorf("remember command: %w", err)
+	}
+	if !first {
+		return nil
+	}
+	_ = m.cfg.Spool.SaveRun(spool.RunRecord{
+		RunID:         env.RunID,
+		State:         "failed",
+		StartedAtUnix: time.Now().Unix(),
+		RepoPath:      repoPath,
+	})
+	m.fail(env.RunID, cause)
+	return nil
+}
+
+func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID, prompt string, startedAt int64, ws gitops.Workspace, git *gitops.Manager, repoPath string) {
 	defer func() {
 		m.mu.Lock()
 		delete(m.active, runID)
@@ -220,7 +332,7 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID,
 		BrokerToken: m.cfg.BrokerToken,
 	})
 	if err != nil {
-		m.recordEarlyFailure(runID, ws, startedAt)
+		m.recordEarlyFailure(runID, ws, startedAt, repoPath)
 		m.fail(runID, fmt.Errorf("build args: %w", err))
 		return
 	}
@@ -232,13 +344,13 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID,
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		m.recordEarlyFailure(runID, ws, startedAt)
+		m.recordEarlyFailure(runID, ws, startedAt, repoPath)
 		m.fail(runID, fmt.Errorf("stdout pipe: %w", err))
 		return
 	}
 
 	if err := cmd.Start(); err != nil {
-		m.recordEarlyFailure(runID, ws, startedAt)
+		m.recordEarlyFailure(runID, ws, startedAt, repoPath)
 		m.fail(runID, fmt.Errorf("start agent: %w", err))
 		return
 	}
@@ -254,6 +366,7 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID,
 		WorktreePath:  ws.Path,
 		StartedAtUnix: startedAt,
 		PID:           pid,
+		RepoPath:      repoPath,
 	}); err != nil {
 		slog.Error("save run pid failed", "run_id", runID, "err", err)
 	}
@@ -297,6 +410,7 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID,
 		WorktreePath:  ws.Path,
 		StartedAtUnix: startedAt,
 		PID:           pid,
+		RepoPath:      repoPath,
 	}
 
 	switch {
@@ -306,12 +420,12 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID,
 		// 여기서 죽으면 재시작 후 Reconcile이 이미 종결 상태를 보고
 		// 이 Run을 다시 살펴보지 않으므로, salvage를 SaveRun보다 앞에
 		// 둬야 그 창에서 실행이 끊겨도 보존이 유실되지 않는다.
-		m.salvage(runID)
+		m.salvage(runID, git)
 		_ = m.cfg.Spool.SaveRun(record)
 		m.fail(runID, fmt.Errorf("parse stream: %w", parseErr))
 	case waitErr != nil:
 		record.State = m.terminalState(runID)
-		m.salvage(runID)
+		m.salvage(runID, git)
 		_ = m.cfg.Spool.SaveRun(record)
 		m.fail(runID, fmt.Errorf("agent exited: %w", waitErr))
 	case session.APIKeySource != "none":
@@ -320,7 +434,7 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID,
 		// 조기 검사가 한 번도 실행되지 못한 경우(예: init 다음에 곧바로
 		// result만 오는 스트림)의 마지막 방어선이기도 하다(PRD §13.2).
 		record.State = "failed"
-		m.salvage(runID)
+		m.salvage(runID, git)
 		_ = m.cfg.Spool.SaveRun(record)
 		m.fail(runID, fmt.Errorf("agent's billing identity is not a verified subscription login (apiKeySource=%q); refusing to continue", session.APIKeySource))
 	default:
@@ -333,13 +447,14 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID,
 // recordEarlyFailure는 Agent 프로세스를 아예 띄우지 못한 경우의 원장
 // 기록이다. 이 실패들은 어떤 세션도 시작되기 전에 일어나므로 SessionID·PID는
 // 비운다.
-func (m *Manager) recordEarlyFailure(runID string, ws gitops.Workspace, startedAt int64) {
+func (m *Manager) recordEarlyFailure(runID string, ws gitops.Workspace, startedAt int64, repoPath string) {
 	_ = m.cfg.Spool.SaveRun(spool.RunRecord{
 		RunID:         runID,
 		State:         "failed",
 		Branch:        ws.Branch,
 		WorktreePath:  ws.Path,
 		StartedAtUnix: startedAt,
+		RepoPath:      repoPath,
 	})
 }
 
@@ -357,11 +472,11 @@ func (m *Manager) terminalState(runID string) string {
 }
 
 // salvage는 종료 전 미커밋 변경을 보존한다(PRD §8.7.1).
-func (m *Manager) salvage(runID string) {
+func (m *Manager) salvage(runID string, git *gitops.Manager) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	sha, saved, err := m.cfg.Git.Salvage(ctx, runID)
+	sha, saved, err := git.Salvage(ctx, runID)
 	if err != nil {
 		slog.Error("salvage failed", "run_id", runID, "err", err)
 		return
@@ -404,6 +519,7 @@ func (m *Manager) handleRunCancel(env protocol.Envelope) error {
 		Branch:        h.ws.Branch,
 		WorktreePath:  h.ws.Path,
 		StartedAtUnix: h.startedAt,
+		RepoPath:      h.repoPath,
 	})
 	m.emitState(env.RunID, "cancelled", "cancelled by user")
 	return nil

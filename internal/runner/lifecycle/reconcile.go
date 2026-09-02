@@ -79,7 +79,13 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 
 		case VerdictLost:
 			// 반드시 보존이 먼저다. 사용자 작업을 잃지 않는 것이 최우선이다.
-			m.salvage(rec.RunID)
+			// 어느 저장소인지는 기록의 RepoPath가 말한다(없으면 첫 허용 저장소).
+			// 허용 목록에서 빠진 저장소면 보존은 건너뛰되 판정은 그대로 한다.
+			if git, _, err := m.cfg.Repos.resolve(rec.RepoPath); err != nil {
+				slog.Warn("cannot salvage: repository no longer allowed", "run_id", rec.RunID, "repo", rec.RepoPath, "err", err)
+			} else {
+				m.salvage(rec.RunID, git)
+			}
 			m.emitState(rec.RunID, "failed", "reconciled: session lost, work salvaged")
 
 			rec.State = "failed"
