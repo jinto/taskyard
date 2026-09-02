@@ -755,6 +755,33 @@ func TestSecondRunStartWhileBusyFails(t *testing.T) {
 	if n := startCount(); n != 1 {
 		t.Fatalf("agent starts = %d, want exactly one (second must not start while busy)", n)
 	}
+
+	// 첫 Run의 sleep 30을 고아로 남기지 않는다. execute의 ctx는 Background
+	// 파생이라 테스트가 끝나도 프로세스가 살아남기 때문이다.
+	cancelCmd, err := protocol.NewCommand(protocol.CmdRunCancel, "run-1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.HandleCommand(ctx, cancelCmd); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "run-1 cancelled", func() bool {
+		for _, r := range mustLoadRuns(t, h.sp) {
+			if r.RunID == "run-1" && r.State == "cancelled" {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func mustLoadRuns(t *testing.T, sp *spool.Spool) []spool.RunRecord {
+	t.Helper()
+	runs, err := sp.LoadRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runs
 }
 
 func TestTerminalAndCancelRecordsCarryRepoPath(t *testing.T) {
