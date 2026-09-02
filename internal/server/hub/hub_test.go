@@ -116,6 +116,47 @@ func TestEventsFlowFromRunnerToServerAndGetAcked(t *testing.T) {
 	})
 }
 
+// TestEventsForUnknownRunAreAckedAndDropped: 서버 원장에 없는 Run의 이벤트는
+// 저장하지 않되 ack는 해야 한다. ack가 없으면 러너의 spool이 영원히 남아
+// 재연결마다 같은 이벤트를 다시 보낸다(findings 2번 livelock). 서버 DB를
+// 지운 채 러너 spool이 살아 있는 경우가 이 경로다.
+func TestEventsForUnknownRunAreAckedAndDropped(t *testing.T) {
+	r := newRig(t, nil)
+	// 원장에 run-ghost 를 만들지 않는다.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.link.Run(ctx)
+	waitFor(t, "runner connection", r.hub.Connected)
+
+	for i := 0; i < 3; i++ {
+		env, _ := protocol.NewEvent(protocol.EvMessageDelta, "run-ghost", 0, map[string]int{"i": i})
+		if err := r.link.Publish("run-ghost", env); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	waitFor(t, "spool to drain although the run is unknown", func() bool {
+		n, err := r.sp.Pending("run-ghost")
+		return err == nil && n == 0
+	})
+
+	events, err := r.st.Events("run-ghost", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("stored %d events for an unknown run, want 0", len(events))
+	}
+	points, err := r.st.ResumePoints()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := points["run-ghost"]; ok {
+		t.Fatal("an unknown run must not gain a ledger row")
+	}
+}
+
 func TestReconnectResendsUnackedEventsWithoutDuplication(t *testing.T) {
 	r := newRig(t, nil)
 	if err := r.st.UpsertRun(store.Run{ID: "run-1", State: store.StateRunning, Kind: "structured"}); err != nil {
