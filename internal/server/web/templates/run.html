@@ -1,6 +1,6 @@
 {{define "content"}}
-<h1><a href="/">←</a> {{.Run.ID}}</h1>
-<div class="state">{{.Run.State}} · {{.Run.Branch}}</div>
+<h1><a href="{{.Back}}">←</a> {{.Run.ID}}</h1>
+<div class="state">{{.Run.State}}{{if .Run.Stage}} · {{.Run.Stage}}{{end}} · {{.Run.Branch}}{{if .IssueLabel}} · <a href="{{.Back}}">{{.IssueLabel}}</a>{{end}}</div>
 
 <div class="approval" id="approval" hidden>
   <div id="approval-text"></div>

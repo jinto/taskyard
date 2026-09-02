@@ -513,6 +513,18 @@ func (s *Store) GetProject(key string) (Project, error) {
 	return p, nil
 }
 
+// GetProjectByID는 Task·Run에서 프로젝트로 거슬러 올라갈 때 쓴다.
+func (s *Store) GetProjectByID(id string) (Project, error) {
+	p, err := scanProject(s.db.QueryRow(`SELECT `+projectColumns+` FROM projects WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Project{}, ErrProjectNotFound
+	}
+	if err != nil {
+		return Project{}, fmt.Errorf("get project by id: %w", err)
+	}
+	return p, nil
+}
+
 func (s *Store) ListProjects() ([]Project, error) {
 	rows, err := s.db.Query(`SELECT ` + projectColumns + ` FROM projects ORDER BY created_at ASC, rowid ASC`)
 	if err != nil {
@@ -599,6 +611,18 @@ func (s *Store) GetTask(projectID string, number int) (Task, error) {
 	}
 	if err != nil {
 		return Task{}, fmt.Errorf("get task: %w", err)
+	}
+	return t, nil
+}
+
+// GetTaskByID는 Run.TaskID에서 이슈로 거슬러 올라갈 때 쓴다.
+func (s *Store) GetTaskByID(id string) (Task, error) {
+	t, err := scanTask(s.db.QueryRow(`SELECT `+taskColumns+` FROM tasks WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Task{}, ErrTaskNotFound
+	}
+	if err != nil {
+		return Task{}, fmt.Errorf("get task by id: %w", err)
 	}
 	return t, nil
 }
