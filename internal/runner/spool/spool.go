@@ -14,6 +14,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/jinto/taskyard/internal/protocol"
+	"github.com/jinto/taskyard/internal/sqlitex"
 )
 
 const schema = `
@@ -48,10 +49,9 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 `
 
-// runsMigrations는 Phase 0 원장에 뒤늦게 추가된 컬럼이다. PRAGMA table_info로
-// 없는 것만 ALTER한다.
-var runsMigrations = []struct{ name, ddl string }{
-	{"repo_path", "TEXT NOT NULL DEFAULT ''"},
+// runsMigrations는 Phase 0 원장에 뒤늦게 추가된 컬럼이다.
+var runsMigrations = []sqlitex.Column{
+	{Name: "repo_path", DDL: "TEXT NOT NULL DEFAULT ''"},
 }
 
 // Spool은 SQLite로 뒷받침되는 이벤트 대기열이다.
@@ -72,44 +72,11 @@ func Open(path string) (*Spool, error) {
 		db.Close()
 		return nil, fmt.Errorf("create spool schema: %w", err)
 	}
-	if err := migrateRuns(db); err != nil {
+	if err := sqlitex.AddMissingColumns(db, "runs", runsMigrations); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return &Spool{db: db}, nil
-}
-
-func migrateRuns(db *sql.DB) error {
-	rows, err := db.Query(`PRAGMA table_info(runs)`)
-	if err != nil {
-		return fmt.Errorf("inspect runs schema: %w", err)
-	}
-	have := map[string]bool{}
-	for rows.Next() {
-		var (
-			cid, notnull, pk int
-			name, typ        string
-			dflt             sql.NullString
-		)
-		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan runs schema: %w", err)
-		}
-		have[name] = true
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("inspect runs schema: %w", err)
-	}
-	for _, m := range runsMigrations {
-		if have[m.name] {
-			continue
-		}
-		if _, err := db.Exec(`ALTER TABLE runs ADD COLUMN ` + m.name + ` ` + m.ddl); err != nil {
-			return fmt.Errorf("add runs.%s: %w", m.name, err)
-		}
-	}
-	return nil
 }
 
 func (s *Spool) Close() error { return s.db.Close() }

@@ -71,14 +71,8 @@ func canonicalRepoPath(p string) (string, error) {
 // 같은 저장소면 같은 인스턴스다. 정규화에 실패하거나 목록에 없으면
 // ErrRepoNotAllowed.
 func (r *RepoResolver) Manager(repoPath string) (*gitops.Manager, error) {
-	canon, err := canonicalRepoPath(repoPath)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %s (%v)", ErrRepoNotAllowed, repoPath, err)
-	}
-	if !r.allowed[canon] {
-		return nil, fmt.Errorf("%w: %s", ErrRepoNotAllowed, repoPath)
-	}
-	return r.managerFor(canon), nil
+	m, _, err := r.resolve(repoPath)
+	return m, err
 }
 
 // First는 허용 목록의 첫 저장소다. repo_path가 없는 명령과 RepoPath가 없는
@@ -87,16 +81,20 @@ func (r *RepoResolver) First() *gitops.Manager {
 	return r.managerFor(r.order[0])
 }
 
-// RepoPathOf는 관리자가 맡은 저장소의 정규화 경로다. 원장에 기록하는 값이다.
-func (r *RepoResolver) RepoPathOf(m *gitops.Manager) string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for canon, mgr := range r.managers {
-		if mgr == m {
-			return canon
-		}
+// resolve는 run.start와 원장 기록이 공통으로 쓰는 해석이다. 관리자와 함께
+// 원장에 기록할 정규화 경로를 돌려준다. 빈 경로는 첫 허용 저장소다.
+func (r *RepoResolver) resolve(repoPath string) (*gitops.Manager, string, error) {
+	if repoPath == "" {
+		return r.First(), r.order[0], nil
 	}
-	return ""
+	canon, err := canonicalRepoPath(repoPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %s (%v)", ErrRepoNotAllowed, repoPath, err)
+	}
+	if !r.allowed[canon] {
+		return nil, "", fmt.Errorf("%w: %s", ErrRepoNotAllowed, repoPath)
+	}
+	return r.managerFor(canon), canon, nil
 }
 
 func (r *RepoResolver) managerFor(canon string) *gitops.Manager {
@@ -112,18 +110,4 @@ func (r *RepoResolver) managerFor(canon string) *gitops.Manager {
 	m := gitops.New(canon, root)
 	r.managers[canon] = m
 	return m
-}
-
-// resolve는 run.start와 원장 기록이 공통으로 쓰는 해석이다. 빈 경로는 첫
-// 허용 저장소다.
-func (r *RepoResolver) resolve(repoPath string) (*gitops.Manager, string, error) {
-	if repoPath == "" {
-		m := r.First()
-		return m, r.order[0], nil
-	}
-	m, err := r.Manager(repoPath)
-	if err != nil {
-		return nil, "", err
-	}
-	return m, r.RepoPathOf(m), nil
 }

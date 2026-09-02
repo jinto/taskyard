@@ -20,6 +20,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/jinto/taskyard/internal/protocol"
+	"github.com/jinto/taskyard/internal/sqlitex"
 )
 
 // Run 상태. PRD §9.3의 부분집합으로, 지금 필요한 것만 둔다.
@@ -105,12 +106,10 @@ CREATE TABLE IF NOT EXISTS tasks (
 `
 
 // runsMigrations는 Phase 0 DB의 runs 테이블에 뒤늦게 추가된 컬럼이다.
-// CREATE TABLE IF NOT EXISTS는 이미 있는 테이블에 컬럼을 붙여 주지 않으므로,
-// PRAGMA table_info로 없는 것만 ALTER한다. 드라이버 오류 문자열에 기대지 않는다.
-var runsMigrations = []struct{ name, ddl string }{
-	{"task_id", "TEXT NOT NULL DEFAULT ''"},
-	{"stage", "TEXT NOT NULL DEFAULT ''"},
-	{"created_at", "INTEGER NOT NULL DEFAULT 0"},
+var runsMigrations = []sqlitex.Column{
+	{Name: "task_id", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "stage", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "created_at", DDL: "INTEGER NOT NULL DEFAULT 0"},
 }
 
 var (
@@ -179,48 +178,11 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("create server schema: %w", err)
 	}
-	if err := migrateRuns(db); err != nil {
+	if err := sqlitex.AddMissingColumns(db, "runs", runsMigrations); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return &Store{db: db}, nil
-}
-
-func migrateRuns(db *sql.DB) error {
-	rows, err := db.Query(`PRAGMA table_info(runs)`)
-	if err != nil {
-		return fmt.Errorf("inspect runs schema: %w", err)
-	}
-	have := map[string]bool{}
-	for rows.Next() {
-		var (
-			cid     int
-			name    string
-			typ     string
-			notnull int
-			dflt    sql.NullString
-			pk      int
-		)
-		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan runs schema: %w", err)
-		}
-		have[name] = true
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("inspect runs schema: %w", err)
-	}
-
-	for _, m := range runsMigrations {
-		if have[m.name] {
-			continue
-		}
-		if _, err := db.Exec(`ALTER TABLE runs ADD COLUMN ` + m.name + ` ` + m.ddl); err != nil {
-			return fmt.Errorf("add runs.%s: %w", m.name, err)
-		}
-	}
-	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }

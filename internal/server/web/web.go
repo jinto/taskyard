@@ -44,20 +44,22 @@ type Server struct {
 }
 
 func New(st *store.Store, h *hub.Hub) (*Server, error) {
-	s := &Server{st: st, hub: h}
-	for name, dst := range map[string]**template.Template{
-		"projects.html": &s.projects,
-		"project.html":  &s.project,
-		"issue.html":    &s.issue,
-		"run.html":      &s.run,
-	} {
-		t, err := template.ParseFS(templateFS, "templates/layout.html", "templates/"+name)
-		if err != nil {
-			return nil, fmt.Errorf("parse %s: %w", name, err)
+	var err error
+	page := func(name string) *template.Template {
+		t, perr := template.ParseFS(templateFS, "templates/layout.html", "templates/"+name)
+		if perr != nil && err == nil {
+			err = fmt.Errorf("parse %s: %w", name, perr)
 		}
-		*dst = t
+		return t
 	}
-	return s, nil
+	s := &Server{
+		st: st, hub: h,
+		projects: page("projects.html"),
+		project:  page("project.html"),
+		issue:    page("issue.html"),
+		run:      page("run.html"),
+	}
+	return s, err
 }
 
 func (s *Server) Routes() http.Handler {
