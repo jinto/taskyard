@@ -372,6 +372,251 @@ func TestRunIssueRejectsWhenARunIsActive(t *testing.T) {
 	}
 }
 
+// ---- 종료 방식: 취소·재시도 ----
+
+// retryTemplate은 재시도 변수를 쓰는 실행 템플릿이다.
+const retryTemplate = "이슈:{{issue}}\n이전:{{previous_run}}\n메모:{{feedback}}"
+
+func seedRetryProject(t *testing.T, st *store.Store) (store.Project, store.Task) {
+	t.Helper()
+	p, err := st.CreateProject(store.Project{Key: "shop", Name: "쇼핑몰", RepoPath: "/repos/shop", DefaultBranch: "main", ExecuteTemplate: retryTemplate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := seedTask(t, st, p, "이메일 정규화", "")
+	return p, task
+}
+
+func seedRun(t *testing.T, st *store.Store, task store.Task, id, state, session, detail string) {
+	t.Helper()
+	if err := st.UpsertRun(store.Run{
+		ID: id, State: state, Kind: "structured", TaskID: task.ID, Stage: "execute",
+		ProviderSessionID: session, Detail: detail,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func decodeStart(t *testing.T, got <-chan protocol.Envelope, wantType string) (protocol.Envelope, protocol.RunStartBody) {
+	t.Helper()
+	select {
+	case env := <-got:
+		if env.Type != wantType {
+			t.Fatalf("runner got %s, want %s", env.Type, wantType)
+		}
+		var body protocol.RunStartBody
+		if wantType == protocol.CmdRunStart {
+			if err := json.Unmarshal(env.Body, &body); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return env, body
+	case <-time.After(5 * time.Second):
+		t.Fatalf("runner never received %s", wantType)
+		return protocol.Envelope{}, protocol.RunStartBody{}
+	}
+}
+
+func TestCancelSendsRunCancelAndRedirects(t *testing.T) {
+	st, hb, h := newServerWithHub(t)
+	got := attachRunner(t, hb, h)
+	_, task := seedRetryProject(t, st)
+	seedRun(t, st, task, "run-1", store.StateRunning, "", "")
+
+	rec := postForm(h, "/runs/run-1/cancel", nil)
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/projects/shop/issues/1" {
+		t.Fatalf("status = %d location = %q", rec.Code, rec.Header().Get("Location"))
+	}
+	env, _ := decodeStart(t, got, protocol.CmdRunCancel)
+	if env.RunID != "run-1" {
+		t.Fatalf("cancel for %s, want run-1", env.RunID)
+	}
+}
+
+func TestCancelNeedsAttentionRunWithoutRunner(t *testing.T) {
+	st, h := newServer(t)
+	p, task := seedRetryProject(t, st)
+	_ = st.UpdateTaskStatus(task.ID, store.TaskInProgress)
+	seedRun(t, st, task, "run-1", store.StateNeedsAttention, "sess-1", "why")
+
+	if rec := postForm(h, "/runs/run-1/cancel", nil); rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303 (no runner needed for a stopped run)", rec.Code)
+	}
+	run, _ := st.GetRun("run-1")
+	if run.State != store.StateCancelled {
+		t.Fatalf("run state = %q, want cancelled", run.State)
+	}
+	tk, _ := st.GetTask(p.ID, 1)
+	if tk.Status != store.TaskBacklog {
+		t.Fatalf("task status = %q, want backlog", tk.Status)
+	}
+}
+
+func TestCancelTerminalRunIs409(t *testing.T) {
+	st, h := newServer(t)
+	_, task := seedRetryProject(t, st)
+	seedRun(t, st, task, "run-1", store.StateSucceeded, "sess-1", "")
+	if rec := postForm(h, "/runs/run-1/cancel", nil); rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", rec.Code)
+	}
+}
+
+func TestRetryContinueReusesWorkspaceAndResumesSession(t *testing.T) {
+	st, hb, h := newServerWithHub(t)
+	got := attachRunner(t, hb, h)
+	p, task := seedRetryProject(t, st)
+	_ = st.UpdateTaskStatus(task.ID, store.TaskInProgress)
+	seedRun(t, st, task, "run-prev", store.StateNeedsAttention, "sess-1", "CI가 반복 실패")
+
+	rec := postForm(h, "/runs/run-prev/retry", url.Values{"mode": {"continue"}, "feedback": {"캐시를 지우고 다시"}})
+	if rec.Code != http.StatusSeeOther || !strings.HasPrefix(rec.Header().Get("Location"), "/runs/run-") {
+		t.Fatalf("status = %d location = %q body = %s", rec.Code, rec.Header().Get("Location"), rec.Body.String())
+	}
+	newID := strings.TrimPrefix(rec.Header().Get("Location"), "/runs/")
+
+	env, body := decodeStart(t, got, protocol.CmdRunStart)
+	if env.RunID != newID {
+		t.Fatalf("run.start for %s, want %s", env.RunID, newID)
+	}
+	if body.WorkspaceRunID != "run-prev" || body.ResumeSessionID != "sess-1" {
+		t.Fatalf("body workspace=%q resume=%q, want run-prev / sess-1", body.WorkspaceRunID, body.ResumeSessionID)
+	}
+	want := "이슈:#1 이메일 정규화\n이전:이전 실행 run-prev: needs_attention\nCI가 반복 실패\n메모:캐시를 지우고 다시"
+	if body.Prompt != want {
+		t.Fatalf("prompt = %q\nwant  %q", body.Prompt, want)
+	}
+
+	run, err := st.GetRun(newID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.PreviousRunID != "run-prev" || run.Feedback != "캐시를 지우고 다시" || run.WorkspaceRunID != "run-prev" || run.TaskID != task.ID {
+		t.Fatalf("new run = %+v", run)
+	}
+	tk, _ := st.GetTask(p.ID, 1)
+	if tk.Status != store.TaskInProgress {
+		t.Fatalf("task status = %q, want in_progress", tk.Status)
+	}
+}
+
+func TestRetryContinueChainsWorkspaceOfEarlierRun(t *testing.T) {
+	st, hb, h := newServerWithHub(t)
+	got := attachRunner(t, hb, h)
+	_, task := seedRetryProject(t, st)
+	// run-2 는 run-1 의 worktree 를 이어받은 재시도였다. 그것을 또 이어가면
+	// worktree 주인은 여전히 run-1 이다.
+	seedRun(t, st, task, "run-1", store.StateFailed, "sess-1", "")
+	_ = st.UpsertRun(store.Run{ID: "run-2", State: store.StateFailed, Kind: "structured", TaskID: task.ID, Stage: "execute",
+		ProviderSessionID: "sess-2", PreviousRunID: "run-1", WorkspaceRunID: "run-1"})
+
+	if rec := postForm(h, "/runs/run-2/retry", url.Values{"mode": {"continue"}}); rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	_, body := decodeStart(t, got, protocol.CmdRunStart)
+	if body.WorkspaceRunID != "run-1" || body.ResumeSessionID != "sess-2" {
+		t.Fatalf("body workspace=%q resume=%q, want run-1 / sess-2", body.WorkspaceRunID, body.ResumeSessionID)
+	}
+}
+
+func TestRetryFreshUsesNewWorkspaceAndNoResume(t *testing.T) {
+	st, hb, h := newServerWithHub(t)
+	got := attachRunner(t, hb, h)
+	_, task := seedRetryProject(t, st)
+	seedRun(t, st, task, "run-prev", store.StateFailed, "sess-1", "boom")
+
+	rec := postForm(h, "/runs/run-prev/retry", url.Values{"mode": {"fresh"}})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	newID := strings.TrimPrefix(rec.Header().Get("Location"), "/runs/")
+	_, body := decodeStart(t, got, protocol.CmdRunStart)
+	if body.WorkspaceRunID != "" && body.WorkspaceRunID != newID {
+		t.Fatalf("fresh retry must not reuse a workspace, got %q", body.WorkspaceRunID)
+	}
+	if body.ResumeSessionID != "" {
+		t.Fatalf("fresh retry must not resume, got %q", body.ResumeSessionID)
+	}
+	if !strings.Contains(body.Prompt, "이전 실행 run-prev: failed\nboom") {
+		t.Fatalf("prompt lacks previous run text:\n%s", body.Prompt)
+	}
+	run, _ := st.GetRun(newID)
+	if run.WorkspaceRunID != newID || run.PreviousRunID != "run-prev" {
+		t.Fatalf("new run = %+v", run)
+	}
+}
+
+func TestRetryContinueWithoutSessionIs409AndCreatesNoRun(t *testing.T) {
+	st, h := newServer(t)
+	_, task := seedRetryProject(t, st)
+	seedRun(t, st, task, "run-prev", store.StateFailed, "", "no init")
+
+	if rec := postForm(h, "/runs/run-prev/retry", url.Values{"mode": {"continue"}}); rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", rec.Code)
+	}
+	runs, _ := st.RunsForTask(task.ID)
+	if len(runs) != 1 {
+		t.Fatalf("a run was created despite the refusal: %+v", runs)
+	}
+}
+
+func TestRetryIsRefusedUnlessSettled(t *testing.T) {
+	st, h := newServer(t)
+	_, task := seedRetryProject(t, st)
+	seedRun(t, st, task, "run-prev", store.StateSucceeded, "sess-1", "")
+	seedRun(t, st, task, "run-live", store.StateRunning, "", "")
+
+	// 이슈에 활성 Run 이 있으면 어떤 재시도도 안 된다.
+	if rec := postForm(h, "/runs/run-prev/retry", url.Values{"mode": {"fresh"}}); rec.Code != http.StatusConflict {
+		t.Fatalf("retry while another run is active: status = %d, want 409", rec.Code)
+	}
+	// 정착되지 않은 Run 자체도 재시도 대상이 아니다.
+	if rec := postForm(h, "/runs/run-live/retry", url.Values{"mode": {"fresh"}}); rec.Code != http.StatusConflict {
+		t.Fatalf("retry of a running run: status = %d, want 409", rec.Code)
+	}
+	if rec := postForm(h, "/runs/run-prev/retry", url.Values{"mode": {"sideways"}}); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad mode: status = %d, want 400", rec.Code)
+	}
+}
+
+func TestRetryFromReviewMovesIssueToInProgress(t *testing.T) {
+	st, hb, h := newServerWithHub(t)
+	got := attachRunner(t, hb, h)
+	p, task := seedRetryProject(t, st)
+	_ = st.UpdateTaskStatus(task.ID, store.TaskReview)
+	seedRun(t, st, task, "run-prev", store.StateSucceeded, "sess-1", "")
+
+	if rec := postForm(h, "/runs/run-prev/retry", url.Values{"mode": {"fresh"}}); rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	decodeStart(t, got, protocol.CmdRunStart)
+	tk, _ := st.GetTask(p.ID, 1)
+	if tk.Status != store.TaskInProgress {
+		t.Fatalf("task status = %q, want in_progress", tk.Status)
+	}
+}
+
+func TestIssuePageShowsCancelForActiveAndRetryForSettled(t *testing.T) {
+	st, h := newServer(t)
+	_, task := seedRetryProject(t, st)
+
+	seedRun(t, st, task, "run-1", store.StateRunning, "", "")
+	body := get(h, "/projects/shop/issues/1").Body.String()
+	if !strings.Contains(body, `action="/runs/run-1/cancel"`) {
+		t.Errorf("active run has no cancel action:\n%s", body)
+	}
+	if strings.Contains(body, `action="/runs/run-1/retry"`) {
+		t.Errorf("active run must not offer retry:\n%s", body)
+	}
+
+	seedRun(t, st, task, "run-1", store.StateNeedsAttention, "sess-1", "CI가 반복 실패")
+	body = get(h, "/projects/shop/issues/1").Body.String()
+	for _, want := range []string{`action="/runs/run-1/retry"`, `name="mode"`, `value="continue"`, `value="fresh"`, `name="feedback"`, `action="/runs/run-1/cancel"`, "CI가 반복 실패"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("settled run page lacks %q:\n%s", want, body)
+		}
+	}
+}
+
 func TestPostRunsIsGone(t *testing.T) {
 	_, h := newServer(t)
 	if rec := postForm(h, "/runs", url.Values{"prompt": {"x"}}); rec.Code != http.StatusNotFound {
@@ -412,7 +657,7 @@ func TestCrossSitePostIsRejected(t *testing.T) {
 	p := seedProject(t, st, "shop", "/repos/shop")
 	seedTask(t, st, p, "이슈", "")
 
-	paths := []string{"/projects", "/projects/shop/template", "/projects/shop/issues", "/projects/shop/issues/1/run", "/runs/run-1/approve"}
+	paths := []string{"/projects", "/projects/shop/template", "/projects/shop/issues", "/projects/shop/issues/1/run", "/runs/run-1/approve", "/runs/run-1/cancel", "/runs/run-1/retry"}
 	send := func(path string, headers map[string]string) int {
 		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader("title=x&key=k&name=n&repo_path=/r"))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
