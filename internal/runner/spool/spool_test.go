@@ -1,6 +1,7 @@
 package spool
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 
@@ -24,6 +25,62 @@ func mustEvent(t *testing.T, runID string) protocol.Envelope {
 		t.Fatalf("NewEvent: %v", err)
 	}
 	return env
+}
+
+func TestRunRecordRoundTripsRepoPath(t *testing.T) {
+	s := openTemp(t)
+	if err := s.SaveRun(RunRecord{RunID: "run-1", State: "running", RepoPath: "/private/tmp/repo"}); err != nil {
+		t.Fatal(err)
+	}
+	runs, err := s.LoadRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].RepoPath != "/private/tmp/repo" {
+		t.Fatalf("LoadRuns = %+v, want RepoPath round-tripped", runs)
+	}
+}
+
+// TestSpoolOpenMigratesRepoPathColumn: Phase 0 스키마의 runs 테이블에는
+// repo_path가 없다. Open이 PRAGMA table_info로 확인해 붙여야 한다.
+func TestSpoolOpenMigratesRepoPathColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE runs (
+	  run_id TEXT PRIMARY KEY, state TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '',
+	  branch TEXT NOT NULL DEFAULT '', worktree_path TEXT NOT NULL DEFAULT '',
+	  pid INTEGER NOT NULL DEFAULT 0, started_at INTEGER NOT NULL DEFAULT 0);
+	  INSERT INTO runs (run_id, state) VALUES ('run-old', 'running');`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on old schema: %v", err)
+	}
+	defer s.Close()
+
+	runs, err := s.LoadRuns()
+	if err != nil {
+		t.Fatalf("LoadRuns after migration: %v", err)
+	}
+	if len(runs) != 1 || runs[0].RunID != "run-old" || runs[0].RepoPath != "" {
+		t.Fatalf("LoadRuns = %+v", runs)
+	}
+	if err := s.SaveRun(RunRecord{RunID: "run-new", State: "running", RepoPath: "/r"}); err != nil {
+		t.Fatalf("SaveRun with repo_path: %v", err)
+	}
+	// 두 번째 Open도 멱등이다.
+	_ = s.Close()
+	again, err := Open(path)
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	_ = again.Close()
 }
 
 func TestAppendIssuesMonotonicSequences(t *testing.T) {
