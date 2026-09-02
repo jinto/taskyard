@@ -1,0 +1,1 @@
+{"method":"tools/call","params":{"name":"approve","arguments":{"tool_name":"Write","input":{"file_path":"/private/tmp/taskyard-probe/probe-note.txt","content":"hello from probe\n"},"tool_use_id":"toolu_01P1SZNbTpBrMuYYBCdig938"},"_meta":{"claudecode/toolUseId":"toolu_01P1SZNbTpBrMuYYBCdig938","progressToken":2}},"jsonrpc":"2.0","id":2}

@@ -1,0 +1,58 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+
+	"github.com/jinto/taskyard/internal/buildinfo"
+	"github.com/jinto/taskyard/internal/server/hub"
+	"github.com/jinto/taskyard/internal/server/store"
+	"github.com/jinto/taskyard/internal/server/web"
+)
+
+func main() {
+	var (
+		addr        = flag.String("addr", "127.0.0.1:8080", "listen address")
+		dbPath      = flag.String("db", "taskyard-server.db", "sqlite path")
+		token       = flag.String("pairing-token", "", "one-time pairing token for the runner")
+		showVersion = flag.Bool("version", false, "print version and exit")
+	)
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("taskyard-server %s (protocol v%d)\n", buildinfo.Version(), buildinfo.ProtocolVersion())
+		return
+	}
+	if *token == "" {
+		fmt.Fprintln(os.Stderr, "taskyard-server: --pairing-token is required")
+		os.Exit(2)
+	}
+
+	st, err := store.Open(*dbPath)
+	if err != nil {
+		slog.Error("open store failed", "err", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+
+	h := hub.New(st, *token)
+
+	ui, err := web.New(st, h)
+	if err != nil {
+		slog.Error("build web failed", "err", err)
+		os.Exit(1)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", h.ServeWS)
+	mux.Handle("/", ui.Routes())
+
+	slog.Info("taskyard-server listening", "addr", *addr)
+	if err := http.ListenAndServe(*addr, mux); err != nil {
+		slog.Error("server stopped", "err", err)
+		os.Exit(1)
+	}
+}

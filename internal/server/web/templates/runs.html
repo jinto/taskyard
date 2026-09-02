@@ -1,0 +1,16 @@
+{{define "content"}}
+<h1>실행 목록</h1>
+<form method="post" action="/runs" style="margin-bottom: 1.5rem;">
+  <input type="text" name="prompt" placeholder="Agent에게 시킬 일을 입력하세요" required
+         style="width: 60%; padding: .4rem .6rem;">
+  <button type="submit">실행 시작</button>
+</form>
+{{range .Runs}}
+  <div class="run">
+    <a href="/runs/{{.ID}}">{{.ID}}</a>
+    <div class="state">{{.State}} · seq {{.LastAckedSeq}}{{if .Branch}} · {{.Branch}}{{end}}</div>
+  </div>
+{{else}}
+  <p class="state">아직 실행이 없습니다.</p>
+{{end}}
+{{end}}
