@@ -63,10 +63,15 @@ type Envelope struct {
 // 한다(PRD RN-03). 비어 있으면 Runner의 첫 허용 저장소 — Phase 0 형식의
 // 명령과 저장소 하나짜리 러너를 위한 기본값이다. BaseBranch가 비어 있으면
 // Runner 설정의 기본 브랜치를 쓴다.
+//
+// WorkspaceRunID가 있으면 그 Run의 worktree·브랜치를 그대로 쓴다(이어서
+// 재시도, PRD §7.6). ResumeSessionID가 있으면 `--resume`으로 그 세션을 이어간다.
 type RunStartBody struct {
-	Prompt     string `json:"prompt"`
-	RepoPath   string `json:"repo_path,omitempty"`
-	BaseBranch string `json:"base_branch,omitempty"`
+	Prompt          string `json:"prompt"`
+	RepoPath        string `json:"repo_path,omitempty"`
+	BaseBranch      string `json:"base_branch,omitempty"`
+	WorkspaceRunID  string `json:"workspace_run_id,omitempty"`
+	ResumeSessionID string `json:"resume_session_id,omitempty"`
 }
 
 func marshalBody(body any) (json.RawMessage, error) {

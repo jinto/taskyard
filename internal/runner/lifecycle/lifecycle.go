@@ -56,11 +56,34 @@ type Manager struct {
 // 쓴다 — 취소로 죽은 프로세스도 parseErr/waitErr로 나타나기 때문이다.
 type runHandle struct {
 	cancel    context.CancelFunc
-	ws        gitops.Workspace
-	git       *gitops.Manager // 이 Run의 저장소 관리자. salvage가 쓴다
-	repoPath  string          // 원장에 남기는 정규화 경로
-	startedAt int64
+	spec      runSpec
 	cancelled bool
+}
+
+// runSpec은 Run 하나를 실행하는 데 필요한 전부다. 원장 기록의 공통 필드가
+// 여기서 나오므로, 어느 경로에서 기록하든 RepoPath·WorkspaceRunID가 빠지지
+// 않는다.
+type runSpec struct {
+	runID           string
+	prompt          string
+	resumeSessionID string
+	repoPath        string // 원장에 남기는 정규화 경로
+	workspaceRunID  string // worktree·브랜치의 주인 Run. 이어서 재시도는 이전 Run
+	startedAt       int64
+	ws              gitops.Workspace
+	git             *gitops.Manager // 이 Run의 저장소 관리자. salvage가 쓴다
+}
+
+func (s runSpec) record(state string) spool.RunRecord {
+	return spool.RunRecord{
+		RunID:          s.runID,
+		State:          state,
+		Branch:         s.ws.Branch,
+		WorktreePath:   s.ws.Path,
+		StartedAtUnix:  s.startedAt,
+		RepoPath:       s.repoPath,
+		WorkspaceRunID: s.workspaceRunID,
+	}
 }
 
 func New(cfg Config) (*Manager, error) {
@@ -178,7 +201,13 @@ func (m *Manager) handleRunStart(ctx context.Context, env protocol.Envelope) err
 		baseBranch = m.cfg.BaseBranch
 	}
 
-	ws, err := git.Ensure(ctx, env.RunID, baseBranch)
+	// worktree·브랜치는 workspace 주인 Run의 이름으로 정해진다. 이어서 재시도는
+	// 이전 Run의 것을 그대로 쓰고, 그 밖에는 자기 자신이다(PRD §7.6).
+	wsID := body.WorkspaceRunID
+	if wsID == "" {
+		wsID = env.RunID
+	}
+	ws, err := git.Ensure(ctx, wsID, baseBranch)
 	if err != nil {
 		return fmt.Errorf("ensure worktree: %w", err)
 	}
@@ -204,15 +233,16 @@ func (m *Manager) handleRunStart(ctx context.Context, env protocol.Envelope) err
 		return nil
 	}
 
-	startedAt := time.Now().Unix()
-	if err := m.cfg.Spool.SaveRun(spool.RunRecord{
-		RunID:         env.RunID,
-		State:         "running",
-		Branch:        ws.Branch,
-		WorktreePath:  ws.Path,
-		StartedAtUnix: startedAt,
-		RepoPath:      repoPath,
-	}); err != nil {
+	spec := runSpec{
+		runID:           env.RunID,
+		resumeSessionID: body.ResumeSessionID,
+		repoPath:        repoPath,
+		workspaceRunID:  wsID,
+		startedAt:       time.Now().Unix(),
+		ws:              ws,
+		git:             git,
+	}
+	if err := m.cfg.Spool.SaveRun(spec.record("running")); err != nil {
 		return fmt.Errorf("save run record: %w", err)
 	}
 
@@ -220,20 +250,24 @@ func (m *Manager) handleRunStart(ctx context.Context, env protocol.Envelope) err
 
 	// {{memory}}는 Server가 아니라 여기서 채운다 — 기억 파일은 저장소 안에 있고
 	// Server에는 저장소가 없다(PRD §8.4 ME-01). 다른 토큰은 손대지 않는다.
-	prompt := replaceMemoryToken(body.Prompt, ws.Path)
+	spec.prompt = replaceMemoryToken(body.Prompt, ws.Path)
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	m.mu.Lock()
-	m.active[env.RunID] = &runHandle{cancel: cancel, ws: ws, git: git, repoPath: repoPath, startedAt: startedAt}
+	m.active[env.RunID] = &runHandle{cancel: cancel, spec: spec}
 	m.mu.Unlock()
 
-	go m.execute(runCtx, cancel, env.RunID, prompt, startedAt, ws, git, repoPath)
+	go m.execute(runCtx, cancel, spec)
 	return nil
 }
 
 // maxMemoryBytes는 프롬프트에 주입하는 기억 파일의 상한이다. 그 위는 잘라
-// 내고 잘렸음을 알린다.
-const maxMemoryBytes = 64 * 1024
+// 내고 잘렸음을 알린다. maxAttentionBytes는 멈춤 보고의 상한이다.
+const (
+	maxMemoryBytes    = 64 * 1024
+	maxAttentionBytes = 4 * 1024
+	attentionFile     = ".taskyard/attention.md"
+)
 
 // replaceMemoryToken은 prompt의 {{memory}}를 worktree의 .taskyard/memory.md
 // 내용으로 바꾼다. 파일이 없으면 빈 문자열이다. strings.ReplaceAll은 넣은
@@ -243,40 +277,63 @@ func replaceMemoryToken(prompt, worktree string) string {
 	if !strings.Contains(prompt, token) {
 		return prompt
 	}
-	return strings.ReplaceAll(prompt, token, readMemory(worktree))
+	memory, truncated, _ := readWorktreeFile(worktree, ".taskyard/memory.md", maxMemoryBytes)
+	if truncated {
+		memory += "\n…(memory.md truncated at 64KiB)\n"
+	}
+	return strings.ReplaceAll(prompt, token, memory)
 }
 
-// readMemory는 기억 파일을 읽되 두 가지를 지킨다. 저장소는 에이전트가 쓰는
-// 곳이므로 (1) worktree 밖을 가리키는 심링크는 읽지 않고 (2) 크기를
-// maxMemoryBytes로 자른다.
-func readMemory(worktree string) string {
-	path := filepath.Join(worktree, ".taskyard", "memory.md")
+// readWorktreeFile은 worktree 안의 파일을 읽되 두 가지를 지킨다. 저장소는
+// 에이전트가 쓰는 곳이므로 (1) worktree 밖을 가리키는 심링크는 읽지 않고
+// (2) 크기를 max로 자른다. 없거나 읽을 수 없거나 밖을 가리키면 ok=false.
+func readWorktreeFile(worktree, rel string, max int) (content string, truncated, ok bool) {
+	path := filepath.Join(worktree, rel)
 	real, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		return ""
+		return "", false, false
 	}
 	root, err := filepath.EvalSymlinks(worktree)
 	if err != nil {
-		return ""
+		return "", false, false
 	}
 	if real != root && !strings.HasPrefix(real, root+string(filepath.Separator)) {
-		slog.Warn("memory file escapes the worktree; ignoring", "path", path, "target", real)
-		return ""
+		slog.Warn("worktree file escapes the worktree; ignoring", "path", path, "target", real)
+		return "", false, false
 	}
 
 	f, err := os.Open(real)
 	if err != nil {
-		return ""
+		return "", false, false
 	}
 	defer f.Close()
-	buf, err := io.ReadAll(io.LimitReader(f, maxMemoryBytes+1))
+	buf, err := io.ReadAll(io.LimitReader(f, int64(max)+1))
 	if err != nil {
-		return ""
+		return "", false, false
 	}
-	if len(buf) > maxMemoryBytes {
-		return string(buf[:maxMemoryBytes]) + "\n…(memory.md truncated at 64KiB)\n"
+	if len(buf) > max {
+		return string(buf[:max]), true, true
 	}
-	return string(buf)
+	return string(buf), false, true
+}
+
+// takeAttention은 에이전트가 남긴 멈춤 보고(PRD §7.5)를 읽고 파일을 지운다.
+// 지우는 이유: 이어서 재시도가 같은 worktree를 쓰므로 남기면 다음 Run이
+// 즉시 다시 멈춘다. 파일이 없거나 비어 있거나 읽을 수 없으면 보고가 없는
+// 것이다. 에이전트가 파일을 커밋해 버렸다면 삭제가 미커밋 변경으로 남고
+// 다음 Run이나 salvage가 그 삭제를 실어 간다 — 결정적이고 무해하다.
+func takeAttention(worktree string) (string, bool) {
+	reason, truncated, ok := readWorktreeFile(worktree, attentionFile, maxAttentionBytes)
+	if !ok || strings.TrimSpace(reason) == "" {
+		return "", false
+	}
+	if truncated {
+		reason += "\n…(attention.md truncated at 4KiB)"
+	}
+	if err := os.Remove(filepath.Join(worktree, attentionFile)); err != nil {
+		slog.Warn("could not remove attention file", "err", err)
+	}
+	return reason, true
 }
 
 // errRunnerBusy는 활성 Run이 있는 동안 온 다른 run.start의 실패 이유다.
@@ -314,60 +371,61 @@ func (m *Manager) failBeforeStart(env protocol.Envelope, repoPath string, cause 
 		StartedAtUnix: time.Now().Unix(),
 		RepoPath:      repoPath,
 	})
-	m.fail(env.RunID, cause)
+	m.emitTerminal(env.RunID, "failed", cause.Error(), "")
 	return nil
 }
 
-func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID, prompt string, startedAt int64, ws gitops.Workspace, git *gitops.Manager, repoPath string) {
+func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, spec runSpec) {
+	runID := spec.runID
 	defer func() {
 		m.mu.Lock()
 		delete(m.active, runID)
 		m.mu.Unlock()
 	}()
 
+	// Agent 프로세스를 아예 띄우지 못한 실패. 어떤 세션도 시작되기 전이므로
+	// SessionID·PID는 비어 있다.
+	earlyFail := func(err error) {
+		slog.Error("run failed", "run_id", runID, "err", err)
+		_ = m.cfg.Spool.SaveRun(spec.record("failed"))
+		m.emitTerminal(runID, "failed", err.Error(), "")
+	}
+
 	args, err := claudecode.BuildArgs(claudecode.SpawnOptions{
-		Prompt:      prompt,
-		WorkDir:     ws.Path,
-		BrokerURL:   m.cfg.BrokerURL,
-		BrokerToken: m.cfg.BrokerToken,
+		Prompt:          spec.prompt,
+		WorkDir:         spec.ws.Path,
+		ResumeSessionID: spec.resumeSessionID,
+		BrokerURL:       m.cfg.BrokerURL,
+		BrokerToken:     m.cfg.BrokerToken,
 	})
 	if err != nil {
-		m.recordEarlyFailure(runID, ws, startedAt, repoPath)
-		m.fail(runID, fmt.Errorf("build args: %w", err))
+		earlyFail(fmt.Errorf("build args: %w", err))
 		return
 	}
 
 	cmd := exec.CommandContext(ctx, m.cfg.ClaudeBinary, args...)
-	cmd.Dir = ws.Path
+	cmd.Dir = spec.ws.Path
 	cmd.Env = claudecode.ScrubEnv(os.Environ())
 	cmd.Stderr = os.Stderr
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		m.recordEarlyFailure(runID, ws, startedAt, repoPath)
-		m.fail(runID, fmt.Errorf("stdout pipe: %w", err))
+		earlyFail(fmt.Errorf("stdout pipe: %w", err))
 		return
 	}
 
 	if err := cmd.Start(); err != nil {
-		m.recordEarlyFailure(runID, ws, startedAt, repoPath)
-		m.fail(runID, fmt.Errorf("start agent: %w", err))
+		earlyFail(fmt.Errorf("start agent: %w", err))
 		return
 	}
 
-	// PID를 확보하는 즉시 원장에 반영한다. Task 10의 재시작 후 조정은 이
-	// PID로 프로세스 생존을 판정하므로(PRD §11.7), 0으로 남아 있으면 살아
-	// 있는 Run을 영원히 알아보지 못한다.
+	// PID를 확보하는 즉시 원장에 반영한다. 재시작 후 조정은 이 PID로 프로세스
+	// 생존을 판정하므로(PRD §11.7), 0으로 남아 있으면 살아 있는 Run을 영원히
+	// 알아보지 못한다.
 	pid := cmd.Process.Pid
-	if err := m.cfg.Spool.SaveRun(spool.RunRecord{
-		RunID:         runID,
-		State:         "running",
-		Branch:        ws.Branch,
-		WorktreePath:  ws.Path,
-		StartedAtUnix: startedAt,
-		PID:           pid,
-		RepoPath:      repoPath,
-	}); err != nil {
+	running := spec.record("running")
+	running.PID = pid
+	if err := m.cfg.Spool.SaveRun(running); err != nil {
 		slog.Error("save run pid failed", "run_id", runID, "err", err)
 	}
 
@@ -403,59 +461,49 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID,
 	waitErr := cmd.Wait()
 	session := parser.Session()
 
-	record := spool.RunRecord{
-		RunID:         runID,
-		SessionID:     session.SessionID,
-		Branch:        ws.Branch,
-		WorktreePath:  ws.Path,
-		StartedAtUnix: startedAt,
-		PID:           pid,
-		RepoPath:      repoPath,
+	// 종결은 여기 한 곳에서만 결정하고 발행한다. 취소로 죽은 프로세스도
+	// parseErr/waitErr로 나타나므로 terminalState()가 cancelled를 고른다 —
+	// handleRunCancel은 이벤트를 보내지 않는다. 그렇지 않으면 cancelled 뒤에
+	// failed가 따라와 서버가 failed로 끝난다(Phase 0 버그).
+	//
+	// 반드시 보존이 먼저다(Reconcile과 같은 순서). 여기서 죽으면 재시작 후
+	// Reconcile이 이미 종결 상태를 보고 이 Run을 다시 살펴보지 않으므로,
+	// salvage를 SaveRun보다 앞에 둬야 그 창에서 실행이 끊겨도 보존이
+	// 유실되지 않는다.
+	finish := func(state, detail string, salvageFirst bool) {
+		if salvageFirst {
+			m.salvage(runID, spec.workspaceRunID, spec.git)
+		}
+		rec := spec.record(state)
+		rec.SessionID = session.SessionID
+		rec.PID = pid
+		_ = m.cfg.Spool.SaveRun(rec)
+		if state != "succeeded" && state != "needs_attention" {
+			slog.Error("run failed", "run_id", runID, "state", state, "detail", detail)
+		}
+		m.emitTerminal(runID, state, detail, session.SessionID)
 	}
 
 	switch {
 	case parseErr != nil:
-		record.State = m.terminalState(runID)
-		// 반드시 보존이 먼저다(Reconcile과 같은 순서, reconcile.go 참고).
-		// 여기서 죽으면 재시작 후 Reconcile이 이미 종결 상태를 보고
-		// 이 Run을 다시 살펴보지 않으므로, salvage를 SaveRun보다 앞에
-		// 둬야 그 창에서 실행이 끊겨도 보존이 유실되지 않는다.
-		m.salvage(runID, git)
-		_ = m.cfg.Spool.SaveRun(record)
-		m.fail(runID, fmt.Errorf("parse stream: %w", parseErr))
+		finish(m.terminalState(runID), m.terminalDetail(runID, fmt.Errorf("parse stream: %w", parseErr)), true)
 	case waitErr != nil:
-		record.State = m.terminalState(runID)
-		m.salvage(runID, git)
-		_ = m.cfg.Spool.SaveRun(record)
-		m.fail(runID, fmt.Errorf("agent exited: %w", waitErr))
+		finish(m.terminalState(runID), m.terminalDetail(runID, fmt.Errorf("agent exited: %w", waitErr)), true)
 	case session.APIKeySource != "none":
 		// init이 아예 없었거나(APIKeySource == "") 왔지만 구독 로그인임을
 		// 증명하지 못했다. system/init은 emit하지 않으므로, emit 콜백의
 		// 조기 검사가 한 번도 실행되지 못한 경우(예: init 다음에 곧바로
 		// result만 오는 스트림)의 마지막 방어선이기도 하다(PRD §13.2).
-		record.State = "failed"
-		m.salvage(runID, git)
-		_ = m.cfg.Spool.SaveRun(record)
-		m.fail(runID, fmt.Errorf("agent's billing identity is not a verified subscription login (apiKeySource=%q); refusing to continue", session.APIKeySource))
+		finish("failed", fmt.Sprintf("agent's billing identity is not a verified subscription login (apiKeySource=%q); refusing to continue", session.APIKeySource), true)
 	default:
-		record.State = "succeeded"
-		_ = m.cfg.Spool.SaveRun(record)
-		m.emitState(runID, "succeeded", "")
+		// 정상 종료. 에이전트가 멈춤 보고를 남겼으면 성공이 아니라 사람의
+		// 차례다(PRD §7.5). 실패·취소가 이 분기보다 앞서므로 실패가 우선한다.
+		if reason, ok := takeAttention(spec.ws.Path); ok {
+			finish("needs_attention", reason, false)
+			return
+		}
+		finish("succeeded", "", false)
 	}
-}
-
-// recordEarlyFailure는 Agent 프로세스를 아예 띄우지 못한 경우의 원장
-// 기록이다. 이 실패들은 어떤 세션도 시작되기 전에 일어나므로 SessionID·PID는
-// 비운다.
-func (m *Manager) recordEarlyFailure(runID string, ws gitops.Workspace, startedAt int64, repoPath string) {
-	_ = m.cfg.Spool.SaveRun(spool.RunRecord{
-		RunID:         runID,
-		State:         "failed",
-		Branch:        ws.Branch,
-		WorktreePath:  ws.Path,
-		StartedAtUnix: startedAt,
-		RepoPath:      repoPath,
-	})
 }
 
 // terminalState는 parseErr/waitErr로 끝난 Run이 사람이 취소해서 죽었는지,
@@ -471,14 +519,23 @@ func (m *Manager) terminalState(runID string) string {
 	return "failed"
 }
 
-// salvage는 종료 전 미커밋 변경을 보존한다(PRD §8.7.1).
-func (m *Manager) salvage(runID string, git *gitops.Manager) {
+// terminalDetail은 취소면 사람의 행동을, 아니면 실패 원인을 설명한다.
+func (m *Manager) terminalDetail(runID string, cause error) string {
+	if m.terminalState(runID) == "cancelled" {
+		return "cancelled by user"
+	}
+	return cause.Error()
+}
+
+// salvage는 종료 전 미커밋 변경을 보존한다(PRD §8.7.1). worktree는 wsID의
+// 것이고, 보존 이벤트는 runID의 것이다.
+func (m *Manager) salvage(runID, wsID string, git *gitops.Manager) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	sha, saved, err := git.Salvage(ctx, runID)
+	sha, saved, err := git.Salvage(ctx, wsID)
 	if err != nil {
-		slog.Error("salvage failed", "run_id", runID, "err", err)
+		slog.Error("salvage failed", "run_id", runID, "workspace", wsID, "err", err)
 		return
 	}
 	if !saved {
@@ -511,17 +568,10 @@ func (m *Manager) handleRunCancel(env protocol.Envelope) error {
 		return nil
 	}
 	h.cancel()
-	// 원장에도 남긴다. PID는 execute가 종결 시점에 마지막으로 쓰므로
-	// 여기서는 비워 둔다 — execute의 기록이 항상 이 기록 뒤에 온다.
-	_ = m.cfg.Spool.SaveRun(spool.RunRecord{
-		RunID:         env.RunID,
-		State:         "cancelled",
-		Branch:        h.ws.Branch,
-		WorktreePath:  h.ws.Path,
-		StartedAtUnix: h.startedAt,
-		RepoPath:      h.repoPath,
-	})
-	m.emitState(env.RunID, "cancelled", "cancelled by user")
+	// 원장에는 남기되 이벤트는 보내지 않는다. 종결 이벤트는 프로세스가 죽은
+	// 뒤 execute가 한 곳에서 보낸다(cancelled 뒤에 failed가 따라오는 것을
+	// 막는다). PID·SessionID는 execute의 기록이 이 기록 뒤에 와서 채운다.
+	_ = m.cfg.Spool.SaveRun(h.spec.record("cancelled"))
 	return nil
 }
 
@@ -544,13 +594,24 @@ func (m *Manager) handleApprovalDecision(env protocol.Envelope) error {
 	})
 }
 
+// emitState는 비종결 상태(running)를 알린다.
 func (m *Manager) emitState(runID, state, detail string) {
-	env, err := protocol.NewEvent(protocol.EvRunStateChanged, runID, 0, eventBody{
-		Body: map[string]any{
-			"state":  state,
-			"detail": detail,
-		},
-	})
+	m.publishState(runID, map[string]any{"state": state, "detail": detail})
+}
+
+// emitTerminal은 종결·정착 상태를 알린다. session_id를 함께 실어 Server가
+// 이어서 재시도에 쓸 세션을 알게 한다. 비어 있으면 싣지 않는다 — Server는
+// 알던 세션을 빈 값으로 지우지 않는다.
+func (m *Manager) emitTerminal(runID, state, detail, sessionID string) {
+	body := map[string]any{"state": state, "detail": detail}
+	if sessionID != "" {
+		body["session_id"] = sessionID
+	}
+	m.publishState(runID, body)
+}
+
+func (m *Manager) publishState(runID string, body map[string]any) {
+	env, err := protocol.NewEvent(protocol.EvRunStateChanged, runID, 0, eventBody{Body: body})
 	if err != nil {
 		slog.Error("build state event failed", "err", err)
 		return
@@ -558,9 +619,4 @@ func (m *Manager) emitState(runID, state, detail string) {
 	if err := m.cfg.Publish(runID, env); err != nil {
 		slog.Error("publish state event failed", "run_id", runID, "err", err)
 	}
-}
-
-func (m *Manager) fail(runID string, cause error) {
-	slog.Error("run failed", "run_id", runID, "err", cause)
-	m.emitState(runID, "failed", cause.Error())
 }

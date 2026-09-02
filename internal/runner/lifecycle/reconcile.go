@@ -22,11 +22,13 @@ const (
 	VerdictLost Verdict = "lost"
 )
 
-// terminalStates는 조정 대상이 아닌 상태다.
+// terminalStates는 조정 대상이 아닌 상태다. needs_attention은 프로세스 없이
+// 사람을 기다리는 정착 상태라 lost로 오판하면 안 된다.
 var terminalStates = map[string]bool{
-	"succeeded": true,
-	"failed":    true,
-	"cancelled": true,
+	"succeeded":       true,
+	"failed":          true,
+	"cancelled":       true,
+	"needs_attention": true,
 }
 
 // Classify는 기록 하나의 실제 상태를 판정한다.
@@ -81,12 +83,18 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 			// 반드시 보존이 먼저다. 사용자 작업을 잃지 않는 것이 최우선이다.
 			// 어느 저장소인지는 기록의 RepoPath가 말한다(없으면 첫 허용 저장소).
 			// 허용 목록에서 빠진 저장소면 보존은 건너뛰되 판정은 그대로 한다.
+			// worktree는 기록의 WorkspaceRunID가 주인이다(이어서 재시도는 이전
+			// Run의 것을 쓴다). 비어 있으면 자기 자신.
+			wsID := rec.WorkspaceRunID
+			if wsID == "" {
+				wsID = rec.RunID
+			}
 			if git, _, err := m.cfg.Repos.resolve(rec.RepoPath); err != nil {
 				slog.Warn("cannot salvage: repository no longer allowed", "run_id", rec.RunID, "repo", rec.RepoPath, "err", err)
 			} else {
-				m.salvage(rec.RunID, git)
+				m.salvage(rec.RunID, wsID, git)
 			}
-			m.emitState(rec.RunID, "failed", "reconciled: session lost, work salvaged")
+			m.emitTerminal(rec.RunID, "failed", "reconciled: session lost, work salvaged", rec.SessionID)
 
 			rec.State = "failed"
 			if err := m.cfg.Spool.SaveRun(rec); err != nil {
