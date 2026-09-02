@@ -49,6 +49,16 @@ var terminalStates = map[string]bool{
 	StateCancelled: true,
 }
 
+// knownStates는 이벤트가 runs.state에 쓸 수 있는 값의 전부다. 그 밖의
+// 문자열은 저장은 되되 상태에는 닿지 않는다.
+var knownStates = map[string]bool{
+	StateQueued: true, StateRunning: true, StateWaitingApproval: true, StateOrphaned: true,
+	StateSucceeded: true, StateFailed: true, StateCancelled: true,
+}
+
+// IsTerminal은 Run이 끝났는지를 말한다. 웹의 "이미 실행 중" 판정이 쓴다.
+func IsTerminal(state string) bool { return terminalStates[state] }
+
 const schema = `
 CREATE TABLE IF NOT EXISTS runs (
   id                  TEXT    PRIMARY KEY,
@@ -388,7 +398,7 @@ func applyStateChange(tx *sql.Tx, env protocol.Envelope, current, taskID string)
 	}
 	next := outer.Body.State
 
-	if terminalStates[current] && !terminalStates[next] {
+	if !knownStates[next] || (terminalStates[current] && !terminalStates[next]) {
 		return nil
 	}
 	if _, err := tx.Exec(`UPDATE runs SET state = ? WHERE id = ?`, next, env.RunID); err != nil {

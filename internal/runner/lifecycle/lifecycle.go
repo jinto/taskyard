@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -163,26 +164,13 @@ func (m *Manager) handleRunStart(ctx context.Context, env protocol.Envelope) err
 	git, repoPath, err := m.cfg.Repos.resolve(body.RepoPath)
 	if errors.Is(err, ErrRepoNotAllowed) {
 		// 허용 목록 밖의 저장소는 명령 처리 오류가 아니라 이 Run의 실패다.
-		// 관문을 먼저 통과시켜 재전송이 같은 실패를 다시 발행하지 않게 한다.
-		// 프로세스는 띄우지 않고, 원장에는 요청받은 경로를 그대로 남긴다.
-		_, first, rerr := m.cfg.Spool.RememberCommand(env.ID, []byte(`{"accepted":true}`))
-		if rerr != nil {
-			return fmt.Errorf("remember command: %w", rerr)
-		}
-		if !first {
-			return nil
-		}
-		_ = m.cfg.Spool.SaveRun(spool.RunRecord{
-			RunID:         env.RunID,
-			State:         "failed",
-			StartedAtUnix: time.Now().Unix(),
-			RepoPath:      body.RepoPath,
-		})
-		m.fail(env.RunID, err)
-		return nil
+		return m.failBeforeStart(env, body.RepoPath, err)
 	}
 	if err != nil {
 		return fmt.Errorf("resolve repository: %w", err)
+	}
+	if m.otherRunActive(env.RunID) {
+		return m.failBeforeStart(env, repoPath, errRunnerBusy)
 	}
 
 	baseBranch := body.BaseBranch
@@ -243,6 +231,10 @@ func (m *Manager) handleRunStart(ctx context.Context, env protocol.Envelope) err
 	return nil
 }
 
+// maxMemoryBytes는 프롬프트에 주입하는 기억 파일의 상한이다. 그 위는 잘라
+// 내고 잘렸음을 알린다.
+const maxMemoryBytes = 64 * 1024
+
 // replaceMemoryToken은 prompt의 {{memory}}를 worktree의 .taskyard/memory.md
 // 내용으로 바꾼다. 파일이 없으면 빈 문자열이다. strings.ReplaceAll은 넣은
 // 값을 다시 훑지 않으므로 기억 파일 안에 {{memory}}가 있어도 그대로다.
@@ -251,11 +243,79 @@ func replaceMemoryToken(prompt, worktree string) string {
 	if !strings.Contains(prompt, token) {
 		return prompt
 	}
-	memory, err := os.ReadFile(filepath.Join(worktree, ".taskyard", "memory.md"))
+	return strings.ReplaceAll(prompt, token, readMemory(worktree))
+}
+
+// readMemory는 기억 파일을 읽되 두 가지를 지킨다. 저장소는 에이전트가 쓰는
+// 곳이므로 (1) worktree 밖을 가리키는 심링크는 읽지 않고 (2) 크기를
+// maxMemoryBytes로 자른다.
+func readMemory(worktree string) string {
+	path := filepath.Join(worktree, ".taskyard", "memory.md")
+	real, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		memory = nil
+		return ""
 	}
-	return strings.ReplaceAll(prompt, token, string(memory))
+	root, err := filepath.EvalSymlinks(worktree)
+	if err != nil {
+		return ""
+	}
+	if real != root && !strings.HasPrefix(real, root+string(filepath.Separator)) {
+		slog.Warn("memory file escapes the worktree; ignoring", "path", path, "target", real)
+		return ""
+	}
+
+	f, err := os.Open(real)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	buf, err := io.ReadAll(io.LimitReader(f, maxMemoryBytes+1))
+	if err != nil {
+		return ""
+	}
+	if len(buf) > maxMemoryBytes {
+		return string(buf[:maxMemoryBytes]) + "\n…(memory.md truncated at 64KiB)\n"
+	}
+	return string(buf)
+}
+
+// errRunnerBusy는 활성 Run이 있는 동안 온 다른 run.start의 실패 이유다.
+// 러너는 동시에 하나만 돌린다 — runIDForApproval이 그 가정에 기대고, 동시
+// 실행 한도는 Phase 1 뒤쪽 항목이다(PRD EX-10).
+var errRunnerBusy = errors.New("runner busy: another run is active (concurrency limit 1)")
+
+// otherRunActive는 env.RunID가 아닌 Run이 돌고 있는지 본다. 같은 Run의
+// 재전송은 바쁨이 아니라 멱등성 관문의 몫이다.
+func (m *Manager) otherRunActive(runID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id := range m.active {
+		if id != runID {
+			return true
+		}
+	}
+	return false
+}
+
+// failBeforeStart는 프로세스를 띄우기 전에 정해진 실패(허용 목록 밖 저장소,
+// 바쁜 러너)를 기록한다. 관문을 먼저 통과시켜 재전송이 같은 실패를 다시
+// 발행하지 않게 하고, 원장에는 요청받은 경로를 그대로 남긴다.
+func (m *Manager) failBeforeStart(env protocol.Envelope, repoPath string, cause error) error {
+	_, first, err := m.cfg.Spool.RememberCommand(env.ID, []byte(`{"accepted":true}`))
+	if err != nil {
+		return fmt.Errorf("remember command: %w", err)
+	}
+	if !first {
+		return nil
+	}
+	_ = m.cfg.Spool.SaveRun(spool.RunRecord{
+		RunID:         env.RunID,
+		State:         "failed",
+		StartedAtUnix: time.Now().Unix(),
+		RepoPath:      repoPath,
+	})
+	m.fail(env.RunID, cause)
+	return nil
 }
 
 func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, runID, prompt string, startedAt int64, ws gitops.Workspace, git *gitops.Manager, repoPath string) {

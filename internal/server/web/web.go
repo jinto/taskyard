@@ -222,14 +222,31 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 //  1. Run 행을 queued로 먼저 만든다. Runner는 run.start를 받는 즉시 이벤트를
 //     낼 수 있는데, store.ApplyEvent는 runs에 행이 없으면 ErrRunNotFound로
 //     버린다. 순서를 뒤집으면 첫 이벤트가 조용히 유실된다.
-//  2. 명령을 보낸다. Runner가 없으면 방금 만든 행을 failed로 정리하고 503 —
-//     queued로 영영 남겨 사용자가 실행 중이라고 믿게 하지 않는다. 이슈 상태는
-//     건드리지 않는다.
-//  3. 보내졌으면 이슈를 in_progress로 옮긴다.
+//  2. 이슈를 in_progress로 옮긴다 — 명령을 보내기 *전에*. 뒤에 하면 빠른
+//     Runner가 succeeded를 먼저 보내 이슈가 review가 된 다음 in_progress로
+//     되돌아간다.
+//  3. 명령을 보낸다. Runner가 없으면 방금 만든 행을 failed로 정리하고 이슈
+//     상태를 되돌리고 503 — queued로 영영 남겨 사용자가 실행 중이라고 믿게
+//     하지 않는다.
+//
+// 활성 Run이 있는 이슈는 다시 시작하지 않는다(409). 재시도는 종결된 뒤의
+// 새 Run이다(PRD §7.6).
 func (s *Server) handleIssueRun(w http.ResponseWriter, r *http.Request) {
 	p, task, ok := s.loadIssue(w, r)
 	if !ok {
 		return
+	}
+
+	runs, err := s.st.RunsForTask(task.ID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	for _, existing := range runs {
+		if !store.IsTerminal(existing.State) {
+			http.Error(w, "이미 실행 중인 Run이 있습니다: "+existing.ID, http.StatusConflict)
+			return
+		}
 	}
 
 	prompt := pipeline.Render(p.ExecuteTemplate, map[string]string{
@@ -252,17 +269,18 @@ func (s *Server) handleIssueRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	if err := s.st.UpdateTaskStatus(task.ID, store.TaskInProgress); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 
 	if err := s.hub.SendCommand(cmd); err != nil {
 		slog.Warn("run.start could not be delivered", "run_id", runID, "task_id", task.ID, "err", err)
 		run.State = store.StateFailed
 		_ = s.st.UpsertRun(run)
+		_ = s.st.UpdateTaskStatus(task.ID, task.Status)
 		http.Error(w, "runner is not connected", http.StatusServiceUnavailable)
 		return
-	}
-
-	if err := s.st.UpdateTaskStatus(task.ID, store.TaskInProgress); err != nil {
-		slog.Error("task status update failed", "task_id", task.ID, "err", err)
 	}
 	http.Redirect(w, r, "/runs/"+runID, http.StatusSeeOther)
 }

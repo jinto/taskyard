@@ -719,10 +719,11 @@ func TestSecondRunStartWhileBusyFails(t *testing.T) {
 	if err := h.m.HandleCommand(ctx, h.start(t, "run-1", "first")); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "first run active", func() bool {
-		runs, _ := h.sp.LoadRuns()
-		return len(runs) == 1 && runs[0].PID != 0
-	})
+	startCount := func() int {
+		raw, _ := os.ReadFile(starts)
+		return strings.Count(string(raw), "started")
+	}
+	waitFor(t, "first agent to start", func() bool { return startCount() == 1 })
 
 	if err := h.m.HandleCommand(ctx, h.start(t, "run-2", "second")); err != nil {
 		t.Fatalf("busy runner returned a command error %v; it should fail run-2 instead", err)
@@ -750,8 +751,9 @@ func TestSecondRunStartWhileBusyFails(t *testing.T) {
 			t.Fatalf("run-1 was disturbed: %q", r.State)
 		}
 	}
-	if raw, _ := os.ReadFile(starts); strings.Count(string(raw), "started") != 1 {
-		t.Fatalf("agent starts = %q, want exactly one (second must not start while busy)", raw)
+	time.Sleep(200 * time.Millisecond) // 두 번째가 떴다면 이 사이에 줄을 남긴다
+	if n := startCount(); n != 1 {
+		t.Fatalf("agent starts = %d, want exactly one (second must not start while busy)", n)
 	}
 }
 
