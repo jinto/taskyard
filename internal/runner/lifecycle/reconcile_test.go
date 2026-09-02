@@ -95,6 +95,68 @@ func TestReconcileSalvagesLostRun(t *testing.T) {
 	}
 }
 
+// TestReconcileSalvagesByWorkspaceRunID: 이어서 재시도한 Run(run-2)은 run-1의
+// worktree를 쓴다. lost로 판정되면 salvage도 그 worktree에서 일어나야 한다.
+func TestReconcileSalvagesByWorkspaceRunID(t *testing.T) {
+	col := &collector{}
+	h := newHarness(t, col)
+	ctx := context.Background()
+
+	ws, err := h.git.Ensure(ctx, "run-1", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws.Path, "wip.txt"), []byte("half\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.sp.SaveRun(spool.RunRecord{
+		RunID: "run-2", State: "running", Branch: ws.Branch, WorktreePath: ws.Path,
+		RepoPath: canonical(t, h.repo), WorkspaceRunID: "run-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.m.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := h.git.Status(ctx, "run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Dirty {
+		t.Fatal("run-2's work in run-1's worktree was not salvaged")
+	}
+	// 보존 이벤트는 worktree 주인이 아니라 그 Run(run-2)의 것이다.
+	for _, e := range col.snapshot() {
+		if e.Type == protocol.EvFileChanged && e.RunID != "run-2" {
+			t.Fatalf("salvage event attributed to %s, want run-2", e.RunID)
+		}
+	}
+}
+
+// TestReconcileSkipsNeedsAttention: 멈추고 보고한 Run은 정착 상태라 조정
+// 대상이 아니다. 프로세스도 없으므로 lost로 오판해 failed로 바꾸면 안 된다.
+func TestReconcileSkipsNeedsAttention(t *testing.T) {
+	col := &collector{}
+	h := newHarness(t, col)
+
+	if err := h.sp.SaveRun(spool.RunRecord{RunID: "run-att", State: "needs_attention"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := col.count(protocol.EvRunStateChanged); got != 0 {
+		t.Fatalf("emitted %d state events for a needs_attention run, want 0", got)
+	}
+	for _, r := range mustLoadRuns(t, h.sp) {
+		if r.RunID == "run-att" && r.State != "needs_attention" {
+			t.Fatalf("needs_attention record was changed to %q", r.State)
+		}
+	}
+}
+
 // TestReconcileSalvagesUsingRecordedRepo: 기록의 RepoPath가 두 번째 저장소를
 // 가리키면 salvage도 그곳에서 일어난다. 첫 저장소로 가면 worktree가 없어
 // 아무것도 보존되지 않는다.

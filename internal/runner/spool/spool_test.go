@@ -27,6 +27,52 @@ func mustEvent(t *testing.T, runID string) protocol.Envelope {
 	return env
 }
 
+func TestRunRecordRoundTripsWorkspaceRunID(t *testing.T) {
+	s := openTemp(t)
+	if err := s.SaveRun(RunRecord{RunID: "run-2", State: "running", WorkspaceRunID: "run-1"}); err != nil {
+		t.Fatal(err)
+	}
+	runs, err := s.LoadRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].WorkspaceRunID != "run-1" {
+		t.Fatalf("LoadRuns = %+v, want WorkspaceRunID round-tripped", runs)
+	}
+}
+
+// TestSpoolOpenMigratesWorkspaceRunIDColumn: PR #3 시점의 원장(repo_path까지)에
+// workspace_run_id 를 붙인다.
+func TestSpoolOpenMigratesWorkspaceRunIDColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pr3.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE runs (
+	  run_id TEXT PRIMARY KEY, state TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '',
+	  branch TEXT NOT NULL DEFAULT '', worktree_path TEXT NOT NULL DEFAULT '',
+	  pid INTEGER NOT NULL DEFAULT 0, started_at INTEGER NOT NULL DEFAULT 0,
+	  repo_path TEXT NOT NULL DEFAULT '');
+	  INSERT INTO runs (run_id, state) VALUES ('run-old', 'running');`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on PR #3 schema: %v", err)
+	}
+	defer s.Close()
+	runs, err := s.LoadRuns()
+	if err != nil || len(runs) != 1 || runs[0].WorkspaceRunID != "" {
+		t.Fatalf("LoadRuns = %+v, err = %v", runs, err)
+	}
+	if err := s.SaveRun(RunRecord{RunID: "run-new", State: "running", WorkspaceRunID: "run-old"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunRecordRoundTripsRepoPath(t *testing.T) {
 	s := openTemp(t)
 	if err := s.SaveRun(RunRecord{RunID: "run-1", State: "running", RepoPath: "/private/tmp/repo"}); err != nil {
