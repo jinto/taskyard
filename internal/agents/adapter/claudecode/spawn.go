@@ -67,10 +67,12 @@ type SpawnOptions struct {
 }
 
 // allowedToolPattern은 허용 도구 항목의 문법이다: 도구 이름, 선택적으로
-// 괄호 안의 패턴("Bash(go test:*)"처럼 괄호 안 공백은 된다). 쉼표는 안
+// 괄호 안의 패턴("Bash(go test:*)"처럼 괄호 안 공백은 된다). MCP 도구는
+// "mcp__claude-in-chrome__navigate"처럼 하이픈이, 서버 전체 허용은
+// "mcp__github__*"처럼 별표가 든다. 쉼표는 안
 // 된다 — 쉼표로 이어 값 하나로 넘기니까. 이름은 글자로 시작해야 하므로
 // "-"로 시작하는 플래그 모양은 걸러진다.
-var allowedToolPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*(\([^(),\s][^(),\n]*\))?$`)
+var allowedToolPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_*-]*(\([^(),\s][^(),\n]*\))?$`)
 
 // CheckAllowedTools는 항목 전부가 문법에 맞는지 본다. 웹 설정 폼과 BuildArgs가
 // 같은 규칙을 쓴다.

@@ -188,11 +188,7 @@ func (s *Server) handleTemplateUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "허용 도구 형식이 잘못됐습니다: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := s.st.UpdateProjectTemplate(p.Key, r.FormValue("execute_template")); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	if err := s.st.UpdateProjectAllowedTools(p.Key, tools); err != nil {
+	if err := s.st.UpdateProjectSettings(p.Key, r.FormValue("execute_template"), tools); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}

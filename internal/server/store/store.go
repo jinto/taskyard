@@ -636,23 +636,14 @@ func (s *Store) ListProjects() ([]Project, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) UpdateProjectTemplate(key, executeTemplate string) error {
-	res, err := s.db.Exec(`UPDATE projects SET execute_template = ? WHERE key = ?`, executeTemplate, key)
+// UpdateProjectSettings는 실행 템플릿과 허용 도구 목록을 한 번에 바꾼다 —
+// 하나는 저장되고 하나는 안 되는 창이 없도록 UPDATE 하나로. tools가 nil이면
+// 비운다. 항목 문법 검사는 호출자(웹 폼)의 몫이다.
+func (s *Store) UpdateProjectSettings(key, executeTemplate string, tools []string) error {
+	res, err := s.db.Exec(`UPDATE projects SET execute_template = ?, allowed_tools = ? WHERE key = ?`,
+		executeTemplate, joinTools(tools), key)
 	if err != nil {
-		return fmt.Errorf("update project template: %w", err)
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrProjectNotFound
-	}
-	return nil
-}
-
-// UpdateProjectAllowedTools는 허용 도구 목록을 통째로 바꾼다. nil이면 비운다.
-// 항목 문법 검사는 호출자(웹 폼)의 몫이다.
-func (s *Store) UpdateProjectAllowedTools(key string, tools []string) error {
-	res, err := s.db.Exec(`UPDATE projects SET allowed_tools = ? WHERE key = ?`, joinTools(tools), key)
-	if err != nil {
-		return fmt.Errorf("update project allowed tools: %w", err)
+		return fmt.Errorf("update project settings: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrProjectNotFound

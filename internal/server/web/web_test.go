@@ -212,7 +212,7 @@ func TestUpdateSettingsSavesAllowedTools(t *testing.T) {
 
 	rec := postForm(h, "/projects/shop/template", url.Values{
 		"execute_template": {"t {{issue}}"},
-		"allowed_tools":    {"Edit\n\n  Bash(go test:*)  \n"},
+		"allowed_tools":    {"Edit\r\n\r\n  Bash(go test:*)  \r\n"},
 	})
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())

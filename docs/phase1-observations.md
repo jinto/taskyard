@@ -45,6 +45,11 @@
    지나갔는데, 이는 사용자의 전역 permission 규칙이 허용한 것이다. 프로젝트별 사전 허용
    도구(PRD §11.6.3, `--allowedTools`)가 Phase 1의 실사용 조건이다 — 지금은 스크립트로
    전부 허용했지만 사람이 손으로 5번 누르는 건 첫날부터 짜증이 난다.
+   → 해소(PR: 사전 허용 도구). 같은 저장소에 이슈 #3(Shout 함수 추가)을 `Read`, `Edit`,
+   `Write`, `Bash(go test:*)`, `Bash(git add:*)`, `Bash(git commit:*)` 허용으로 돌렸더니
+   승인이 1회로 줄었다. 남은 1회는 `gofmt -l . ; go vet ./... && go test ./...` 처럼
+   허용 규칙에 없는 명령이 섞인 복합 명령이었다 — 올바른 동작이다. `Edit` 2회와
+   `git add && git commit` 복합 명령은 승인 없이 지나갔다.
 4. **웹 UI의 승인 화면은 SSE 아일랜드에만 `request_id`가 있다.** 서버 렌더링 HTML에는
    없어 스크립트가 SSE를 구독해야 했다. 사람이 브라우저로 쓰는 데는 문제없지만, API로
    승인하려면 `GET /runs/{id}/approvals` 같은 조회가 필요하다.

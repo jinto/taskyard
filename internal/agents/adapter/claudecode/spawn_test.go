@@ -151,14 +151,14 @@ func TestBuildArgsRejectsLeadingDashResumeSessionID(t *testing.T) {
 // 가변 인자로 넘기면 뒤따르는 플래그까지 값으로 먹을 수 있다.
 func TestBuildArgsAddsAllowedToolsAsOneValue(t *testing.T) {
 	opts := baseOpts()
-	opts.AllowedTools = []string{"Edit", "Bash(go test:*)"}
+	opts.AllowedTools = []string{"Edit", "Bash(go test:*)", "mcp__claude-in-chrome__*"}
 
 	args, err := BuildArgs(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !hasFlagValue(args, "--allowedTools", "Edit,Bash(go test:*)") {
-		t.Errorf("missing --allowedTools Edit,Bash(go test:*): %s", argsString(args))
+	if !hasFlagValue(args, "--allowedTools", "Edit,Bash(go test:*),mcp__claude-in-chrome__*") {
+		t.Errorf("missing joined --allowedTools: %s", argsString(args))
 	}
 }
 

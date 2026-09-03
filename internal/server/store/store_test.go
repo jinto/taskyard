@@ -238,21 +238,21 @@ func TestProjectAllowedToolsRoundTrip(t *testing.T) {
 	if len(got.AllowedTools) != 2 || got.AllowedTools[0] != "Edit" || got.AllowedTools[1] != "Bash(go test:*)" {
 		t.Fatalf("AllowedTools = %q", got.AllowedTools)
 	}
-	if err := s.UpdateProjectAllowedTools(p.Key, []string{"Read"}); err != nil {
+	if err := s.UpdateProjectSettings(p.Key, p.ExecuteTemplate, []string{"Read"}); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = s.GetProject("shop")
 	if len(got.AllowedTools) != 1 || got.AllowedTools[0] != "Read" {
 		t.Fatalf("after update AllowedTools = %q", got.AllowedTools)
 	}
-	if err := s.UpdateProjectAllowedTools(p.Key, nil); err != nil {
+	if err := s.UpdateProjectSettings(p.Key, p.ExecuteTemplate, nil); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = s.GetProject("shop")
 	if len(got.AllowedTools) != 0 {
 		t.Fatalf("cleared AllowedTools = %q, want none", got.AllowedTools)
 	}
-	if err := s.UpdateProjectAllowedTools("nope", nil); !errors.Is(err, ErrProjectNotFound) {
+	if err := s.UpdateProjectSettings("nope", "x", nil); !errors.Is(err, ErrProjectNotFound) {
 		t.Fatalf("err = %v, want ErrProjectNotFound", err)
 	}
 }
@@ -281,23 +281,23 @@ func TestOpenMigratesProjectsAllowedTools(t *testing.T) {
 	if err != nil || len(p.AllowedTools) != 0 {
 		t.Fatalf("GetProject = %+v, err = %v", p, err)
 	}
-	if err := s.UpdateProjectAllowedTools("shop", []string{"Edit"}); err != nil {
+	if err := s.UpdateProjectSettings("shop", "t", []string{"Edit"}); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestUpdateProjectTemplate(t *testing.T) {
+func TestUpdateProjectSettings(t *testing.T) {
 	s := openTemp(t)
 	seedProject(t, s, "shop")
 
-	if err := s.UpdateProjectTemplate("shop", "new {{issue}}"); err != nil {
+	if err := s.UpdateProjectSettings("shop", "new {{issue}}", []string{"Edit"}); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := s.GetProject("shop")
-	if got.ExecuteTemplate != "new {{issue}}" {
-		t.Fatalf("template = %q", got.ExecuteTemplate)
+	if got.ExecuteTemplate != "new {{issue}}" || len(got.AllowedTools) != 1 || got.AllowedTools[0] != "Edit" {
+		t.Fatalf("project = %+v", got)
 	}
-	if err := s.UpdateProjectTemplate("nope", "x"); !errors.Is(err, ErrProjectNotFound) {
+	if err := s.UpdateProjectSettings("nope", "x", nil); !errors.Is(err, ErrProjectNotFound) {
 		t.Fatalf("err = %v, want ErrProjectNotFound", err)
 	}
 }
