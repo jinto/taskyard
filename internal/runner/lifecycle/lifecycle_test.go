@@ -867,6 +867,35 @@ func TestRunStartReusesWorkspaceOfPreviousRun(t *testing.T) {
 	}
 }
 
+func TestRunStartPassesAllowedTools(t *testing.T) {
+	col := &collector{}
+	argsFile := filepath.Join(t.TempDir(), "args")
+	h := newHarness(t, col, withBinary(fakeClaudeRecording(t, pongFixture, argsFile)))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cmd := startCommand(t, "run-1", protocol.RunStartBody{Prompt: "go", RepoPath: h.repo, AllowedTools: []string{"Edit", "Bash(go test:*)"}})
+	if err := h.m.HandleCommand(ctx, cmd); err != nil {
+		t.Fatal(err)
+	}
+	waitTerminal(t, col)
+
+	raw, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Split(strings.TrimRight(string(raw), "\x00"), "\x00")
+	found := false
+	for i, a := range args {
+		if a == "--allowedTools" && i+1 < len(args) && args[i+1] == "Edit,Bash(go test:*)" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("agent args lack --allowedTools: %q", args)
+	}
+}
+
 func TestRunStartPassesResumeSessionID(t *testing.T) {
 	col := &collector{}
 	argsFile := filepath.Join(t.TempDir(), "args")

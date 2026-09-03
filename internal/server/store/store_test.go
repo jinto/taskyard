@@ -228,6 +228,64 @@ func TestCreateProjectAssignsIDAndRejectsDuplicateKey(t *testing.T) {
 	}
 }
 
+func TestProjectAllowedToolsRoundTrip(t *testing.T) {
+	s := openTemp(t)
+	p, err := s.CreateProject(Project{Key: "shop", Name: "shop", RepoPath: "/r", DefaultBranch: "main", AllowedTools: []string{"Edit", "Bash(go test:*)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetProject("shop")
+	if len(got.AllowedTools) != 2 || got.AllowedTools[0] != "Edit" || got.AllowedTools[1] != "Bash(go test:*)" {
+		t.Fatalf("AllowedTools = %q", got.AllowedTools)
+	}
+	if err := s.UpdateProjectAllowedTools(p.Key, []string{"Read"}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.GetProject("shop")
+	if len(got.AllowedTools) != 1 || got.AllowedTools[0] != "Read" {
+		t.Fatalf("after update AllowedTools = %q", got.AllowedTools)
+	}
+	if err := s.UpdateProjectAllowedTools(p.Key, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.GetProject("shop")
+	if len(got.AllowedTools) != 0 {
+		t.Fatalf("cleared AllowedTools = %q, want none", got.AllowedTools)
+	}
+	if err := s.UpdateProjectAllowedTools("nope", nil); !errors.Is(err, ErrProjectNotFound) {
+		t.Fatalf("err = %v, want ErrProjectNotFound", err)
+	}
+}
+
+func TestOpenMigratesProjectsAllowedTools(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pr3.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// PR #3 시점의 projects 스키마(allowed_tools 없음).
+	if _, err := db.Exec(`CREATE TABLE projects (
+	  id TEXT PRIMARY KEY, key TEXT NOT NULL UNIQUE, name TEXT NOT NULL, repo_path TEXT NOT NULL,
+	  default_branch TEXT NOT NULL, execute_template TEXT NOT NULL, created_at INTEGER NOT NULL);
+	  INSERT INTO projects VALUES ('p1', 'shop', 'shop', '/r', 'main', 't', 1);`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on old projects schema: %v", err)
+	}
+	defer s.Close()
+	p, err := s.GetProject("shop")
+	if err != nil || len(p.AllowedTools) != 0 {
+		t.Fatalf("GetProject = %+v, err = %v", p, err)
+	}
+	if err := s.UpdateProjectAllowedTools("shop", []string{"Edit"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestUpdateProjectTemplate(t *testing.T) {
 	s := openTemp(t)
 	seedProject(t, s, "shop")
