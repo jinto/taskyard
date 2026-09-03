@@ -27,6 +27,8 @@
   <textarea name="allowed_tools" rows="4" placeholder="Edit&#10;Bash(go test:*)">{{range .Project.AllowedTools}}{{.}}
 {{end}}</textarea></label>
   <p class="state">여기 없는 도구 호출은 지금처럼 승인을 묻습니다. 예: <code>Edit</code>, <code>Write</code>, <code>Bash(go test:*)</code>, <code>Bash(git commit:*)</code>.</p>
+  <label><input type="checkbox" name="create_pr"{{if .Project.CreatePR}} checked{{end}}> PR 만들기 — 실행이 성공하면 러너가 <code>origin</code>에 push하고 PR을 엽니다. 원격이 없는 저장소는 끕니다.</label>
+  <label><input type="checkbox" name="cleanup_merged"{{if .Project.CleanupMerged}} checked{{end}}> merge 후 worktree 삭제 — 미커밋·미push가 없을 때만.</label>
   <button type="submit">저장</button>
 </form>
 {{end}}
