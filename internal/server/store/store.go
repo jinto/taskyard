@@ -43,6 +43,8 @@ const (
 	TaskBacklog    = "backlog"
 	TaskInProgress = "in_progress"
 	TaskReview     = "review"
+	// TaskDone은 PR merge가 확인된 이슈다(PRD §7.6). 나가는 길은 [실행]·재시도뿐.
+	TaskDone = "done"
 )
 
 // terminalStates는 끝난 Run 상태다. settledStates는 거기에 needs_attention을
@@ -89,7 +91,13 @@ CREATE TABLE IF NOT EXISTS runs (
   detail              TEXT    NOT NULL DEFAULT '',
   previous_run_id     TEXT    NOT NULL DEFAULT '',
   workspace_run_id    TEXT    NOT NULL DEFAULT '',
-  feedback            TEXT    NOT NULL DEFAULT ''
+  feedback            TEXT    NOT NULL DEFAULT '',
+  summary             TEXT    NOT NULL DEFAULT '',
+  pr_url              TEXT    NOT NULL DEFAULT '',
+  pr_number           INTEGER NOT NULL DEFAULT 0,
+  pr_state            TEXT    NOT NULL DEFAULT '',
+  pr_checks           TEXT    NOT NULL DEFAULT '',
+  pr_review           TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS run_events (
@@ -108,7 +116,9 @@ CREATE TABLE IF NOT EXISTS projects (
   default_branch   TEXT    NOT NULL,
   execute_template TEXT    NOT NULL,
   created_at       INTEGER NOT NULL,
-  allowed_tools    TEXT    NOT NULL DEFAULT ''
+  allowed_tools    TEXT    NOT NULL DEFAULT '',
+  create_pr        INTEGER NOT NULL DEFAULT 1,
+  cleanup_merged   INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -132,11 +142,20 @@ var runsMigrations = []sqlitex.Column{
 	{Name: "previous_run_id", DDL: "TEXT NOT NULL DEFAULT ''"},
 	{Name: "workspace_run_id", DDL: "TEXT NOT NULL DEFAULT ''"},
 	{Name: "feedback", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "summary", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "pr_url", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "pr_number", DDL: "INTEGER NOT NULL DEFAULT 0"},
+	{Name: "pr_state", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "pr_checks", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "pr_review", DDL: "TEXT NOT NULL DEFAULT ''"},
 }
 
 // projectsMigrations는 PR #3 이후 projects 테이블에 추가된 컬럼이다.
 var projectsMigrations = []sqlitex.Column{
 	{Name: "allowed_tools", DDL: "TEXT NOT NULL DEFAULT ''"},
+	// 옛 행의 기본값은 PRD 기본 — PR 만들기 켬(§7.2), merge 후 삭제(§8.7.1).
+	{Name: "create_pr", DDL: "INTEGER NOT NULL DEFAULT 1"},
+	{Name: "cleanup_merged", DDL: "INTEGER NOT NULL DEFAULT 1"},
 }
 
 var (
@@ -175,6 +194,15 @@ type Run struct {
 	// WorkspaceRunID는 이 Run이 쓰는 worktree·브랜치의 주인 Run이다. 이어서
 	// 재시도는 이전 Run의 것을 쓴다. 비어 있으면 자기 자신.
 	WorkspaceRunID string
+	// Summary는 에이전트가 남긴 변경 설명(.taskyard/summary.md)이다. 종결
+	// 이벤트에 실려 온다. PR 필드는 pr.updated로만 채워진다 — UpsertRun은
+	// 건드리지 않는다.
+	Summary  string
+	PRURL    string
+	PRNumber int
+	PRState  string
+	PRChecks string
+	PRReview string
 }
 
 // Project는 저장소 하나와 이슈 보드, 실행 템플릿을 가진 단위다(PRD §6.1).
@@ -191,6 +219,18 @@ type Project struct {
 	// AllowedTools는 승인 없이 통과시킬 도구 패턴이다(PRD §11.6.3). 줄 단위로
 	// 저장한다.
 	AllowedTools []string
+	// CreatePR: 성공한 Run의 브랜치를 push하고 PR을 만든다(GH-05). 원격이 없는
+	// 저장소는 끈다. CleanupMerged: merge 확인 후 worktree를 지운다(GH-10).
+	CreatePR      bool
+	CleanupMerged bool
+}
+
+// ProjectSettings는 설정 폼이 한 번에 저장하는 필드들이다.
+type ProjectSettings struct {
+	ExecuteTemplate string
+	AllowedTools    []string
+	CreatePR        bool
+	CleanupMerged   bool
 }
 
 func joinTools(tools []string) string { return strings.Join(tools, "\n") }
@@ -279,7 +319,7 @@ func (s *Store) UpsertRun(r Run) error {
 }
 
 const runColumns = `id, state, kind, provider_session_id, branch, worktree_path, last_acked_seq, reconcile_state, task_id, stage, created_at,
-                    detail, previous_run_id, workspace_run_id, feedback`
+                    detail, previous_run_id, workspace_run_id, feedback, summary, pr_url, pr_number, pr_state, pr_checks, pr_review`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
@@ -290,7 +330,8 @@ func scanRun(sc rowScanner) (Run, error) {
 	)
 	err := sc.Scan(&r.ID, &r.State, &r.Kind, &r.ProviderSessionID, &r.Branch, &r.WorktreePath,
 		&r.LastAckedSeq, &r.ReconcileState, &r.TaskID, &r.Stage, &created,
-		&r.Detail, &r.PreviousRunID, &r.WorkspaceRunID, &r.Feedback)
+		&r.Detail, &r.PreviousRunID, &r.WorkspaceRunID, &r.Feedback,
+		&r.Summary, &r.PRURL, &r.PRNumber, &r.PRState, &r.PRChecks, &r.PRReview)
 	if err != nil {
 		return Run{}, err
 	}
@@ -396,9 +437,16 @@ func (s *Store) ApplyEvent(env protocol.Envelope) (bool, uint64, error) {
 		return false, 0, fmt.Errorf("update ack cursor: %w", err)
 	}
 
-	if affected > 0 && env.Type == protocol.EvRunStateChanged {
-		if err := applyStateChange(tx, env, current, taskID); err != nil {
-			return false, 0, err
+	if affected > 0 {
+		switch env.Type {
+		case protocol.EvRunStateChanged:
+			if err := applyStateChange(tx, env, current, taskID); err != nil {
+				return false, 0, err
+			}
+		case protocol.EvPRUpdated:
+			if err := applyPRUpdate(tx, env, taskID); err != nil {
+				return false, 0, err
+			}
 		}
 	}
 
@@ -419,6 +467,7 @@ func applyStateChange(tx *sql.Tx, env protocol.Envelope, current, taskID string)
 			State     string `json:"state"`
 			Detail    string `json:"detail"`
 			SessionID string `json:"session_id"`
+			Summary   string `json:"summary"`
 		} `json:"body"`
 	}
 	if err := json.Unmarshal(env.Body, &outer); err != nil || outer.Body.State == "" {
@@ -433,6 +482,11 @@ func applyStateChange(tx *sql.Tx, env protocol.Envelope, current, taskID string)
 	if _, err := tx.Exec(`UPDATE runs SET state = ?, detail = ? WHERE id = ?`, next, outer.Body.Detail, env.RunID); err != nil {
 		return fmt.Errorf("update run state: %w", err)
 	}
+	if outer.Body.Summary != "" {
+		if _, err := tx.Exec(`UPDATE runs SET summary = ? WHERE id = ?`, outer.Body.Summary, env.RunID); err != nil {
+			return fmt.Errorf("update run summary: %w", err)
+		}
+	}
 	// 알던 세션을 빈 값으로 지우지 않는다 — 이어서 재시도가 이 값에 기댄다.
 	if outer.Body.SessionID != "" {
 		if _, err := tx.Exec(`UPDATE runs SET provider_session_id = ? WHERE id = ?`, outer.Body.SessionID, env.RunID); err != nil {
@@ -442,7 +496,43 @@ func applyStateChange(tx *sql.Tx, env protocol.Envelope, current, taskID string)
 	return moveTaskFor(tx, next, taskID)
 }
 
-// moveTaskFor는 Run 상태에 따른 이슈 상태 전이다.
+// applyPRUpdate는 pr.updated를 runs의 PR 필드에 반영하고, MERGED이면 이슈를
+// done으로 옮긴다 — 단, 이 Run이 이슈의 최신 Run일 때만. 재시도가 진행 중인
+// 이슈를 옛 PR이 끝내면 안 된다(계획 "서버 반영").
+func applyPRUpdate(tx *sql.Tx, env protocol.Envelope, taskID string) error {
+	var outer struct {
+		Body protocol.PRUpdatedBody `json:"body"`
+	}
+	if err := json.Unmarshal(env.Body, &outer); err != nil || outer.Body.Number == 0 {
+		return nil
+	}
+	pr := outer.Body
+	if _, err := tx.Exec(
+		`UPDATE runs SET pr_url = ?, pr_number = ?, pr_state = ?, pr_checks = ?, pr_review = ? WHERE id = ?`,
+		pr.URL, pr.Number, pr.State, pr.Checks, pr.Review, env.RunID,
+	); err != nil {
+		return fmt.Errorf("update run pr: %w", err)
+	}
+	if pr.State != "MERGED" || taskID == "" {
+		return nil
+	}
+	var latest string
+	if err := tx.QueryRow(
+		`SELECT id FROM runs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`, taskID,
+	).Scan(&latest); err != nil {
+		return fmt.Errorf("find latest run: %w", err)
+	}
+	if latest != env.RunID {
+		return nil
+	}
+	if _, err := tx.Exec(`UPDATE tasks SET status = ? WHERE id = ?`, TaskDone, taskID); err != nil {
+		return fmt.Errorf("move task to done: %w", err)
+	}
+	return nil
+}
+
+// moveTaskFor는 Run 상태에 따른 이슈 상태 전이다. done은 건드리지 않는다 —
+// 옛 Run의 늦은 succeeded가 merge된 이슈를 review로 되돌리면 안 된다.
 func moveTaskFor(tx *sql.Tx, runState, taskID string) error {
 	if taskID == "" {
 		return nil
@@ -456,7 +546,7 @@ func moveTaskFor(tx *sql.Tx, runState, taskID string) error {
 	default:
 		return nil
 	}
-	if _, err := tx.Exec(`UPDATE tasks SET status = ? WHERE id = ?`, status, taskID); err != nil {
+	if _, err := tx.Exec(`UPDATE tasks SET status = ? WHERE id = ? AND status != ?`, status, taskID, TaskDone); err != nil {
 		return fmt.Errorf("move task to %s: %w", status, err)
 	}
 	return nil
@@ -541,7 +631,7 @@ func (s *Store) Events(runID string, afterSeq uint64, limit int) ([]protocol.Env
 
 // ---- Project ----
 
-const projectColumns = `id, key, name, repo_path, default_branch, execute_template, created_at, allowed_tools`
+const projectColumns = `id, key, name, repo_path, default_branch, execute_template, created_at, allowed_tools, create_pr, cleanup_merged`
 
 func scanProject(sc rowScanner) (Project, error) {
 	var (
@@ -549,7 +639,7 @@ func scanProject(sc rowScanner) (Project, error) {
 		created int64
 		tools   string
 	)
-	if err := sc.Scan(&p.ID, &p.Key, &p.Name, &p.RepoPath, &p.DefaultBranch, &p.ExecuteTemplate, &created, &tools); err != nil {
+	if err := sc.Scan(&p.ID, &p.Key, &p.Name, &p.RepoPath, &p.DefaultBranch, &p.ExecuteTemplate, &created, &tools, &p.CreatePR, &p.CleanupMerged); err != nil {
 		return Project{}, err
 	}
 	p.CreatedAt = time.Unix(0, created)
@@ -584,8 +674,9 @@ func (s *Store) CreateProject(p Project) (Project, error) {
 	}
 
 	if _, err := tx.Exec(
-		`INSERT INTO projects (`+projectColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO projects (`+projectColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ID, p.Key, p.Name, p.RepoPath, p.DefaultBranch, p.ExecuteTemplate, p.CreatedAt.UnixNano(), joinTools(p.AllowedTools),
+		p.CreatePR, p.CleanupMerged,
 	); err != nil {
 		return Project{}, fmt.Errorf("insert project: %w", err)
 	}
@@ -636,12 +727,13 @@ func (s *Store) ListProjects() ([]Project, error) {
 	return out, rows.Err()
 }
 
-// UpdateProjectSettings는 실행 템플릿과 허용 도구 목록을 한 번에 바꾼다 —
-// 하나는 저장되고 하나는 안 되는 창이 없도록 UPDATE 하나로. tools가 nil이면
-// 비운다. 항목 문법 검사는 호출자(웹 폼)의 몫이다.
-func (s *Store) UpdateProjectSettings(key, executeTemplate string, tools []string) error {
-	res, err := s.db.Exec(`UPDATE projects SET execute_template = ?, allowed_tools = ? WHERE key = ?`,
-		executeTemplate, joinTools(tools), key)
+// UpdateProjectSettings는 설정 폼의 필드를 한 번에 바꾼다 — 일부만 저장되는
+// 창이 없도록 UPDATE 하나로. AllowedTools가 nil이면 비운다. 항목 문법 검사는
+// 호출자(웹 폼)의 몫이다.
+func (s *Store) UpdateProjectSettings(key string, st ProjectSettings) error {
+	res, err := s.db.Exec(
+		`UPDATE projects SET execute_template = ?, allowed_tools = ?, create_pr = ?, cleanup_merged = ? WHERE key = ?`,
+		st.ExecuteTemplate, joinTools(st.AllowedTools), st.CreatePR, st.CleanupMerged, key)
 	if err != nil {
 		return fmt.Errorf("update project settings: %w", err)
 	}
