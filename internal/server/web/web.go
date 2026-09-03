@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -541,6 +542,26 @@ type eventView struct {
 	// Input은 도구 호출의 핵심 인자(Bash면 명령, 파일 도구면 경로)다. 사람이
 	// 승인을 결정하려면 도구 이름만으로는 부족하다.
 	Input string `json:"input,omitempty"`
+	// State·Badge는 run.state_changed에만 있다. 페이지의 상태 배지를 새로고침
+	// 없이 갱신하기 위해 서버가 배지 스타일까지 정해 보낸다.
+	State string `json:"state,omitempty"`
+	Badge string `json:"badge,omitempty"`
+}
+
+// firstLine은 여러 줄 텍스트에서 비어 있지 않은 첫 줄을 max 글자까지 돌려준다.
+// CRLF의 \r도 걷어낸다.
+func firstLine(s string, max int) string {
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if r := []rune(line); len(r) > max {
+			return string(r[:max]) + "…"
+		}
+		return line
+	}
+	return ""
 }
 
 // describeInput은 도구 입력에서 사람이 볼 한 줄을 고른다. 모르는 도구는 JSON.
@@ -588,9 +609,24 @@ func summarize(env protocol.Envelope) eventView {
 		}
 	case protocol.EvToolFinished:
 		view.Summary = "← 완료"
+		if isErr, _ := outer.Body["is_error"].(bool); isErr {
+			view.Summary = "← 오류"
+		}
+		if line := firstLine(fmt.Sprint(outer.Body["output"]), 160); line != "" && line != "<nil>" {
+			view.Summary += ": " + line
+		}
+	case protocol.EvUsageUpdated:
+		// 로그 행이 아니라 머리말 한 줄. 서버 렌더링(handleRun)과 SSE(JS)가
+		// 같은 문장을 쓴다.
+		status, _ := outer.Body["status"].(string)
+		view.Summary = "사용량 " + status
+		if resets, ok := outer.Body["resets_at"].(float64); ok && resets > 0 {
+			view.Summary += " · 초기화 " + time.Unix(int64(resets), 0).Local().Format("01-02 15:04")
+		}
 	case protocol.EvRunStateChanged:
 		state, _ := outer.Body["state"].(string)
 		detail, _ := outer.Body["detail"].(string)
+		view.State, view.Badge = state, badgeClass(state)
 		view.Summary = state
 		if detail != "" {
 			view.Summary += " — " + detail
@@ -636,8 +672,14 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	views := make([]eventView, 0, len(stored))
+	var usage string
 	for _, env := range stored {
-		views = append(views, summarize(env))
+		view := summarize(env)
+		if env.Type == protocol.EvUsageUpdated {
+			usage = view.Summary
+			continue
+		}
+		views = append(views, view)
 	}
 
 	// 이슈에서 시작된 Run이면 돌아갈 곳을 붙인다. Phase 0 시절의 Run은 없다.
@@ -653,7 +695,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.render(w, s.run, map[string]any{
-		"Title": id, "Run": run, "Events": views, "Back": back, "IssueLabel": issueLabel,
+		"Title": id, "Run": run, "Events": views, "Back": back, "IssueLabel": issueLabel, "Usage": usage,
 	})
 }
 

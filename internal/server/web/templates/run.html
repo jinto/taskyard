@@ -6,6 +6,7 @@
   {{if .Run.PRURL}}<a href="{{.Run.PRURL}}" class="text-sm text-go hover:underline">PR #{{.Run.PRNumber}}</a> <span class="badge {{badge .Run.PRState}}">{{.Run.PRState}}</span>{{end}}
 </div>
 <p class="hint mt-1 font-mono text-xs">{{.Run.Stage}}{{if .Run.Branch}} <span class="mx-1">·</span> {{.Run.Branch}}{{end}}</p>
+<p class="hint mt-1 text-xs" id="usage">{{.Usage}}</p>
 
 <div class="mt-6 rounded-lg border-2 border-attention bg-attention-soft p-4 dark:bg-attention/15" id="approval" hidden>
   <div class="text-sm font-semibold text-attention">승인이 필요합니다</div>
@@ -38,6 +39,11 @@
   source.onmessage = function (msg) {
     const ev = JSON.parse(msg.data);
 
+    if (ev.type === "usage_updated") {
+      document.getElementById("usage").textContent = ev.summary;
+      return;
+    }
+
     const row = document.createElement("div");
     row.className = "flex gap-3 border-b border-line px-3 py-1.5 dark:border-zinc-800";
     row.innerHTML = '<span class="w-40 shrink-0 text-muted"></span><span class="min-w-0 whitespace-pre-wrap break-words"></span>';
@@ -46,6 +52,11 @@
     list.appendChild(row);
     list.scrollTop = list.scrollHeight;
 
+    if (ev.type === "run.state_changed" && ev.state) {
+      const badge = document.getElementById("run-state");
+      badge.textContent = ev.state;
+      badge.className = "badge " + ev.badge;
+    }
     if (ev.type === "approval_requested") {
       pendingRequestID = ev.request_id;
       text.textContent = ev.input || ev.summary;

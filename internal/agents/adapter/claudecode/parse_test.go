@@ -175,6 +175,30 @@ func TestToolUseBecomesToolStartedAndFinished(t *testing.T) {
 	if got[1].Body["tool_use_id"] != "toolu_1" {
 		t.Errorf("finished tool_use_id = %v, want toolu_1", got[1].Body["tool_use_id"])
 	}
+	// 결과 본문은 화면이 한 줄 요약에 쓴다. 문자열 content 그대로.
+	if got[1].Body["output"] != "README.md" {
+		t.Errorf("finished output = %v, want README.md", got[1].Body["output"])
+	}
+}
+
+func TestToolResultOutputHandlesBlockArrayAndTruncates(t *testing.T) {
+	long := strings.Repeat("x", 1000)
+	input := `{"type":"user","session_id":"s1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","is_error":true,"content":[{"type":"text","text":"line one"},{"type":"text","text":"` + long + `"}]}]}}` + "\n"
+	p := NewParser()
+	var got []adapter.Event
+	if err := p.Parse(strings.NewReader(input), func(e adapter.Event) error { got = append(got, e); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d events", len(got))
+	}
+	out, _ := got[0].Body["output"].(string)
+	if !strings.HasPrefix(out, "line one\n") || len([]rune(out)) != 400 || !strings.HasSuffix(out, "…") {
+		t.Fatalf("output = %q (len %d); want joined blocks, truncated at 400 runes with …", out[:min(60, len(out))], len([]rune(out)))
+	}
+	if got[0].Body["is_error"] != true {
+		t.Fatalf("is_error = %v", got[0].Body["is_error"])
+	}
 }
 
 func TestMalformedLineBecomesErrorEventAndParsingContinues(t *testing.T) {

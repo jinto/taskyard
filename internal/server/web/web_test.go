@@ -976,6 +976,9 @@ func TestRunPageShowsToolInputForApprovalAndToolStart(t *testing.T) {
 	events := []protocol.Envelope{
 		mustEvent(t, protocol.EvToolStarted, "run-1", 1, map[string]any{"tool_name": "Edit", "input": map[string]any{"file_path": "/wt/greet.go", "old_string": "x"}}),
 		mustEvent(t, protocol.EvApprovalRequested, "run-1", 2, map[string]any{"tool_name": "Bash", "request_id": "r1", "tool_use_id": "t1", "input": map[string]any{"command": "go test ./... -v"}}),
+		mustEvent(t, protocol.EvToolFinished, "run-1", 3, map[string]any{"tool_use_id": "t1", "is_error": false, "output": "ok  \tplayground\t0.4s\nPASS"}),
+		mustEvent(t, protocol.EvToolFinished, "run-1", 4, map[string]any{"tool_use_id": "t2", "is_error": true, "output": "\r\n  Error calling tool (Bash): The operation timed out.\r\n"}),
+		mustEvent(t, protocol.EvUsageUpdated, "run-1", 5, map[string]any{"status": "allowed_warning", "rate_limit_type": "seven_day", "resets_at": 1788584400, "quota_exhausted": true}),
 	}
 	for _, e := range events {
 		if _, _, err := st.ApplyEvent(e); err != nil {
@@ -983,9 +986,18 @@ func TestRunPageShowsToolInputForApprovalAndToolStart(t *testing.T) {
 		}
 	}
 	body := get(h, "/runs/run-1").Body.String()
-	for _, want := range []string{"→ Edit: /wt/greet.go", "승인 요청: Bash: go test ./... -v"} {
+	for _, want := range []string{"→ Edit: /wt/greet.go", "승인 요청: Bash: go test ./... -v", "← 완료: ok  \tplayground\t0.4s", "← 오류: Error calling tool (Bash)"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("run page lacks %q", want)
 		}
+	}
+	// 사용량은 로그 행이 아니라 머리말 한 줄이다.
+	start := strings.Index(body, `id="events"`)
+	eventsHTML := body[start : start+strings.Index(body[start:], "<script>")]
+	if strings.Contains(eventsHTML, "usage_updated") {
+		t.Error("usage_updated should not be an event row")
+	}
+	if !strings.Contains(body, `id="usage"`) || !strings.Contains(body, "allowed_warning") {
+		t.Errorf("run page lacks usage header:\n%s", body)
 	}
 }
