@@ -147,6 +147,43 @@ func TestBuildArgsRejectsLeadingDashResumeSessionID(t *testing.T) {
 	}
 }
 
+// 사전 허용 도구(PRD §11.6.3). 쉼표로 이어 --allowedTools 값 하나로 넘긴다 —
+// 가변 인자로 넘기면 뒤따르는 플래그까지 값으로 먹을 수 있다.
+func TestBuildArgsAddsAllowedToolsAsOneValue(t *testing.T) {
+	opts := baseOpts()
+	opts.AllowedTools = []string{"Edit", "Bash(go test:*)", "mcp__claude-in-chrome__*"}
+
+	args, err := BuildArgs(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasFlagValue(args, "--allowedTools", "Edit,Bash(go test:*),mcp__claude-in-chrome__*") {
+		t.Errorf("missing joined --allowedTools: %s", argsString(args))
+	}
+}
+
+func TestBuildArgsOmitsAllowedToolsWhenEmpty(t *testing.T) {
+	args, err := BuildArgs(baseOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range args {
+		if a == "--allowedTools" {
+			t.Fatalf("--allowedTools present with no tools: %s", argsString(args))
+		}
+	}
+}
+
+func TestBuildArgsRejectsMalformedAllowedTools(t *testing.T) {
+	for _, bad := range []string{"--dangerously-skip-permissions", "-x", "Bash(git log", "Edit,Write", "", "  ", "Bash(a) Write", "Ed\nit"} {
+		opts := baseOpts()
+		opts.AllowedTools = []string{"Edit", bad}
+		if _, err := BuildArgs(opts); err == nil {
+			t.Errorf("BuildArgs accepted allowed tool %q", bad)
+		}
+	}
+}
+
 func TestScrubEnvRemovesBillingKeys(t *testing.T) {
 	// 과금 우회 후보 변수 목록. https://code.claude.com/docs/en/env-vars 기준으로,
 	// 구독이 아니라 API 키/클라우드 제공자/임의 엔드포인트로 과금을 돌리는

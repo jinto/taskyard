@@ -18,10 +18,15 @@
   <p class="state">아직 이슈가 없습니다.</p>
 {{end}}
 
-<h2>실행 템플릿</h2>
+<h2>실행 설정</h2>
 <form method="post" action="/projects/{{.Project.Key}}/template" class="form">
-  <textarea name="execute_template" rows="14">{{.Project.ExecuteTemplate}}</textarea>
-  <p class="state"><code>{{"{{issue}}"}}</code>는 이슈 번호·제목·본문으로, <code>{{"{{memory}}"}}</code>는 저장소의 <code>.taskyard/memory.md</code>로 치환됩니다.</p>
-  <button type="submit">템플릿 저장</button>
+  <label>실행 템플릿
+  <textarea name="execute_template" rows="14">{{.Project.ExecuteTemplate}}</textarea></label>
+  <p class="state"><code>{{"{{issue}}"}}</code>는 이슈 번호·제목·본문으로, <code>{{"{{memory}}"}}</code>는 저장소의 <code>.taskyard/memory.md</code>로, <code>{{"{{previous_run}}"}}</code>·<code>{{"{{feedback}}"}}</code>은 재시도 정보로 치환됩니다.</p>
+  <label>승인 없이 허용할 도구 (한 줄에 하나)
+  <textarea name="allowed_tools" rows="4" placeholder="Edit&#10;Bash(go test:*)">{{range .Project.AllowedTools}}{{.}}
+{{end}}</textarea></label>
+  <p class="state">여기 없는 도구 호출은 지금처럼 승인을 묻습니다. 예: <code>Edit</code>, <code>Write</code>, <code>Bash(go test:*)</code>, <code>Bash(git commit:*)</code>.</p>
+  <button type="submit">저장</button>
 </form>
 {{end}}

@@ -206,6 +206,66 @@ func TestProjectPageListsIssuesNewestFirst(t *testing.T) {
 	}
 }
 
+func TestUpdateSettingsSavesAllowedTools(t *testing.T) {
+	st, h := newServer(t)
+	seedProject(t, st, "shop", "/repos/shop")
+
+	rec := postForm(h, "/projects/shop/template", url.Values{
+		"execute_template": {"t {{issue}}"},
+		"allowed_tools":    {"Edit\r\n\r\n  Bash(go test:*)  \r\n"},
+	})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	p, _ := st.GetProject("shop")
+	if len(p.AllowedTools) != 2 || p.AllowedTools[0] != "Edit" || p.AllowedTools[1] != "Bash(go test:*)" {
+		t.Fatalf("AllowedTools = %q (blank lines and spaces must be dropped)", p.AllowedTools)
+	}
+	if p.ExecuteTemplate != "t {{issue}}" {
+		t.Fatalf("template = %q", p.ExecuteTemplate)
+	}
+
+	body := get(h, "/projects/shop").Body.String()
+	if !strings.Contains(body, `name="allowed_tools"`) || !strings.Contains(body, "Bash(go test:*)") {
+		t.Fatalf("project page does not show allowed tools:\n%s", body)
+	}
+}
+
+func TestUpdateSettingsRejectsMalformedAllowedTools(t *testing.T) {
+	st, h := newServer(t)
+	seedProject(t, st, "shop", "/repos/shop")
+
+	rec := postForm(h, "/projects/shop/template", url.Values{
+		"execute_template": {"t"},
+		"allowed_tools":    {"Edit\n--dangerously-skip-permissions"},
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	p, _ := st.GetProject("shop")
+	if len(p.AllowedTools) != 0 || p.ExecuteTemplate == "t" {
+		t.Fatalf("a rejected form must change nothing: %+v", p)
+	}
+}
+
+func TestRunIssueSendsAllowedTools(t *testing.T) {
+	st, hb, h := newServerWithHub(t)
+	got := attachRunner(t, hb, h)
+	p, err := st.CreateProject(store.Project{Key: "shop", Name: "s", RepoPath: "/repos/shop", DefaultBranch: "main", ExecuteTemplate: "{{issue}}", AllowedTools: []string{"Edit", "Bash(go test:*)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedTask(t, st, p, "이슈", "")
+
+	if rec := postForm(h, "/projects/shop/issues/1/run", nil); rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	_, body := decodeStart(t, got, protocol.CmdRunStart)
+	if len(body.AllowedTools) != 2 || body.AllowedTools[0] != "Edit" || body.AllowedTools[1] != "Bash(go test:*)" {
+		t.Fatalf("run.start allowed_tools = %q", body.AllowedTools)
+	}
+}
+
 func TestUpdateTemplateFromProjectPage(t *testing.T) {
 	st, h := newServer(t)
 	seedProject(t, st, "shop", "/repos/shop")
