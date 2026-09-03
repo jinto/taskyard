@@ -35,6 +35,23 @@ var templateFS embed.FS
 // keyPattern은 프로젝트 key의 문법이다. URL 경로 조각으로 그대로 쓰인다.
 var keyPattern = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
 
+// badgeClass는 이슈·Run·PR 상태를 색으로 옮긴다. 상태가 곧 정보다: 움직이는
+// 것은 파랑, 사람의 차례는 주황, 끝난 것은 초록, 실패는 빨강, 쉬는 것은 회색.
+func badgeClass(state string) string {
+	switch state {
+	case store.StateQueued, store.StateRunning, store.TaskInProgress, "OPEN":
+		return "bg-sky-100 text-sky-900 dark:bg-sky-900/40 dark:text-sky-200"
+	case store.StateWaitingApproval, store.StateNeedsAttention, store.TaskReview:
+		return "bg-attention-soft text-attention dark:bg-attention/25 dark:text-orange-200"
+	case store.StateSucceeded, store.TaskDone, "MERGED":
+		return "bg-go-soft text-go dark:bg-go/25 dark:text-emerald-200"
+	case store.StateFailed, store.StateOrphaned:
+		return "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200"
+	default:
+		return "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+	}
+}
+
 type Server struct {
 	st  *store.Store
 	hub *hub.Hub
@@ -48,7 +65,8 @@ type Server struct {
 func New(st *store.Store, h *hub.Hub) (*Server, error) {
 	var err error
 	page := func(name string) *template.Template {
-		t, perr := template.ParseFS(templateFS, "templates/layout.html", "templates/"+name)
+		t, perr := template.New("layout.html").Funcs(template.FuncMap{"badge": badgeClass}).
+			ParseFS(templateFS, "templates/layout.html", "templates/"+name)
 		if perr != nil && err == nil {
 			err = fmt.Errorf("parse %s: %w", name, perr)
 		}
@@ -520,6 +538,27 @@ type eventView struct {
 	// 키다. Claude Code는 tool call을 병렬로 낼 수 있어 순서로는 구분이
 	// 안 된다. 승인 패널이 이걸 보여줄 수 있도록 끝까지 들고 간다.
 	ToolUseID string `json:"tool_use_id,omitempty"`
+	// Input은 도구 호출의 핵심 인자(Bash면 명령, 파일 도구면 경로)다. 사람이
+	// 승인을 결정하려면 도구 이름만으로는 부족하다.
+	Input string `json:"input,omitempty"`
+}
+
+// describeInput은 도구 입력에서 사람이 볼 한 줄을 고른다. 모르는 도구는 JSON.
+func describeInput(input any) string {
+	m, ok := input.(map[string]any)
+	if !ok || len(m) == 0 {
+		return ""
+	}
+	for _, key := range []string{"command", "file_path", "pattern", "url"} {
+		if v, ok := m[key].(string); ok && v != "" {
+			return v
+		}
+	}
+	raw, _ := json.Marshal(m)
+	if len(raw) > 200 {
+		raw = append(raw[:200], "…"...)
+	}
+	return string(raw)
 }
 
 // summarize는 봉투를 한 줄로 줄인다. 원본은 store에 그대로 있다.
@@ -544,6 +583,9 @@ func summarize(env protocol.Envelope) eventView {
 	case protocol.EvToolStarted:
 		name, _ := outer.Body["tool_name"].(string)
 		view.Summary = "→ " + name
+		if in := describeInput(outer.Body["input"]); in != "" {
+			view.Summary += ": " + in
+		}
 	case protocol.EvToolFinished:
 		view.Summary = "← 완료"
 	case protocol.EvRunStateChanged:
@@ -557,7 +599,11 @@ func summarize(env protocol.Envelope) eventView {
 		name, _ := outer.Body["tool_name"].(string)
 		view.RequestID, _ = outer.Body["request_id"].(string)
 		view.ToolUseID, _ = outer.Body["tool_use_id"].(string)
+		view.Input = describeInput(outer.Body["input"])
 		view.Summary = "승인 요청: " + name
+		if view.Input != "" {
+			view.Summary += ": " + view.Input
+		}
 		if view.ToolUseID != "" {
 			view.Summary += " (" + view.ToolUseID + ")"
 		}

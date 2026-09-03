@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 
 	"github.com/jinto/taskyard/internal/buildinfo"
 	"github.com/jinto/taskyard/internal/server/hub"
@@ -31,6 +32,10 @@ func main() {
 		os.Exit(2)
 	}
 
+	if err := os.MkdirAll(filepath.Dir(*dbPath), 0o755); err != nil {
+		slog.Error("create db directory failed", "err", err)
+		os.Exit(1)
+	}
 	st, err := store.Open(*dbPath)
 	if err != nil {
 		slog.Error("open store failed", "err", err)
