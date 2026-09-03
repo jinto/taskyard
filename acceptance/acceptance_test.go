@@ -82,6 +82,18 @@ func newStack(t *testing.T, dbDir string) *stack {
 // pong fixture의 절대 경로로 치환된다.
 func newStackWith(t *testing.T, dbDir, script string) *stack {
 	t.Helper()
+	return buildStack(t, dbDir, script, stackOpts{})
+}
+
+// stackOpts는 PR 경로에 필요한 추가 배선이다: 가짜 gh, 빠른 폴링, bare origin.
+type stackOpts struct {
+	gh     string
+	prPoll time.Duration
+	origin bool
+}
+
+func buildStack(t *testing.T, dbDir, script string, o stackOpts) *stack {
+	t.Helper()
 
 	st, err := store.Open(filepath.Join(dbDir, "server.db"))
 	if err != nil {
@@ -103,6 +115,11 @@ func newStackWith(t *testing.T, dbDir, script string) *stack {
 
 	repo := filepath.Join(dbDir, "repo")
 	initRepo(t, repo)
+	if o.origin {
+		bare := filepath.Join(dbDir, "origin.git")
+		git(t, dbDir, "init", "-q", "--bare", bare)
+		git(t, repo, "remote", "add", "origin", bare)
+	}
 
 	repos, err := lifecycle.NewRepoResolver([]string{repo}, filepath.Join(dbDir, "wt"))
 	if err != nil {
@@ -127,7 +144,7 @@ func newStackWith(t *testing.T, dbDir, script string) *stack {
 	lm, err := lifecycle.New(lifecycle.Config{
 		Spool: sp, Repos: repos, Broker: approval.New("tok"),
 		BaseBranch: "main", BrokerURL: "http://127.0.0.1:1/mcp", BrokerToken: "tok",
-		ClaudeBinary: fake,
+		ClaudeBinary: fake, GHBinary: o.gh, PRPollInterval: o.prPoll,
 		Publish: func(runID string, env protocol.Envelope) error {
 			return l.Publish(runID, env)
 		},
@@ -909,4 +926,145 @@ func get(h http.Handler, path string) string {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 	return rec.Body.String()
+}
+
+// ---- PR 생성·추적·정리 (계획 2026-09-03-phase1-pr) ----
+
+// fakeGH는 제어 파일 state(없으면 PR 없음)로 조종하는 가짜 gh다. pr create는
+// state를 OPEN으로 만들고, pr view는 state를 그대로 돌려준다.
+func fakeGH(t *testing.T, dir string) (bin, stateFile string) {
+	t.Helper()
+	stateFile = filepath.Join(dir, "gh-state")
+	bin = filepath.Join(dir, "fake-gh")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> ` + filepath.Join(dir, "gh-calls") + `
+case "$1 $2" in
+  "pr view")
+    S=$(cat ` + stateFile + ` 2>/dev/null || echo none)
+    [ "$S" = none ] && { echo "no pull requests found" >&2; exit 1; }
+    printf '{"number":7,"url":"https://example.test/pull/7","state":"%s","statusCheckRollup":[],"reviewDecision":""}\n' "$S" ;;
+  "pr create") echo OPEN > ` + stateFile + `; echo https://example.test/pull/7 ;;
+  *) exit 2 ;;
+esac
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin, stateFile
+}
+
+// 커밋 하나와 변경 설명을 남기는 가짜 Agent.
+const committingAgentScript = "#!/bin/sh\nmkdir -p .taskyard; printf 'README에 한 줄을 더했다\\n' > .taskyard/summary.md\necho agent-work >> README.md\ngit add README.md\ngit -c user.name=t -c user.email=t@t commit -q -m 'agent: add line'\ncat FIXTURE\n"
+
+func createProjectAndIssueWithPR(t *testing.T, ui http.Handler, repo string, createPR bool) {
+	t.Helper()
+	form := url.Values{"key": {"shop"}, "name": {"쇼핑몰"}, "repo_path": {repo}, "default_branch": {"main"}, "cleanup_merged": {"on"}}
+	if createPR {
+		form.Set("create_pr", "on")
+	}
+	if rec := postForm(ui, "/projects", form); rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST /projects status = %d, body=%s", rec.Code, rec.Body)
+	}
+	rec := postForm(ui, "/projects/shop/issues", url.Values{"title": {"README에 한 줄 추가"}, "body": {"agent-work라는 줄을 덧붙인다"}})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST issue status = %d", rec.Code)
+	}
+}
+
+// TestIssueRunCreatesPRAndMergeCompletesIssue: [실행] → Agent 커밋 + 변경 설명 →
+// 러너가 push·PR 생성 → 서버에 PR 필드, 이슈 review → 사람이 merge(제어 파일)
+// → 추적이 감지 → 이슈 done, worktree 삭제. main처럼 TrackPRs를 나란히 띄운다.
+func TestIssueRunCreatesPRAndMergeCompletesIssue(t *testing.T) {
+	dir := t.TempDir()
+	gh, stateFile := fakeGH(t, dir)
+	s := buildStack(t, dir, committingAgentScript, stackOpts{gh: gh, prPoll: 30 * time.Millisecond, origin: true})
+	repo := filepath.Join(dir, "repo")
+	uiServer, err := web.New(s.st, s.hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ui := uiServer.Routes()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.link.Run(ctx)
+	go s.life.TrackPRs(ctx)
+	waitFor(t, "runner connection", s.hub.Connected)
+
+	createProjectAndIssueWithPR(t, ui, repo, true)
+	runID := runIDFrom(t, postForm(ui, "/projects/shop/issues/1/run", nil))
+	if body := startFor(t, s, runID); body.PR == nil || body.PR.Title != "README에 한 줄 추가" || !body.CleanupMerged {
+		t.Fatalf("run.start pr = %+v", body.PR)
+	}
+
+	waitRunState(t, s, runID, store.StateSucceeded)
+	waitFor(t, "pr fields on server", func() bool {
+		run, _ := s.st.GetRun(runID)
+		return run.PRState == "OPEN" && run.PRNumber == 7
+	})
+	run, _ := s.st.GetRun(runID)
+	if run.Summary != "README에 한 줄을 더했다\n" {
+		t.Fatalf("summary = %q", run.Summary)
+	}
+	if task := taskOf(t, s); task.Status != store.TaskReview {
+		t.Fatalf("task after PR = %s, want review", task.Status)
+	}
+	if page := get(ui, "/projects/shop/issues/1"); !strings.Contains(page, "https://example.test/pull/7") {
+		t.Fatalf("issue page lacks PR link:\n%s", page)
+	}
+	// origin에 브랜치가 실제로 올라갔다.
+	git(t, filepath.Join(dir, "origin.git"), "rev-parse", "--verify", "refs/heads/"+s.git.BranchName(runID))
+
+	// 사람이 GitHub에서 merge했다.
+	if err := os.WriteFile(stateFile, []byte("MERGED\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "task done", func() bool { return taskOf(t, s).Status == store.TaskDone })
+	run, _ = s.st.GetRun(runID)
+	if run.PRState != "MERGED" {
+		t.Fatalf("run pr state = %q", run.PRState)
+	}
+	waitFor(t, "worktree removed", func() bool {
+		_, err := os.Stat(s.git.WorktreePath(runID))
+		return os.IsNotExist(err)
+	})
+	if page := get(ui, "/projects/shop/issues/1"); !strings.Contains(page, "done") || strings.Contains(page, "/issues/1/run\"") {
+		t.Fatalf("done issue page:\n%s", page)
+	}
+}
+
+// TestIssueRunWithoutPRKeepsSummary: PR 만들기를 끈 프로젝트 — push도 gh도
+// 없이 succeeded, 변경 설명은 남는다(playground처럼 원격 없는 저장소의 경로).
+func TestIssueRunWithoutPRKeepsSummary(t *testing.T) {
+	dir := t.TempDir()
+	gh, _ := fakeGH(t, dir)
+	s := buildStack(t, dir, committingAgentScript, stackOpts{gh: gh})
+	repo := filepath.Join(dir, "repo")
+	uiServer, err := web.New(s.st, s.hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ui := uiServer.Routes()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.link.Run(ctx)
+	waitFor(t, "runner connection", s.hub.Connected)
+
+	createProjectAndIssueWithPR(t, ui, repo, false)
+	runID := runIDFrom(t, postForm(ui, "/projects/shop/issues/1/run", nil))
+	if body := startFor(t, s, runID); body.PR != nil {
+		t.Fatalf("create_pr off but run.start has pr: %+v", body.PR)
+	}
+	waitRunState(t, s, runID, store.StateSucceeded)
+	waitFor(t, "summary on server", func() bool {
+		run, _ := s.st.GetRun(runID)
+		return run.Summary != ""
+	})
+	if _, err := os.Stat(filepath.Join(dir, "gh-calls")); !os.IsNotExist(err) {
+		t.Fatal("gh must not be called when PR creation is off")
+	}
+	if run, _ := s.st.GetRun(runID); run.PRURL != "" {
+		t.Fatalf("unexpected PR fields: %+v", run)
+	}
 }
