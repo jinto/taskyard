@@ -993,8 +993,13 @@ func TestAttentionFileIsIgnoredWhenAgentFails(t *testing.T) {
 	}
 	waitTerminal(t, col)
 
-	if last := lastState(t, col, "run-1"); last.state != "failed" {
+	last := lastState(t, col, "run-1")
+	if last.state != "failed" {
 		t.Fatalf("last state = %+v, want failed (failure outranks attention)", last)
+	}
+	// 메모는 버리지 않고 detail에 덧붙인다.
+	if !strings.Contains(last.detail, "reason") {
+		t.Fatalf("detail = %q, want the attention note appended", last.detail)
 	}
 }
 

@@ -337,14 +337,18 @@ func readWorktreeFile(worktree, rel string, max int) (content string, truncated,
 // 다음 Run이나 salvage가 그 삭제를 실어 간다 — 결정적이고 무해하다.
 func takeAttention(worktree string) (string, bool) {
 	reason, truncated, ok := readWorktreeFile(worktree, attentionFile, maxAttentionBytes)
-	if !ok || strings.TrimSpace(reason) == "" {
+	if !ok {
+		return "", false
+	}
+	// 비어 있어도 지운다 — 남기면 salvage가 커밋한다.
+	if err := os.Remove(filepath.Join(worktree, attentionFile)); err != nil {
+		slog.Warn("could not remove attention file", "err", err)
+	}
+	if strings.TrimSpace(reason) == "" {
 		return "", false
 	}
 	if truncated {
 		reason += "\n…(attention.md truncated at 4KiB)"
-	}
-	if err := os.Remove(filepath.Join(worktree, attentionFile)); err != nil {
-		slog.Warn("could not remove attention file", "err", err)
 	}
 	return reason, true
 }
@@ -510,8 +514,8 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, spec r
 			if state == "succeeded" {
 				state, detail = "needs_attention", attention
 			} else {
-				// 실패·취소가 우선한다. 보고는 버리지 않고 로그에 남긴다.
-				slog.Info("attention note on a non-successful run", "run_id", runID, "state", state, "note", attention)
+				// 실패·취소가 우선한다. 보고는 버리지 않고 detail에 덧붙인다.
+				detail += "\n\n에이전트 메모:\n" + attention
 			}
 		}
 		rec := spec.record(state)

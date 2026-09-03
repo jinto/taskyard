@@ -288,6 +288,29 @@ func (s *Spool) SaveRun(r RunRecord) error {
 	return nil
 }
 
+// PRUpdate는 추적이 바꾸는 PR 필드다.
+type PRUpdate struct {
+	State, Checks, Review string
+	WorktreeRemoved       bool
+}
+
+// UpdatePR은 PR 필드만 바꾼다 — 기록 전체를 덮어쓰지 않는다. 추적 goroutine이
+// 읽은 뒤 finish가 종결 상태를 쓰거나 재시도가 superseded로 바꿨을 수 있으므로,
+// 읽었을 때의 pr_state(expect)와 같을 때만 쓴다(compare-and-set). 바뀌었으면
+// ok=false — 호출자는 이벤트를 내지 않는다.
+func (s *Spool) UpdatePR(runID, expect string, u PRUpdate) (bool, error) {
+	res, err := s.db.Exec(
+		`UPDATE runs SET pr_state = ?, pr_checks = ?, pr_review = ?, worktree_removed = ?
+		 WHERE run_id = ? AND pr_state = ?`,
+		u.State, u.Checks, u.Review, u.WorktreeRemoved, runID, expect,
+	)
+	if err != nil {
+		return false, fmt.Errorf("update run pr: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 // LoadRuns는 모든 실행 기록을 돌려준다.
 func (s *Spool) LoadRuns() ([]RunRecord, error) {
 	rows, err := s.db.Query(

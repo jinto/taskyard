@@ -271,7 +271,8 @@ func TestFinishWithoutCommitsSkipsPR(t *testing.T) {
 
 func TestFailureSalvageDoesNotCommitTaskyardFiles(t *testing.T) {
 	col := &collector{}
-	h := newHarness(t, col, withBinary(scriptedAgent(t, []string{writeSummary, "echo dirty > dirty.txt"}, 1)))
+	// 빈 attention.md도 거둔다 — 비어 있다고 남기면 salvage가 커밋한다.
+	h := newHarness(t, col, withBinary(scriptedAgent(t, []string{writeSummary, ": > .taskyard/attention.md", "echo dirty > dirty.txt"}, 1)))
 	startWithPR(t, h, "run-1", nil, "")
 	waitTerminal(t, col)
 
@@ -287,7 +288,7 @@ func TestFailureSalvageDoesNotCommitTaskyardFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(out), ".taskyard/summary.md") || !strings.Contains(string(out), "dirty.txt") {
+	if strings.Contains(string(out), ".taskyard/") || !strings.Contains(string(out), "dirty.txt") {
 		t.Fatalf("salvage commit files = %q", out)
 	}
 	if summaryOf(t, col, "run-1") == "" {

@@ -32,14 +32,18 @@ const (
 // 문자열.
 func takeSummary(worktree string) string {
 	summary, truncated, ok := readWorktreeFile(worktree, summaryFile, maxSummaryBytes)
-	if !ok || strings.TrimSpace(summary) == "" {
+	if !ok {
+		return ""
+	}
+	// 비어 있어도 지운다 — 남기면 salvage가 커밋한다.
+	if err := os.Remove(filepath.Join(worktree, summaryFile)); err != nil {
+		slog.Warn("could not remove summary file", "err", err)
+	}
+	if strings.TrimSpace(summary) == "" {
 		return ""
 	}
 	if truncated {
 		summary += "\n…(summary.md truncated at 16KiB)"
-	}
-	if err := os.Remove(filepath.Join(worktree, summaryFile)); err != nil {
-		slog.Warn("could not remove summary file", "err", err)
 	}
 	return summary
 }
@@ -100,8 +104,7 @@ func (m *Manager) supersede(branch, ownerRunID string) {
 	}
 	for _, r := range records {
 		if r.Branch == branch && r.RunID != ownerRunID && r.PRState == "OPEN" {
-			r.PRState = "superseded"
-			_ = m.cfg.Spool.SaveRun(r)
+			_, _ = m.cfg.Spool.UpdatePR(r.RunID, "OPEN", spool.PRUpdate{State: "superseded", Checks: r.PRChecks, Review: r.PRReview, WorktreeRemoved: r.WorktreeRemoved})
 		}
 	}
 }
@@ -189,10 +192,17 @@ func (m *Manager) pollPRs(ctx context.Context) {
 		if pr.State == "MERGED" && rec.CleanupMerged {
 			body.WorktreeRemoved = m.cleanupMerged(ctx, rec, git)
 		}
-		rec.PRURL, rec.PRState, rec.PRChecks, rec.PRReview = pr.URL, pr.State, pr.Checks, pr.Review
-		rec.WorktreeRemoved = body.WorktreeRemoved
-		if err := m.cfg.Spool.SaveRun(rec); err != nil {
+		// 읽은 뒤 재시도가 이 기록을 superseded로 바꿨으면(compare-and-set 실패)
+		// 주인이 아니다 — 이벤트를 내지 않는다.
+		ok, err := m.cfg.Spool.UpdatePR(rec.RunID, rec.PRState, spool.PRUpdate{
+			State: pr.State, Checks: pr.Checks, Review: pr.Review, WorktreeRemoved: body.WorktreeRemoved,
+		})
+		if err != nil {
 			slog.Error("save run pr state failed", "run_id", rec.RunID, "err", err)
+			continue
+		}
+		if !ok {
+			continue
 		}
 		m.emitPR(rec.RunID, body)
 	}
