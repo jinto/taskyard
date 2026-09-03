@@ -193,7 +193,7 @@ func TestToolResultOutputHandlesBlockArrayAndTruncates(t *testing.T) {
 		t.Fatalf("got %d events", len(got))
 	}
 	out, _ := got[0].Body["output"].(string)
-	if !strings.HasPrefix(out, "line one\n") || len([]rune(out)) > 420 || !strings.HasSuffix(out, "…") {
+	if !strings.HasPrefix(out, "line one\n") || len([]rune(out)) != 400 || !strings.HasSuffix(out, "…") {
 		t.Fatalf("output = %q (len %d); want joined blocks, truncated at 400 runes with …", out[:min(60, len(out))], len([]rune(out)))
 	}
 	if got[0].Body["is_error"] != true {

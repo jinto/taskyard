@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -141,6 +142,10 @@ func brokerMCPConfig(url, token string) (string, error) {
 				"type":    "http",
 				"url":     url,
 				"headers": map[string]string{"Authorization": "Bearer " + token},
+				// HTTP MCP 서버의 요청 타이머는 max(60s, 이 서버의 timeout,
+				// MCP_TIMEOUT)이고 MCP_TOOL_TIMEOUT의 기본값은 그 비교에 안
+				// 들어간다(공식 문서). 승인은 사람의 속도라 서버 단위로 하루.
+				"timeout": mcpToolTimeoutMS,
 			},
 		},
 	}
@@ -155,20 +160,29 @@ func brokerMCPConfig(url, token string) (string, error) {
 // 승인 브로커도 MCP 도구라서 이 한도 안에 사람이 눌러야 한다 — 기본 60초는
 // 사람의 속도가 아니다. 지나면 "timed out" 오류가 에이전트에 돌아가고 같은
 // 승인을 다시 묻는다(2026-09-04 관측). 하루로 올린다.
-const mcpToolTimeout = "MCP_TOOL_TIMEOUT=86400000"
+const mcpToolTimeoutMS = 86_400_000
 
 // AgentEnv는 에이전트 프로세스의 환경이다: 과금 변수를 빼고(ScrubEnv) MCP
-// 도구 호출 한도를 올린다. 사용자가 이미 정한 MCP_TOOL_TIMEOUT은 덮어쓴다 —
-// 승인 대기가 그보다 짧아지면 안 된다.
+// 도구 호출 한도를 올린다. 사용자가 더 길게 정해 뒀으면 그것을 존중하고,
+// 짧거나 없으면 하루로 — 승인 대기가 그보다 짧아지면 안 된다.
 func AgentEnv(env []string) []string {
 	out := ScrubEnv(env)
 	kept := out[:0]
 	for _, entry := range out {
-		if !strings.HasPrefix(entry, "MCP_TOOL_TIMEOUT=") {
-			kept = append(kept, entry)
+		if v, ok := strings.CutPrefix(entry, "MCP_TOOL_TIMEOUT="); ok {
+			if n, err := strconv.Atoi(v); err == nil && n >= mcpToolTimeoutMS {
+				kept = append(kept, entry)
+			}
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	for _, entry := range kept {
+		if strings.HasPrefix(entry, "MCP_TOOL_TIMEOUT=") {
+			return kept
 		}
 	}
-	return append(kept, mcpToolTimeout)
+	return append(kept, "MCP_TOOL_TIMEOUT="+strconv.Itoa(mcpToolTimeoutMS))
 }
 
 // ScrubEnv는 API 과금용 변수를 제거한 환경을 돌려준다.

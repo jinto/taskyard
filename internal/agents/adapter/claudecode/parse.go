@@ -253,7 +253,7 @@ func toolOutput(content json.RawMessage) string {
 		text = strings.Join(parts, "\n")
 	}
 	if r := []rune(text); len(r) > maxToolOutputRunes {
-		return string(r[:maxToolOutputRunes]) + "…"
+		return string(r[:maxToolOutputRunes-1]) + "…"
 	}
 	return text
 }

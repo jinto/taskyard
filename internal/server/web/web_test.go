@@ -977,7 +977,7 @@ func TestRunPageShowsToolInputForApprovalAndToolStart(t *testing.T) {
 		mustEvent(t, protocol.EvToolStarted, "run-1", 1, map[string]any{"tool_name": "Edit", "input": map[string]any{"file_path": "/wt/greet.go", "old_string": "x"}}),
 		mustEvent(t, protocol.EvApprovalRequested, "run-1", 2, map[string]any{"tool_name": "Bash", "request_id": "r1", "tool_use_id": "t1", "input": map[string]any{"command": "go test ./... -v"}}),
 		mustEvent(t, protocol.EvToolFinished, "run-1", 3, map[string]any{"tool_use_id": "t1", "is_error": false, "output": "ok  \tplayground\t0.4s\nPASS"}),
-		mustEvent(t, protocol.EvToolFinished, "run-1", 4, map[string]any{"tool_use_id": "t2", "is_error": true, "output": "Error calling tool (Bash): The operation timed out."}),
+		mustEvent(t, protocol.EvToolFinished, "run-1", 4, map[string]any{"tool_use_id": "t2", "is_error": true, "output": "\r\n  Error calling tool (Bash): The operation timed out.\r\n"}),
 		mustEvent(t, protocol.EvUsageUpdated, "run-1", 5, map[string]any{"status": "allowed_warning", "rate_limit_type": "seven_day", "resets_at": 1788584400, "quota_exhausted": true}),
 	}
 	for _, e := range events {
@@ -992,7 +992,8 @@ func TestRunPageShowsToolInputForApprovalAndToolStart(t *testing.T) {
 		}
 	}
 	// 사용량은 로그 행이 아니라 머리말 한 줄이다.
-	if strings.Contains(body, ">usage_updated<") {
+	eventsHTML := body[strings.Index(body, `id="events"`):]
+	if strings.Contains(eventsHTML, "usage_updated") {
 		t.Error("usage_updated should not be an event row")
 	}
 	if !strings.Contains(body, `id="usage"`) || !strings.Contains(body, "allowed_warning") {

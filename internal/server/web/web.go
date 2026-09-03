@@ -548,15 +548,20 @@ type eventView struct {
 	Badge string `json:"badge,omitempty"`
 }
 
-// firstLine은 여러 줄 텍스트의 첫 줄을 max 글자까지 돌려준다.
+// firstLine은 여러 줄 텍스트에서 비어 있지 않은 첫 줄을 max 글자까지 돌려준다.
+// CRLF의 \r도 걷어낸다.
 func firstLine(s string, max int) string {
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		s = s[:i]
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if r := []rune(line); len(r) > max {
+			return string(r[:max]) + "…"
+		}
+		return line
 	}
-	if r := []rune(s); len(r) > max {
-		return string(r[:max]) + "…"
-	}
-	return s
+	return ""
 }
 
 // describeInput은 도구 입력에서 사람이 볼 한 줄을 고른다. 모르는 도구는 JSON.
@@ -607,8 +612,8 @@ func summarize(env protocol.Envelope) eventView {
 		if isErr, _ := outer.Body["is_error"].(bool); isErr {
 			view.Summary = "← 오류"
 		}
-		if out, _ := outer.Body["output"].(string); out != "" {
-			view.Summary += ": " + firstLine(out, 160)
+		if line := firstLine(fmt.Sprint(outer.Body["output"]), 160); line != "" && line != "<nil>" {
+			view.Summary += ": " + line
 		}
 	case protocol.EvUsageUpdated:
 		// 로그 행이 아니라 머리말 한 줄. 서버 렌더링(handleRun)과 SSE(JS)가

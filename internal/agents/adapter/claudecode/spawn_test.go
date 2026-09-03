@@ -98,7 +98,7 @@ func TestBuildArgsEmbedsBrokerInMCPConfig(t *testing.T) {
 	if cfg == "" {
 		t.Fatal("missing --mcp-config")
 	}
-	for _, want := range []string{`"taskyard"`, `"http"`, "http://127.0.0.1:9999/mcp", "Bearer secret"} {
+	for _, want := range []string{`"taskyard"`, `"http"`, "http://127.0.0.1:9999/mcp", "Bearer secret", `"timeout":86400000`} {
 		if !strings.Contains(cfg, want) {
 			t.Errorf("mcp config missing %q:\n%s", want, cfg)
 		}
@@ -248,5 +248,10 @@ func TestAgentEnvScrubsBillingKeysAndLiftsMCPToolTimeout(t *testing.T) {
 	// 지나면 승인이 "실패"로 돌아가 에이전트가 다시 묻는다. 하루로 올린다.
 	if n := strings.Count(joined, "MCP_TOOL_TIMEOUT="); n != 1 || !strings.Contains(joined, "MCP_TOOL_TIMEOUT=86400000") {
 		t.Fatalf("MCP_TOOL_TIMEOUT not set exactly once to a day: %q", env)
+	}
+	// 사용자가 더 길게 정해 뒀으면 그대로 둔다.
+	longer := strings.Join(AgentEnv([]string{"MCP_TOOL_TIMEOUT=172800000"}), "\n")
+	if strings.Count(longer, "MCP_TOOL_TIMEOUT=") != 1 || !strings.Contains(longer, "MCP_TOOL_TIMEOUT=172800000") {
+		t.Fatalf("user's longer timeout was clobbered: %q", longer)
 	}
 }
