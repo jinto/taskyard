@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 
 	"github.com/jinto/taskyard/internal/agents/adapter"
@@ -171,6 +172,7 @@ func (p *Parser) emitContentBlocks(msg streamMessage, raw json.RawMessage, emit 
 				Body: map[string]any{
 					"tool_use_id": block.ToolUseID,
 					"is_error":    block.IsError,
+					"output":      toolOutput(block.Content),
 				},
 				Raw: raw,
 			}); err != nil {
@@ -220,4 +222,38 @@ type contentBlock struct {
 	Input     json.RawMessage `json:"input"`
 	ToolUseID string          `json:"tool_use_id"`
 	IsError   bool            `json:"is_error"`
+	// Content는 tool_result의 본문이다. 문자열이거나 {type:text,text} 블록 배열.
+	Content json.RawMessage `json:"content"`
+}
+
+// maxToolOutputRunes는 이벤트에 싣는 도구 결과의 상한이다. 원문은 Raw에 있다.
+const maxToolOutputRunes = 400
+
+// toolOutput은 tool_result의 content를 한 문자열로 편다. 블록 배열이면 text를
+// 줄바꿈으로 잇는다. 길면 자르고 …를 붙인다.
+func toolOutput(content json.RawMessage) string {
+	var text string
+	var s string
+	if err := json.Unmarshal(content, &s); err == nil {
+		text = s
+	} else {
+		var blocks []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(content, &blocks); err != nil {
+			return ""
+		}
+		parts := make([]string, 0, len(blocks))
+		for _, b := range blocks {
+			if b.Type == "text" && b.Text != "" {
+				parts = append(parts, b.Text)
+			}
+		}
+		text = strings.Join(parts, "\n")
+	}
+	if r := []rune(text); len(r) > maxToolOutputRunes {
+		return string(r[:maxToolOutputRunes]) + "…"
+	}
+	return text
 }

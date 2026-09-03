@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -547,6 +548,17 @@ type eventView struct {
 	Badge string `json:"badge,omitempty"`
 }
 
+// firstLine은 여러 줄 텍스트의 첫 줄을 max 글자까지 돌려준다.
+func firstLine(s string, max int) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if r := []rune(s); len(r) > max {
+		return string(r[:max]) + "…"
+	}
+	return s
+}
+
 // describeInput은 도구 입력에서 사람이 볼 한 줄을 고른다. 모르는 도구는 JSON.
 func describeInput(input any) string {
 	m, ok := input.(map[string]any)
@@ -592,6 +604,20 @@ func summarize(env protocol.Envelope) eventView {
 		}
 	case protocol.EvToolFinished:
 		view.Summary = "← 완료"
+		if isErr, _ := outer.Body["is_error"].(bool); isErr {
+			view.Summary = "← 오류"
+		}
+		if out, _ := outer.Body["output"].(string); out != "" {
+			view.Summary += ": " + firstLine(out, 160)
+		}
+	case protocol.EvUsageUpdated:
+		// 로그 행이 아니라 머리말 한 줄. 서버 렌더링(handleRun)과 SSE(JS)가
+		// 같은 문장을 쓴다.
+		status, _ := outer.Body["status"].(string)
+		view.Summary = "사용량 " + status
+		if resets, ok := outer.Body["resets_at"].(float64); ok && resets > 0 {
+			view.Summary += " · 초기화 " + time.Unix(int64(resets), 0).Local().Format("01-02 15:04")
+		}
 	case protocol.EvRunStateChanged:
 		state, _ := outer.Body["state"].(string)
 		detail, _ := outer.Body["detail"].(string)
@@ -641,8 +667,14 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	views := make([]eventView, 0, len(stored))
+	var usage string
 	for _, env := range stored {
-		views = append(views, summarize(env))
+		view := summarize(env)
+		if env.Type == protocol.EvUsageUpdated {
+			usage = view.Summary
+			continue
+		}
+		views = append(views, view)
 	}
 
 	// 이슈에서 시작된 Run이면 돌아갈 곳을 붙인다. Phase 0 시절의 Run은 없다.
@@ -658,7 +690,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.render(w, s.run, map[string]any{
-		"Title": id, "Run": run, "Events": views, "Back": back, "IssueLabel": issueLabel,
+		"Title": id, "Run": run, "Events": views, "Back": back, "IssueLabel": issueLabel, "Usage": usage,
 	})
 }
 
