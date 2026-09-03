@@ -230,11 +230,18 @@ func (h *Hub) readLoop(ctx context.Context, conn *websocket.Conn) {
 		}
 
 		accepted, ack, err := h.st.ApplyEvent(env)
-		if err != nil {
+		switch {
+		case errors.Is(err, store.ErrRunNotFound):
+			// 원장에 없는 Run의 이벤트는 버리되 ack는 한다. ack가 없으면 러너의
+			// spool이 영원히 남아 재연결마다 같은 이벤트를 다시 보낸다(findings
+			// 2번). 서버 DB를 지운 채 러너 spool이 살아 있는 경우가 이 경로다.
+			// 그 run_id의 spool.Ack(seq)가 ≤seq를 지우므로 이 seq를 그대로 돌려준다.
+			slog.Warn("dropping event for unknown run", "run_id", env.RunID, "seq", env.Seq)
+			ack = env.Seq
+		case err != nil:
 			slog.Error("apply event failed", "run_id", env.RunID, "seq", env.Seq, "err", err)
 			continue
-		}
-		if accepted {
+		case accepted:
 			h.fanout(env)
 		}
 

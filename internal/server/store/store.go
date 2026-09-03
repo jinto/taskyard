@@ -32,6 +32,9 @@ const (
 	StateSucceeded       = "succeeded"
 	StateFailed          = "failed"
 	StateCancelled       = "cancelled"
+	// StateNeedsAttention은 에이전트가 스스로 멈추고 이유를 남긴 상태다(PRD §7.5).
+	// 종결은 아니지만 정착 상태다 — 사람이 취소·재시도로만 벗어난다.
+	StateNeedsAttention = "needs_attention"
 )
 
 // Task(이슈) 상태. 척추에 필요한 셋만. PRD §9.1의 부분집합.
@@ -41,24 +44,33 @@ const (
 	TaskReview     = "review"
 )
 
-// terminalStates는 되돌리지 않는 Run 상태다. 종결 → 비종결 전이는 무시한다:
-// Runner 재시작 후 Reconcile이 새 seq로 running을 보낼 수 있는데, 그것이
-// 이미 저장된 succeeded를 덮어쓰면 안 된다(계획 Task 1의 단조 규칙).
+// terminalStates는 끝난 Run 상태다. settledStates는 거기에 needs_attention을
+// 더한 "되돌리지 않는" 상태다. 정착 → 비정착 전이는 무시한다: Runner 재시작
+// 후 Reconcile이 새 seq로 running을 보낼 수 있는데, 그것이 이미 저장된
+// succeeded나 needs_attention을 덮어쓰면 안 된다.
 var terminalStates = map[string]bool{
 	StateSucceeded: true,
 	StateFailed:    true,
 	StateCancelled: true,
 }
 
+var settledStates = map[string]bool{
+	StateSucceeded: true, StateFailed: true, StateCancelled: true, StateNeedsAttention: true,
+}
+
 // knownStates는 이벤트가 runs.state에 쓸 수 있는 값의 전부다. 그 밖의
 // 문자열은 저장은 되되 상태에는 닿지 않는다.
 var knownStates = map[string]bool{
 	StateQueued: true, StateRunning: true, StateWaitingApproval: true, StateOrphaned: true,
-	StateSucceeded: true, StateFailed: true, StateCancelled: true,
+	StateSucceeded: true, StateFailed: true, StateCancelled: true, StateNeedsAttention: true,
 }
 
-// IsTerminal은 Run이 끝났는지를 말한다. 웹의 "이미 실행 중" 판정이 쓴다.
+// IsTerminal은 Run이 끝났는지를 말한다.
 func IsTerminal(state string) bool { return terminalStates[state] }
+
+// IsSettled는 Run이 사람의 행동 없이는 더 움직이지 않는지를 말한다. 웹의
+// "이미 실행 중" 판정과 재시도 가능 판정이 쓴다.
+func IsSettled(state string) bool { return settledStates[state] }
 
 const schema = `
 CREATE TABLE IF NOT EXISTS runs (
@@ -72,7 +84,11 @@ CREATE TABLE IF NOT EXISTS runs (
   reconcile_state     TEXT    NOT NULL DEFAULT '',
   task_id             TEXT    NOT NULL DEFAULT '',
   stage               TEXT    NOT NULL DEFAULT '',
-  created_at          INTEGER NOT NULL DEFAULT 0
+  created_at          INTEGER NOT NULL DEFAULT 0,
+  detail              TEXT    NOT NULL DEFAULT '',
+  previous_run_id     TEXT    NOT NULL DEFAULT '',
+  workspace_run_id    TEXT    NOT NULL DEFAULT '',
+  feedback            TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS run_events (
@@ -110,11 +126,18 @@ var runsMigrations = []sqlitex.Column{
 	{Name: "task_id", DDL: "TEXT NOT NULL DEFAULT ''"},
 	{Name: "stage", DDL: "TEXT NOT NULL DEFAULT ''"},
 	{Name: "created_at", DDL: "INTEGER NOT NULL DEFAULT 0"},
+	{Name: "detail", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "previous_run_id", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "workspace_run_id", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "feedback", DDL: "TEXT NOT NULL DEFAULT ''"},
 }
 
 var (
 	// ErrRunNotFound는 알 수 없는 Run을 조회했을 때 반환한다.
 	ErrRunNotFound = errors.New("run not found")
+	// ErrNotCancellable은 서버가 직접 취소할 수 없는 상태의 Run이다 — 활성이면
+	// 러너에게 물어야 하고, 종결이면 취소할 것이 없다.
+	ErrNotCancellable = errors.New("run is not cancellable from the server")
 	// ErrProjectNotFound는 알 수 없는 프로젝트 key를 조회했을 때 반환한다.
 	ErrProjectNotFound = errors.New("project not found")
 	// ErrTaskNotFound는 프로젝트 안에 그 번호의 이슈가 없을 때 반환한다.
@@ -137,6 +160,14 @@ type Run struct {
 	TaskID            string
 	Stage             string
 	CreatedAt         time.Time
+	// Detail은 마지막 상태 이벤트의 설명이다 — 실패 이유 또는 멈춤 보고의 내용.
+	Detail string
+	// PreviousRunID·Feedback은 재시도로 만들어진 Run에만 있다(PRD §7.6).
+	PreviousRunID string
+	Feedback      string
+	// WorkspaceRunID는 이 Run이 쓰는 worktree·브랜치의 주인 Run이다. 이어서
+	// 재시도는 이전 Run의 것을 쓴다. 비어 있으면 자기 자신.
+	WorkspaceRunID string
 }
 
 // Project는 저장소 하나와 이슈 보드, 실행 템플릿을 가진 단위다(PRD §6.1).
@@ -198,8 +229,9 @@ func (s *Store) UpsertRun(r Run) error {
 		created = time.Now()
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO runs (id, state, kind, provider_session_id, branch, worktree_path, reconcile_state, task_id, stage, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO runs (id, state, kind, provider_session_id, branch, worktree_path, reconcile_state, task_id, stage, created_at,
+		                   detail, previous_run_id, workspace_run_id, feedback)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   state               = excluded.state,
 		   kind                = excluded.kind,
@@ -208,9 +240,14 @@ func (s *Store) UpsertRun(r Run) error {
 		   worktree_path       = excluded.worktree_path,
 		   reconcile_state     = excluded.reconcile_state,
 		   task_id             = excluded.task_id,
-		   stage               = excluded.stage`,
+		   stage               = excluded.stage,
+		   detail              = excluded.detail,
+		   previous_run_id     = excluded.previous_run_id,
+		   workspace_run_id    = excluded.workspace_run_id,
+		   feedback            = excluded.feedback`,
 		r.ID, r.State, r.Kind, r.ProviderSessionID, r.Branch, r.WorktreePath, r.ReconcileState,
 		r.TaskID, r.Stage, created.UnixNano(),
+		r.Detail, r.PreviousRunID, r.WorkspaceRunID, r.Feedback,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert run: %w", err)
@@ -218,7 +255,8 @@ func (s *Store) UpsertRun(r Run) error {
 	return nil
 }
 
-const runColumns = `id, state, kind, provider_session_id, branch, worktree_path, last_acked_seq, reconcile_state, task_id, stage, created_at`
+const runColumns = `id, state, kind, provider_session_id, branch, worktree_path, last_acked_seq, reconcile_state, task_id, stage, created_at,
+                    detail, previous_run_id, workspace_run_id, feedback`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
@@ -228,7 +266,8 @@ func scanRun(sc rowScanner) (Run, error) {
 		created int64
 	)
 	err := sc.Scan(&r.ID, &r.State, &r.Kind, &r.ProviderSessionID, &r.Branch, &r.WorktreePath,
-		&r.LastAckedSeq, &r.ReconcileState, &r.TaskID, &r.Stage, &created)
+		&r.LastAckedSeq, &r.ReconcileState, &r.TaskID, &r.Stage, &created,
+		&r.Detail, &r.PreviousRunID, &r.WorkspaceRunID, &r.Feedback)
 	if err != nil {
 		return Run{}, err
 	}
@@ -347,11 +386,16 @@ func (s *Store) ApplyEvent(env protocol.Envelope) (bool, uint64, error) {
 }
 
 // applyStateChange는 run.state_changed의 상태를 runs와 tasks에 반영한다.
-// 이벤트 body는 lifecycle.eventBody 모양({"body":{"state":…}})이다.
+// 이벤트 body는 lifecycle.eventBody 모양({"body":{"state":…,"detail":…,"session_id":…}})이다.
+//
+// 이슈 상태 전이(계획의 행렬): succeeded → review, cancelled → backlog,
+// failed·needs_attention → 그대로.
 func applyStateChange(tx *sql.Tx, env protocol.Envelope, current, taskID string) error {
 	var outer struct {
 		Body struct {
-			State string `json:"state"`
+			State     string `json:"state"`
+			Detail    string `json:"detail"`
+			SessionID string `json:"session_id"`
 		} `json:"body"`
 	}
 	if err := json.Unmarshal(env.Body, &outer); err != nil || outer.Body.State == "" {
@@ -360,18 +404,70 @@ func applyStateChange(tx *sql.Tx, env protocol.Envelope, current, taskID string)
 	}
 	next := outer.Body.State
 
-	if !knownStates[next] || (terminalStates[current] && !terminalStates[next]) {
+	if !knownStates[next] || (settledStates[current] && !settledStates[next]) {
 		return nil
 	}
-	if _, err := tx.Exec(`UPDATE runs SET state = ? WHERE id = ?`, next, env.RunID); err != nil {
+	if _, err := tx.Exec(`UPDATE runs SET state = ?, detail = ? WHERE id = ?`, next, outer.Body.Detail, env.RunID); err != nil {
 		return fmt.Errorf("update run state: %w", err)
 	}
-	if next == StateSucceeded && taskID != "" {
-		if _, err := tx.Exec(`UPDATE tasks SET status = ? WHERE id = ?`, TaskReview, taskID); err != nil {
-			return fmt.Errorf("move task to review: %w", err)
+	// 알던 세션을 빈 값으로 지우지 않는다 — 이어서 재시도가 이 값에 기댄다.
+	if outer.Body.SessionID != "" {
+		if _, err := tx.Exec(`UPDATE runs SET provider_session_id = ? WHERE id = ?`, outer.Body.SessionID, env.RunID); err != nil {
+			return fmt.Errorf("update run session: %w", err)
 		}
 	}
+	return moveTaskFor(tx, next, taskID)
+}
+
+// moveTaskFor는 Run 상태에 따른 이슈 상태 전이다.
+func moveTaskFor(tx *sql.Tx, runState, taskID string) error {
+	if taskID == "" {
+		return nil
+	}
+	var status string
+	switch runState {
+	case StateSucceeded:
+		status = TaskReview
+	case StateCancelled:
+		status = TaskBacklog
+	default:
+		return nil
+	}
+	if _, err := tx.Exec(`UPDATE tasks SET status = ? WHERE id = ?`, status, taskID); err != nil {
+		return fmt.Errorf("move task to %s: %w", status, err)
+	}
 	return nil
+}
+
+// CancelSettledRun은 프로세스가 없는 needs_attention Run을 서버가 직접
+// cancelled로 바꾸고 이슈를 backlog로 옮긴다. 활성 Run은 러너에게
+// run.cancel을 보내야 하고, 종결 Run은 취소할 것이 없다 — 둘 다
+// ErrNotCancellable.
+func (s *Store) CancelSettledRun(runID string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	var state, taskID string
+	err = tx.QueryRow(`SELECT state, task_id FROM runs WHERE id = ?`, runID).Scan(&state, &taskID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrRunNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("read run: %w", err)
+	}
+	if state != StateNeedsAttention {
+		return fmt.Errorf("%w: state is %s", ErrNotCancellable, state)
+	}
+	if _, err := tx.Exec(`UPDATE runs SET state = ? WHERE id = ?`, StateCancelled, runID); err != nil {
+		return fmt.Errorf("cancel run: %w", err)
+	}
+	if err := moveTaskFor(tx, StateCancelled, taskID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ResumePoints는 Runner의 재연결 시 Welcome에 실어 보낼 Run별 ack 지점이다.

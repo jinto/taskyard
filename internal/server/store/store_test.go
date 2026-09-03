@@ -476,6 +476,201 @@ func TestOpenMigratesExistingRunsTable(t *testing.T) {
 	}
 }
 
+// ---- 종료 방식: 정착 상태, 취소, 세션·detail ----
+
+// stateEventWith는 stateEvent에 detail·session_id를 더한 종결 이벤트다.
+func stateEventWith(t *testing.T, runID string, seq uint64, state, detail, sessionID string) protocol.Envelope {
+	t.Helper()
+	body := map[string]any{"state": state, "detail": detail}
+	if sessionID != "" {
+		body["session_id"] = sessionID
+	}
+	env, err := protocol.NewEvent(protocol.EvRunStateChanged, runID, seq, map[string]any{"body": body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.Seq = seq
+	return env
+}
+
+func seedRunningTask(t *testing.T, s *Store) (Project, Task) {
+	t.Helper()
+	p := seedProject(t, s, "shop")
+	task := seedTask(t, s, p, "t")
+	if err := s.UpdateTaskStatus(task.ID, TaskInProgress); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertRun(Run{ID: "run-1", State: StateRunning, Kind: "structured", TaskID: task.ID, Stage: "execute"}); err != nil {
+		t.Fatal(err)
+	}
+	return p, task
+}
+
+func TestCancelledEventMovesTaskToBacklog(t *testing.T) {
+	s := openTemp(t)
+	p, task := seedRunningTask(t, s)
+
+	if _, _, err := s.ApplyEvent(stateEvent(t, "run-1", 1, StateCancelled)); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetTask(p.ID, task.Number)
+	if got.Status != TaskBacklog {
+		t.Fatalf("task status = %q, want backlog", got.Status)
+	}
+}
+
+func TestNeedsAttentionIsSettled(t *testing.T) {
+	s := openTemp(t)
+	p, task := seedRunningTask(t, s)
+
+	_, _, _ = s.ApplyEvent(stateEventWith(t, "run-1", 1, StateNeedsAttention, "CI가 반복 실패", ""))
+	// Reconcile이 보낸 더 새로운 running은 정착 상태를 되돌리지 못한다.
+	_, _, _ = s.ApplyEvent(stateEvent(t, "run-1", 2, StateRunning))
+
+	run, _ := s.GetRun("run-1")
+	if run.State != StateNeedsAttention || run.Detail != "CI가 반복 실패" {
+		t.Fatalf("run = %+v, want needs_attention with detail", run)
+	}
+	tk, _ := s.GetTask(p.ID, task.Number)
+	if tk.Status != TaskInProgress {
+		t.Fatalf("task status = %q, want in_progress (attention does not move the issue)", tk.Status)
+	}
+	if !IsSettled(StateNeedsAttention) || IsTerminal(StateNeedsAttention) {
+		t.Fatal("needs_attention must be settled but not terminal")
+	}
+}
+
+func TestStateEventRecordsDetailAndSessionID(t *testing.T) {
+	s := openTemp(t)
+	seedRun(t, s, "run-1")
+
+	_, _, _ = s.ApplyEvent(stateEventWith(t, "run-1", 1, StateSucceeded, "", "sess-1"))
+	run, _ := s.GetRun("run-1")
+	if run.ProviderSessionID != "sess-1" {
+		t.Fatalf("provider_session_id = %q, want sess-1", run.ProviderSessionID)
+	}
+
+	// 종결 → 종결: detail은 최신 사실로 바뀐다.
+	_, _, _ = s.ApplyEvent(stateEventWith(t, "run-1", 2, StateFailed, "나중에 실패", "sess-1"))
+	run, _ = s.GetRun("run-1")
+	if run.State != StateFailed || run.Detail != "나중에 실패" {
+		t.Fatalf("run = %+v", run)
+	}
+}
+
+func TestEmptySessionIDDoesNotClearKnownOne(t *testing.T) {
+	s := openTemp(t)
+	seedRun(t, s, "run-1")
+
+	_, _, _ = s.ApplyEvent(stateEventWith(t, "run-1", 1, StateRunning, "", "sess-1"))
+	_, _, _ = s.ApplyEvent(stateEventWith(t, "run-1", 2, StateFailed, "boom", ""))
+	run, _ := s.GetRun("run-1")
+	if run.ProviderSessionID != "sess-1" {
+		t.Fatalf("known session was cleared by an event without session_id: %+v", run)
+	}
+}
+
+func TestSettledToSettledApplies(t *testing.T) {
+	s := openTemp(t)
+	p, task := seedRunningTask(t, s)
+
+	_, _, _ = s.ApplyEvent(stateEventWith(t, "run-1", 1, StateNeedsAttention, "why", ""))
+	_, _, _ = s.ApplyEvent(stateEvent(t, "run-1", 2, StateCancelled))
+
+	run, _ := s.GetRun("run-1")
+	if run.State != StateCancelled {
+		t.Fatalf("state = %q, want cancelled", run.State)
+	}
+	tk, _ := s.GetTask(p.ID, task.Number)
+	if tk.Status != TaskBacklog {
+		t.Fatalf("task status = %q, want backlog", tk.Status)
+	}
+}
+
+func TestCancelSettledRunMovesNeedsAttentionToCancelled(t *testing.T) {
+	s := openTemp(t)
+	p, task := seedRunningTask(t, s)
+
+	// running: 러너에게 물어야 한다. 서버가 직접 바꾸지 않는다.
+	if err := s.CancelSettledRun("run-1"); !errors.Is(err, ErrNotCancellable) {
+		t.Fatalf("cancel running via store: err = %v, want ErrNotCancellable", err)
+	}
+
+	_, _, _ = s.ApplyEvent(stateEventWith(t, "run-1", 1, StateNeedsAttention, "why", "sess-1"))
+	if err := s.CancelSettledRun("run-1"); err != nil {
+		t.Fatalf("CancelSettledRun: %v", err)
+	}
+	run, _ := s.GetRun("run-1")
+	if run.State != StateCancelled || run.ProviderSessionID != "sess-1" {
+		t.Fatalf("run = %+v, want cancelled with session kept", run)
+	}
+	tk, _ := s.GetTask(p.ID, task.Number)
+	if tk.Status != TaskBacklog {
+		t.Fatalf("task status = %q, want backlog", tk.Status)
+	}
+
+	// 이미 종결된 Run은 취소할 것이 없다.
+	if err := s.CancelSettledRun("run-1"); !errors.Is(err, ErrNotCancellable) {
+		t.Fatalf("cancel cancelled: err = %v, want ErrNotCancellable", err)
+	}
+	if err := s.CancelSettledRun("nope"); !errors.Is(err, ErrRunNotFound) {
+		t.Fatalf("cancel unknown: err = %v, want ErrRunNotFound", err)
+	}
+}
+
+func TestRunNewFieldsRoundTrip(t *testing.T) {
+	s := openTemp(t)
+	in := Run{
+		ID: "run-2", State: StateQueued, Kind: "structured", TaskID: "t", Stage: "execute",
+		Detail: "d", PreviousRunID: "run-1", WorkspaceRunID: "run-1", Feedback: "다시 해봐",
+	}
+	if err := s.UpsertRun(in); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetRun("run-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Detail != "d" || got.PreviousRunID != "run-1" || got.WorkspaceRunID != "run-1" || got.Feedback != "다시 해봐" {
+		t.Fatalf("round trip lost fields: %+v", got)
+	}
+	runs, _ := s.RunsForTask("t")
+	if len(runs) != 1 || runs[0].Feedback != "다시 해봐" {
+		t.Fatalf("RunsForTask lost fields: %+v", runs)
+	}
+}
+
+func TestOpenMigratesNewRunColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pr3.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// PR #3 시점의 runs 스키마.
+	if _, err := db.Exec(`CREATE TABLE runs (
+	  id TEXT PRIMARY KEY, state TEXT NOT NULL, kind TEXT NOT NULL,
+	  provider_session_id TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL DEFAULT '',
+	  worktree_path TEXT NOT NULL DEFAULT '', last_acked_seq INTEGER NOT NULL DEFAULT 0,
+	  reconcile_state TEXT NOT NULL DEFAULT '', task_id TEXT NOT NULL DEFAULT '',
+	  stage TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0);
+	  INSERT INTO runs (id, state, kind) VALUES ('run-old', 'succeeded', 'structured');`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on PR #3 schema: %v", err)
+	}
+	defer s.Close()
+	if _, err := s.GetRun("run-old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertRun(Run{ID: "run-new", State: StateQueued, Kind: "structured", PreviousRunID: "run-old", Feedback: "f"}); err != nil {
+		t.Fatalf("UpsertRun with new columns: %v", err)
+	}
+}
+
 func TestOpenIsIdempotentOnCurrentSchema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cur.db")
 	s1, err := Open(path)

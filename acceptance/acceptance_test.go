@@ -68,7 +68,19 @@ func initRepo(t *testing.T, repo string) {
 	}
 }
 
+// defaultAgentScript는 README.md에 한 줄을 덧붙이고 fixture를 뱉는 가짜 Agent다.
+// 이 Run은 base 대비 실제 diff를 남기므로, Diff 회수를 검증하는 판정이 빈
+// 문자열이 아니라 실제 변경을 보고 확인한다. FIXTURE는 newStackWith가 채운다.
+const defaultAgentScript = "#!/bin/sh\necho agent-work >> README.md\ncat FIXTURE\n"
+
 func newStack(t *testing.T, dbDir string) *stack {
+	t.Helper()
+	return newStackWith(t, dbDir, defaultAgentScript)
+}
+
+// newStackWith는 가짜 Agent 스크립트를 바꿔 끼운다. 스크립트 안의 FIXTURE는
+// pong fixture의 절대 경로로 치환된다.
+func newStackWith(t *testing.T, dbDir, script string) *stack {
 	t.Helper()
 
 	st, err := store.Open(filepath.Join(dbDir, "server.db"))
@@ -105,11 +117,8 @@ func newStack(t *testing.T, dbDir string) *stack {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// README.md에 한 줄을 덧붙여, 이 fake Agent가 실행된 Run은 base 대비
-	// 실제 diff를 남기게 한다 — Diff 회수를 검증하는 판정(트리거 테스트)이
-	// 빈 문자열이 아니라 실제 변경을 보고 확인한다.
 	fake := filepath.Join(dbDir, "fake-claude")
-	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho agent-work >> README.md\ncat "+abs+"\n"), 0o755); err != nil {
+	if err := os.WriteFile(fake, []byte(strings.ReplaceAll(script, "FIXTURE", abs)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -678,4 +687,226 @@ func TestIssueRunWithoutRunnerLeavesTaskInBacklog(t *testing.T) {
 	if len(runs) != 1 || runs[0].State != store.StateFailed {
 		t.Fatalf("runs = %+v, want one failed run", runs)
 	}
+}
+
+// ---- 종료 방식 (PRD §7.6) ----
+
+// runIDFrom은 303 응답의 Location에서 run id를 꺼낸다.
+func runIDFrom(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	loc := rec.Header().Get("Location")
+	id := strings.TrimPrefix(loc, "/runs/")
+	if rec.Code != http.StatusSeeOther || id == "" || id == loc {
+		t.Fatalf("status = %d location = %q body = %s", rec.Code, loc, rec.Body.String())
+	}
+	return id
+}
+
+// waitRunState는 서버 원장의 runs.state가 want가 될 때까지 기다린다.
+func waitRunState(t *testing.T, s *stack, runID, want string) {
+	t.Helper()
+	waitFor(t, "runs.state = "+want, func() bool {
+		run, err := s.st.GetRun(runID)
+		return err == nil && run.State == want
+	})
+}
+
+// startFor는 러너가 받은 명령 중 runID의 run.start를 찾는다.
+func startFor(t *testing.T, s *stack, runID string) protocol.RunStartBody {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case env := <-s.cmds:
+			if env.Type == protocol.CmdRunStart && env.RunID == runID {
+				var body protocol.RunStartBody
+				if err := json.Unmarshal(env.Body, &body); err != nil {
+					t.Fatal(err)
+				}
+				return body
+			}
+		case <-deadline:
+			t.Fatalf("runner never received run.start for %s", runID)
+		}
+	}
+}
+
+func taskOf(t *testing.T, s *stack) store.Task {
+	t.Helper()
+	p, err := s.st.GetProject("shop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := s.st.GetTask(p.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return task
+}
+
+// TestCancelRunningRunReturnsIssueToBacklog: 실행 중인 Run을 [취소]하면
+// cancelled로 끝나고(뒤따르는 failed 없음), 이슈는 backlog로 돌아간다.
+func TestCancelRunningRunReturnsIssueToBacklog(t *testing.T) {
+	dir := t.TempDir()
+	s := newStackWith(t, dir, "#!/bin/sh\nsleep 30\n")
+	uiServer, err := web.New(s.st, s.hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ui := uiServer.Routes()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.link.Run(ctx)
+	waitFor(t, "runner connection", s.hub.Connected)
+	createProjectAndIssue(t, ui, filepath.Join(dir, "repo"))
+
+	runID := runIDFrom(t, postForm(ui, "/projects/shop/issues/1/run", nil))
+	waitRunState(t, s, runID, store.StateRunning)
+
+	rec := postForm(ui, "/runs/"+runID+"/cancel", nil)
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/projects/shop/issues/1" {
+		t.Fatalf("cancel: status = %d location = %q", rec.Code, rec.Header().Get("Location"))
+	}
+	waitRunState(t, s, runID, store.StateCancelled)
+	// 러너 원장의 종결 기록(PID 채워짐)이 보이면 execute의 종결 switch가 끝난
+	// 것이다. 뒤따를 failed가 있었다면 그 전에 발행됐고 spool을 거쳐 서버에
+	// 도착했을 테니, 서버 이벤트를 한 번 더 기다린 뒤 확인한다.
+	waitFor(t, "runner ledger settled", func() bool {
+		ledger, _ := s.sp.LoadRuns()
+		return len(ledger) == 1 && ledger[0].State == "cancelled" && ledger[0].PID != 0
+	})
+	waitFor(t, "spool drained", func() bool {
+		n, err := s.sp.Pending(runID)
+		return err == nil && n == 0
+	})
+
+	run, _ := s.st.GetRun(runID)
+	if run.State != store.StateCancelled {
+		t.Fatalf("run state = %q after settling, want cancelled", run.State)
+	}
+	events, _ := s.st.Events(runID, 0, 100)
+	for _, env := range events {
+		if env.Type == protocol.EvRunStateChanged {
+			if state, _ := stateOf(t, env); state == store.StateFailed {
+				t.Fatal("a failed event followed the cancellation")
+			}
+		}
+	}
+	if task := taskOf(t, s); task.Status != store.TaskBacklog {
+		t.Fatalf("task status = %q, want backlog", task.Status)
+	}
+	ledger, _ := s.sp.LoadRuns()
+	if len(ledger) != 1 || ledger[0].State != "cancelled" {
+		t.Fatalf("runner ledger = %+v, want cancelled", ledger)
+	}
+}
+
+// TestAttentionThenContinueRetryReusesWorktree: 에이전트가 멈추고 보고하면
+// needs_attention이 되고, 이어서 재시도는 같은 worktree와 세션으로 새 Run을
+// 돌려 끝까지 간다.
+func TestAttentionThenContinueRetryReusesWorktree(t *testing.T) {
+	dir := t.TempDir()
+	// 첫 실행만 attention 파일을 남긴다(MARK로 구분). 두 번째는 정상 성공.
+	mark := filepath.Join(dir, "first-run-done")
+	script := "#!/bin/sh\nif [ ! -f " + mark + " ]; then touch " + mark + "; mkdir -p .taskyard; printf 'CI가 반복 실패한다\\n' > .taskyard/attention.md; fi\necho agent-work >> README.md\ncat FIXTURE\n"
+	s := newStackWith(t, dir, script)
+	uiServer, err := web.New(s.st, s.hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ui := uiServer.Routes()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.link.Run(ctx)
+	waitFor(t, "runner connection", s.hub.Connected)
+	createProjectAndIssue(t, ui, filepath.Join(dir, "repo"))
+
+	first := runIDFrom(t, postForm(ui, "/projects/shop/issues/1/run", nil))
+	startFor(t, s, first)
+	waitRunState(t, s, first, store.StateNeedsAttention)
+
+	run, _ := s.st.GetRun(first)
+	const fixtureSession = "00000000-0000-0000-0000-000000000001"
+	if !strings.Contains(run.Detail, "CI가 반복 실패한다") || run.ProviderSessionID != fixtureSession {
+		t.Fatalf("first run = %+v, want attention detail and the fixture session", run)
+	}
+	if task := taskOf(t, s); task.Status != store.TaskInProgress {
+		t.Fatalf("task status = %q, want in_progress while attention is pending", task.Status)
+	}
+	page := get(ui, "/projects/shop/issues/1")
+	for _, want := range []string{"CI가 반복 실패한다", `action="/runs/` + first + `/retry"`, `value="continue"`} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("issue page lacks %q:\n%s", want, page)
+		}
+	}
+
+	second := runIDFrom(t, postForm(ui, "/runs/"+first+"/retry", url.Values{"mode": {"continue"}, "feedback": {"캐시를 지우고 다시"}}))
+	body := startFor(t, s, second)
+	if body.WorkspaceRunID != first || body.ResumeSessionID != fixtureSession {
+		t.Fatalf("retry body workspace=%q resume=%q, want %s / %s", body.WorkspaceRunID, body.ResumeSessionID, first, fixtureSession)
+	}
+	for _, want := range []string{"CI가 반복 실패한다", "캐시를 지우고 다시", "이전 실행 " + first} {
+		if !strings.Contains(body.Prompt, want) {
+			t.Fatalf("retry prompt lacks %q:\n%s", want, body.Prompt)
+		}
+	}
+
+	waitRunState(t, s, second, store.StateSucceeded)
+	if task := taskOf(t, s); task.Status != store.TaskReview {
+		t.Fatalf("task status = %q, want review", task.Status)
+	}
+
+	// worktree는 하나뿐이고(둘째가 첫째의 것을 씀), attention 파일은 사라졌다.
+	ledger, _ := s.sp.LoadRuns()
+	for _, rec := range ledger {
+		if rec.RunID == second && rec.WorkspaceRunID != first {
+			t.Fatalf("second run ledger = %+v, want workspace %s", rec, first)
+		}
+	}
+	if _, err := os.Stat(s.git.WorktreePath(second)); err == nil {
+		t.Fatal("the retry created a second worktree instead of reusing the first")
+	}
+	if _, err := os.Stat(filepath.Join(s.git.WorktreePath(first), ".taskyard", "attention.md")); err == nil {
+		t.Fatal("attention.md survived the retry")
+	}
+}
+
+// TestContinueRetryWithoutSessionIsRefused: 세션 없이 실패한 Run은 이어갈 수
+// 없다. 409이고 Run은 생기지 않는다.
+func TestContinueRetryWithoutSessionIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	noInit, err := filepath.Abs("../internal/runner/lifecycle/testdata/session-no-init.ndjson")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newStackWith(t, dir, "#!/bin/sh\ncat "+noInit+"\n")
+	uiServer, err := web.New(s.st, s.hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ui := uiServer.Routes()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.link.Run(ctx)
+	waitFor(t, "runner connection", s.hub.Connected)
+	createProjectAndIssue(t, ui, filepath.Join(dir, "repo"))
+
+	first := runIDFrom(t, postForm(ui, "/projects/shop/issues/1/run", nil))
+	waitRunState(t, s, first, store.StateFailed)
+
+	if rec := postForm(ui, "/runs/"+first+"/retry", url.Values{"mode": {"continue"}}); rec.Code != http.StatusConflict {
+		t.Fatalf("continue without a session: status = %d, want 409", rec.Code)
+	}
+	if runs, _ := s.st.RunsForTask(taskOf(t, s).ID); len(runs) != 1 {
+		t.Fatalf("runs = %d, want 1 (refusal must not create a run)", len(runs))
+	}
+}
+
+func get(h http.Handler, path string) string {
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	return rec.Body.String()
 }

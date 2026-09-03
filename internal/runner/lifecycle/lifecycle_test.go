@@ -3,6 +3,7 @@ package lifecycle_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -773,6 +774,262 @@ func TestSecondRunStartWhileBusyFails(t *testing.T) {
 		}
 		return false
 	})
+}
+
+// ---- 종료 방식: workspace 재사용, --resume, attention 파일, 취소 이벤트 ----
+
+type stateView struct{ state, detail, sessionID string }
+
+// stateEventsOf는 한 Run의 run.state_changed를 순서대로 풀어낸다.
+func stateEventsOf(t *testing.T, col *collector, runID string) []stateView {
+	t.Helper()
+	var out []stateView
+	for _, e := range col.snapshot() {
+		if e.RunID != runID || e.Type != protocol.EvRunStateChanged {
+			continue
+		}
+		var wrapper struct {
+			Body map[string]any `json:"body"`
+		}
+		if err := json.Unmarshal(e.Body, &wrapper); err != nil {
+			t.Fatal(err)
+		}
+		s, _ := wrapper.Body["state"].(string)
+		d, _ := wrapper.Body["detail"].(string)
+		sid, _ := wrapper.Body["session_id"].(string)
+		out = append(out, stateView{s, d, sid})
+	}
+	return out
+}
+
+func lastState(t *testing.T, col *collector, runID string) stateView {
+	t.Helper()
+	states := stateEventsOf(t, col, runID)
+	if len(states) == 0 {
+		t.Fatalf("no state events for %s", runID)
+	}
+	return states[len(states)-1]
+}
+
+// attentionThenPong은 worktree에 attention 파일을 쓰고 정상 종료하는 가짜 Agent다.
+func attentionThenPong(t *testing.T, reason string, exitCode int) string {
+	t.Helper()
+	abs, err := filepath.Abs(pongFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "attention-claude")
+	script := "#!/bin/sh\nmkdir -p .taskyard\nprintf '%s\\n' '" + reason + "' > .taskyard/attention.md\ncat " + abs + "\nexit " + fmt.Sprint(exitCode) + "\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestRunStartReusesWorkspaceOfPreviousRun(t *testing.T) {
+	col := &collector{}
+	h := newHarness(t, col)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := h.m.HandleCommand(ctx, h.start(t, "run-1", "first")); err != nil {
+		t.Fatal(err)
+	}
+	waitTerminal(t, col)
+	// run-1의 worktree에 흔적을 남긴다. 이어서 재시도는 이것을 봐야 한다.
+	if err := os.WriteFile(filepath.Join(h.git.WorktreePath("run-1"), "left-behind.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := startCommand(t, "run-2", protocol.RunStartBody{Prompt: "second", RepoPath: h.repo, WorkspaceRunID: "run-1"})
+	if err := h.m.HandleCommand(ctx, cmd); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "run-2 terminal", func() bool {
+		s := stateEventsOf(t, col, "run-2")
+		return len(s) >= 2
+	})
+
+	if _, err := os.Stat(h.git.WorktreePath("run-2")); err == nil {
+		t.Fatal("run-2 created its own worktree instead of reusing run-1's")
+	}
+	if _, err := os.Stat(filepath.Join(h.git.WorktreePath("run-1"), "left-behind.txt")); err != nil {
+		t.Fatal("run-1's worktree was not the one used")
+	}
+	var rec2 spool.RunRecord
+	for _, r := range mustLoadRuns(t, h.sp) {
+		if r.RunID == "run-2" {
+			rec2 = r
+		}
+	}
+	if rec2.WorkspaceRunID != "run-1" || rec2.WorktreePath != h.git.WorktreePath("run-1") || rec2.Branch != "taskyard/run/run-1" {
+		t.Fatalf("run-2 record = %+v, want workspace of run-1", rec2)
+	}
+}
+
+func TestRunStartPassesResumeSessionID(t *testing.T) {
+	col := &collector{}
+	argsFile := filepath.Join(t.TempDir(), "args")
+	h := newHarness(t, col, withBinary(fakeClaudeRecording(t, pongFixture, argsFile)))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cmd := startCommand(t, "run-1", protocol.RunStartBody{Prompt: "go on", RepoPath: h.repo, ResumeSessionID: "sess-x"})
+	if err := h.m.HandleCommand(ctx, cmd); err != nil {
+		t.Fatal(err)
+	}
+	waitTerminal(t, col)
+
+	raw, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Split(strings.TrimRight(string(raw), "\x00"), "\x00")
+	found := false
+	for i, a := range args {
+		if a == "--resume" && i+1 < len(args) && args[i+1] == "sess-x" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("agent args lack --resume sess-x: %q", args)
+	}
+}
+
+func TestAttentionFileEndsRunAsNeedsAttention(t *testing.T) {
+	col := &collector{}
+	h := newHarness(t, col, withBinary(attentionThenPong(t, "CI가 세 번 실패했고 원인을 모르겠다", 0)))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := h.m.HandleCommand(ctx, h.start(t, "run-1", "do it")); err != nil {
+		t.Fatal(err)
+	}
+	waitTerminal(t, col)
+
+	last := lastState(t, col, "run-1")
+	if last.state != "needs_attention" {
+		t.Fatalf("last state = %+v, want needs_attention", last)
+	}
+	if !strings.Contains(last.detail, "원인을 모르겠다") {
+		t.Fatalf("detail = %q, want the attention reason", last.detail)
+	}
+	if last.sessionID != "00000000-0000-0000-0000-000000000001" {
+		t.Fatalf("terminal event session_id = %q, want the fixture's", last.sessionID)
+	}
+	if rec := loadOnlyRun(t, h.sp); rec.State != "needs_attention" {
+		t.Fatalf("ledger = %+v, want needs_attention", rec)
+	}
+	if _, err := os.Stat(filepath.Join(h.git.WorktreePath("run-1"), ".taskyard", "attention.md")); err == nil {
+		t.Fatal("attention.md was left behind; a continue-retry would trip on it")
+	}
+}
+
+func TestAttentionFileIsIgnoredWhenAgentFails(t *testing.T) {
+	col := &collector{}
+	h := newHarness(t, col, withBinary(attentionThenPong(t, "reason", 1)))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := h.m.HandleCommand(ctx, h.start(t, "run-1", "do it")); err != nil {
+		t.Fatal(err)
+	}
+	waitTerminal(t, col)
+
+	if last := lastState(t, col, "run-1"); last.state != "failed" {
+		t.Fatalf("last state = %+v, want failed (failure outranks attention)", last)
+	}
+}
+
+func TestAttentionSymlinkEscapeIsIgnored(t *testing.T) {
+	col := &collector{}
+	h := newHarness(t, col)
+
+	secret := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(secret, []byte("SECRET\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(h.repo, ".taskyard"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(h.repo, ".taskyard", "attention.md")); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+	gitIn(t, h.repo, "add", ".taskyard")
+	gitIn(t, h.repo, "commit", "-q", "-m", "symlinked attention")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := h.m.HandleCommand(ctx, h.start(t, "run-1", "do it")); err != nil {
+		t.Fatal(err)
+	}
+	waitTerminal(t, col)
+
+	if last := lastState(t, col, "run-1"); last.state != "succeeded" || strings.Contains(last.detail, "SECRET") {
+		t.Fatalf("last state = %+v, want plain succeeded", last)
+	}
+}
+
+func TestCancelledRunEndsAsCancelledNotFailed(t *testing.T) {
+	col := &collector{}
+	sleeper := filepath.Join(t.TempDir(), "sleeper")
+	if err := os.WriteFile(sleeper, []byte("#!/bin/sh\nsleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h := newHarness(t, col, withBinary(sleeper))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := h.m.HandleCommand(ctx, h.start(t, "run-1", "wait")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "pid recorded", func() bool {
+		runs, _ := h.sp.LoadRuns()
+		return len(runs) == 1 && runs[0].PID != 0
+	})
+	cancelCmd, err := protocol.NewCommand(protocol.CmdRunCancel, "run-1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.HandleCommand(ctx, cancelCmd); err != nil {
+		t.Fatal(err)
+	}
+	// execute의 종결 기록은 PID를 채운다(handleRunCancel의 기록은 PID 0).
+	// 그것이 보이면 종결 switch가 끝난 것이라, 뒤따를 이벤트가 있다면 이미 왔다.
+	waitFor(t, "execute to finish after process death", func() bool {
+		rec := loadOnlyRun(t, h.sp)
+		return rec.State == "cancelled" && rec.PID != 0
+	})
+
+	states := stateEventsOf(t, col, "run-1")
+	if last := states[len(states)-1]; last.state != "cancelled" {
+		t.Fatalf("last state = %+v, want cancelled", last)
+	}
+	for _, s := range states {
+		if s.state == "failed" {
+			t.Fatalf("a failed event was emitted for a cancelled run: %+v", states)
+		}
+	}
+	if rec := loadOnlyRun(t, h.sp); rec.State != "cancelled" {
+		t.Fatalf("ledger = %+v, want cancelled", rec)
+	}
+}
+
+func TestTerminalStateEventCarriesSessionID(t *testing.T) {
+	col := &collector{}
+	h := newHarness(t, col)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := h.m.HandleCommand(ctx, h.start(t, "run-1", "say pong")); err != nil {
+		t.Fatal(err)
+	}
+	waitTerminal(t, col)
+
+	last := lastState(t, col, "run-1")
+	if last.state != "succeeded" || last.sessionID != "00000000-0000-0000-0000-000000000001" {
+		t.Fatalf("last state = %+v, want succeeded with the fixture session id", last)
+	}
 }
 
 func mustLoadRuns(t *testing.T, sp *spool.Spool) []spool.RunRecord {

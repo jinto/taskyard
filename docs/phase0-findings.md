@@ -25,9 +25,9 @@
 재전송이 커짐 → 다음 패스가 더 느려짐. **정상 성공 경로에서 악화되는 유일한 항목.**
 `CmdRunReconcile`은 같은 이유로 이미 고루틴으로 뺐다. `Ensure`는 남아 있다.
 
-### 2. `ErrRunNotFound` livelock — C1 트리거를 배선하면서 도달 가능해졌다
-`store.ApplyEvent`가 `ErrRunNotFound`를 반환하면 `hub.readLoop`이 **ack 없이**
-로그만 남기고 넘어간다. `link.drain`은 seq 0부터 전체 창을 다시 읽는다. 아무도 트림하지
+### 2. `ErrRunNotFound` livelock — 해소 (종료 방식 PR: 원장에 없는 Run의 이벤트는 그 seq를 ack하고 버린다)
+Phase 0에서는 `store.ApplyEvent`가 `ErrRunNotFound`를 반환하면 `hub.readLoop`이 **ack 없이**
+로그만 남기고 넘어갔다. `link.drain`은 seq 0부터 전체 창을 다시 읽는다. 아무도 트림하지
 않아 spool이 무한히 자라고 같은 이벤트를 영원히 재전송한다. poison-message 경로도,
 dead-letter도, 유계 재시도도 없다.
 - 진입 경로: `lifecycle.runIDForApproval()`이 활성 run이 없을 때 문자열 `"unknown"`을 반환

@@ -4,16 +4,45 @@
 
 {{if .Task.Body}}<pre class="body">{{.Task.Body}}</pre>{{end}}
 
+{{if or (not .HasLatest) .LatestSettled}}
 <form method="post" action="/projects/{{.Project.Key}}/issues/{{.Task.Number}}/run" class="form">
   <button type="submit">실행</button>
-  <span class="state">프로젝트의 실행 템플릿으로 에이전트를 새 세션에서 띄웁니다.</span>
+  <span class="state">프로젝트의 실행 템플릿으로 에이전트를 새 세션에서 띄웁니다{{if .HasLatest}} (이전 실행 맥락 없이){{end}}.</span>
 </form>
+{{end}}
+{{if not .HasLatest}}
+{{else if .LatestSettled}}
+  {{if .Latest.Detail}}
+  <div class="approval">
+    <div class="state">{{.Latest.ID}} · {{.Latest.State}}</div>
+    <pre class="body">{{.Latest.Detail}}</pre>
+  </div>
+  {{end}}
+  <form method="post" action="/runs/{{.Latest.ID}}/retry" class="form">
+    <label><input type="radio" name="mode" value="continue"{{if .LatestResumable}} checked{{else}} disabled{{end}}> 이어서 재시도 — 같은 worktree, 같은 세션{{if not .LatestResumable}} (이어갈 세션 없음){{end}}</label>
+    <label><input type="radio" name="mode" value="fresh"{{if not .LatestResumable}} checked{{end}}> 처음부터 재시도 — 새 worktree, 새 세션</label>
+    <label>메모 <input type="text" name="feedback" placeholder="에이전트에게 남길 한 줄"></label>
+    <button type="submit">재시도</button>
+  </form>
+  {{if .LatestCancellable}}
+  <form method="post" action="/runs/{{.Latest.ID}}/cancel" class="form">
+    <button type="submit">취소</button>
+    <span class="state">이슈를 backlog로 되돌립니다. worktree는 보존됩니다.</span>
+  </form>
+  {{end}}
+{{else}}
+<form method="post" action="/runs/{{.Latest.ID}}/cancel" class="form">
+  <button type="submit">취소</button>
+  <span class="state">{{.Latest.ID}} · {{.Latest.State}} — 프로세스를 멈추고 미커밋 변경을 보존합니다.</span>
+</form>
+{{end}}
 
 <h2>실행</h2>
 {{range .Runs}}
   <div class="run">
     <a href="/runs/{{.ID}}">{{.ID}}</a>
-    <div class="state">{{.State}} · {{.Stage}} · {{.CreatedAt.Format "2006-01-02 15:04:05"}}{{if .Branch}} · {{.Branch}}{{end}}</div>
+    <div class="state">{{.State}} · {{.Stage}} · {{.CreatedAt.Format "2006-01-02 15:04:05"}}{{if .Branch}} · {{.Branch}}{{end}}{{if .PreviousRunID}} · ← {{.PreviousRunID}}{{end}}</div>
+    {{if .Detail}}<div class="state">{{.Detail}}</div>{{end}}
   </div>
 {{else}}
   <p class="state">아직 실행이 없습니다.</p>

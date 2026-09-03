@@ -41,6 +41,19 @@ func IssueText(number int, title, body string) string {
 	return head + "\n\n" + body
 }
 
+// PreviousRunText는 {{previous_run}}에 들어갈 본문이다(PRD §7.6). 첫 실행이면
+// 빈 문자열 — 템플릿의 그 자리가 비어 에이전트가 무시한다.
+func PreviousRunText(id, state, detail string) string {
+	if id == "" {
+		return ""
+	}
+	head := fmt.Sprintf("이전 실행 %s: %s", id, state)
+	if detail == "" {
+		return head
+	}
+	return head + "\n" + detail
+}
+
 // DefaultExecuteTemplate은 프로젝트를 만들 때 채워지는 범용 실행 템플릿이다.
 // 특정 사용자의 스킬에 의존하지 않는다. 프로젝트 설정에서 덮어쓴다.
 const DefaultExecuteTemplate = `다음 이슈를 해결하라.
@@ -57,9 +70,13 @@ const DefaultExecuteTemplate = `다음 이슈를 해결하라.
 4. 의미 단위로 커밋한다. 커밋 메시지에 이슈 번호를 넣는다.
 5. ` + "`gh pr create`" + `로 PR을 연다. 본문에 무엇을 왜 바꿨는지 적는다.
 
-멈추고 보고해야 하는 경우 — 계속 시도하지 말고 이유를 마지막 메시지에 남긴 뒤 종료하라:
+멈추고 보고해야 하는 경우 — 계속 시도하지 말고, 이유를 ` + "`.taskyard/attention.md`" + ` 파일에 쓴 뒤 정상 종료하라. 사람이 읽고 다음 행동을 정한다:
 - 테스트나 CI가 반복 실패하고 원인을 모르겠을 때
 - 이슈가 요구하는 것이 코드베이스와 모순되거나 제품 동작을 바꿔야 할 때
 - 데이터 손실, 비가역 마이그레이션, 보안, 비용에 영향이 있는 결정이 필요할 때
 - 범위가 이슈보다 크게 커질 때
+
+재시도라면 아래에 이전 실행의 결과와 사람의 메모가 있다. 비어 있으면 첫 실행이니 무시하라.
+{{previous_run}}
+{{feedback}}
 `

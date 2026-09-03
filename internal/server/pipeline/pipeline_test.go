@@ -58,6 +58,26 @@ func TestIssueTextWithAndWithoutBody(t *testing.T) {
 	}
 }
 
+func TestPreviousRunTextFormats(t *testing.T) {
+	if got := PreviousRunText("", "", ""); got != "" {
+		t.Fatalf("first run should render empty, got %q", got)
+	}
+	if got := PreviousRunText("run-1", "failed", ""); got != "이전 실행 run-1: failed" {
+		t.Fatalf("without detail = %q", got)
+	}
+	if got := PreviousRunText("run-1", "needs_attention", "CI가 반복 실패"); got != "이전 실행 run-1: needs_attention\nCI가 반복 실패" {
+		t.Fatalf("with detail = %q", got)
+	}
+}
+
+func TestDefaultTemplateMentionsAttentionFileAndRetryTokens(t *testing.T) {
+	for _, want := range []string{".taskyard/attention.md", "{{previous_run}}", "{{feedback}}"} {
+		if !strings.Contains(DefaultExecuteTemplate, want) {
+			t.Errorf("DefaultExecuteTemplate lacks %q", want)
+		}
+	}
+}
+
 func TestDefaultTemplateMentionsIssueAndMemory(t *testing.T) {
 	for _, token := range []string{"{{issue}}", "{{memory}}"} {
 		if !strings.Contains(DefaultExecuteTemplate, token) {
