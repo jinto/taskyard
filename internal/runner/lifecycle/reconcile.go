@@ -94,7 +94,7 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 			} else {
 				m.salvage(rec.RunID, wsID, git)
 			}
-			m.emitTerminal(rec.RunID, "failed", "reconciled: session lost, work salvaged", rec.SessionID)
+			m.emitTerminal(rec.RunID, "failed", "reconciled: session lost, work salvaged", rec.SessionID, "")
 
 			rec.State = "failed"
 			if err := m.cfg.Spool.SaveRun(rec); err != nil {

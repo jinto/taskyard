@@ -154,6 +154,7 @@ type harness struct {
 	worktrees string
 	git       *gitops.Manager // repo의 관리자
 	broker    *approval.Broker
+	cfg       lifecycle.Config
 }
 
 type harnessOpt func(*harnessOpts)
@@ -162,11 +163,19 @@ type harnessOpts struct {
 	binary     string
 	extraRepos []string
 	baseBranch string
+	gh         string
+	prPoll     time.Duration
+	origin     bool
 }
 
-func withBinary(path string) harnessOpt   { return func(o *harnessOpts) { o.binary = path } }
-func withRepos(paths ...string) harnessOpt { return func(o *harnessOpts) { o.extraRepos = paths } }
-func withBaseBranch(b string) harnessOpt   { return func(o *harnessOpts) { o.baseBranch = b } }
+func withBinary(path string) harnessOpt     { return func(o *harnessOpts) { o.binary = path } }
+func withRepos(paths ...string) harnessOpt  { return func(o *harnessOpts) { o.extraRepos = paths } }
+func withBaseBranch(b string) harnessOpt    { return func(o *harnessOpts) { o.baseBranch = b } }
+func withGH(path string) harnessOpt         { return func(o *harnessOpts) { o.gh = path } }
+func withPRPoll(d time.Duration) harnessOpt { return func(o *harnessOpts) { o.prPoll = d } }
+
+// withOrigin은 첫 저장소에 bare 저장소를 origin으로 붙인다 — push가 진짜로 돈다.
+func withOrigin() harnessOpt { return func(o *harnessOpts) { o.origin = true } }
 
 func newHarness(t *testing.T, col *collector, opts ...harnessOpt) *harness {
 	t.Helper()
@@ -178,6 +187,11 @@ func newHarness(t *testing.T, col *collector, opts ...harnessOpt) *harness {
 	repo, worktrees := newRepo(t)
 	if o.binary == "" {
 		o.binary = fakeClaude(t, pongFixture)
+	}
+	if o.origin {
+		bare := filepath.Join(filepath.Dir(repo), "origin.git")
+		gitIn(t, filepath.Dir(repo), "init", "-q", "--bare", bare)
+		gitIn(t, repo, "remote", "add", "origin", bare)
 	}
 
 	sp, err := spool.Open(filepath.Join(t.TempDir(), "spool.db"))
@@ -196,20 +210,34 @@ func newHarness(t *testing.T, col *collector, opts ...harnessOpt) *harness {
 	}
 
 	broker := approval.New("tok")
-	m, err := lifecycle.New(lifecycle.Config{
-		Spool:        sp,
-		Repos:        repos,
-		Broker:       broker,
-		BaseBranch:   o.baseBranch,
-		BrokerURL:    "http://127.0.0.1:9999/mcp",
-		BrokerToken:  "tok",
-		ClaudeBinary: o.binary,
-		Publish:      col.publish,
-	})
+	cfg := lifecycle.Config{
+		Spool:          sp,
+		Repos:          repos,
+		Broker:         broker,
+		BaseBranch:     o.baseBranch,
+		BrokerURL:      "http://127.0.0.1:9999/mcp",
+		BrokerToken:    "tok",
+		ClaudeBinary:   o.binary,
+		GHBinary:       o.gh,
+		PRPollInterval: o.prPoll,
+		Publish:        col.publish,
+	}
+	m, err := lifecycle.New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &harness{m: m, sp: sp, repos: repos, repo: repo, worktrees: worktrees, git: git, broker: broker}
+	return &harness{m: m, sp: sp, repos: repos, repo: repo, worktrees: worktrees, git: git, broker: broker, cfg: cfg}
+}
+
+// restart는 같은 spool·저장소로 Manager를 새로 만든다 — 러너 재시작.
+func (h *harness) restart(t *testing.T) *lifecycle.Manager {
+	t.Helper()
+	m, err := lifecycle.New(h.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.m = m
+	return m
 }
 
 // start는 이 harness의 첫 저장소를 가리키는 run.start 명령이다.
@@ -965,8 +993,13 @@ func TestAttentionFileIsIgnoredWhenAgentFails(t *testing.T) {
 	}
 	waitTerminal(t, col)
 
-	if last := lastState(t, col, "run-1"); last.state != "failed" {
+	last := lastState(t, col, "run-1")
+	if last.state != "failed" {
 		t.Fatalf("last state = %+v, want failed (failure outranks attention)", last)
+	}
+	// 메모는 버리지 않고 detail에 덧붙인다.
+	if !strings.Contains(last.detail, "reason") {
+		t.Fatalf("detail = %q, want the attention note appended", last.detail)
 	}
 }
 

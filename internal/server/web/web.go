@@ -126,6 +126,8 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 		RepoPath:        r.FormValue("repo_path"),
 		DefaultBranch:   r.FormValue("default_branch"),
 		ExecuteTemplate: pipeline.DefaultExecuteTemplate,
+		CreatePR:        r.FormValue("create_pr") != "",
+		CleanupMerged:   r.FormValue("cleanup_merged") != "",
 	}
 	switch {
 	case !keyPattern.MatchString(p.Key):
@@ -188,7 +190,13 @@ func (s *Server) handleTemplateUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "허용 도구 형식이 잘못됐습니다: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := s.st.UpdateProjectSettings(p.Key, r.FormValue("execute_template"), tools); err != nil {
+	// 체크박스는 안 보내면 false — 폼이 항상 두 필드를 다루므로 그대로 저장한다.
+	if err := s.st.UpdateProjectSettings(p.Key, store.ProjectSettings{
+		ExecuteTemplate: r.FormValue("execute_template"),
+		AllowedTools:    tools,
+		CreatePR:        r.FormValue("create_pr") != "",
+		CleanupMerged:   r.FormValue("cleanup_merged") != "",
+	}); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -233,7 +241,7 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 	// 재시도 폼(과 needs_attention이면 [취소]도), 없으면 [실행].
 	data := map[string]any{
 		"Title": fmt.Sprintf("#%d %s", task.Number, task.Title), "Project": p, "Task": task, "Runs": runs,
-		"HasLatest": len(runs) > 0,
+		"HasLatest": len(runs) > 0, "Done": task.Status == store.TaskDone,
 	}
 	if len(runs) > 0 {
 		latest := runs[0]
@@ -302,6 +310,15 @@ func (s *Server) launch(w http.ResponseWriter, r *http.Request, p store.Project,
 		"feedback":     l.feedback,
 	})
 
+	// PR은 러너가 만든다(GH-05). 제목은 이슈 제목, 본문은 에이전트의 변경
+	// 설명이 없을 때의 대체 — 이슈 번호·Run·이슈 본문. 러너는 이슈를 모른다.
+	var pr *protocol.PRSpec
+	if p.CreatePR {
+		pr = &protocol.PRSpec{
+			Title: task.Title,
+			Body:  fmt.Sprintf("Taskyard 이슈 #%d · Run %s\n\n%s", task.Number, runID, task.Body),
+		}
+	}
 	cmd, err := protocol.NewCommand(protocol.CmdRunStart, runID, protocol.RunStartBody{
 		Prompt:          prompt,
 		RepoPath:        p.RepoPath,
@@ -309,6 +326,8 @@ func (s *Server) launch(w http.ResponseWriter, r *http.Request, p store.Project,
 		WorkspaceRunID:  wsID,
 		ResumeSessionID: l.resumeSession,
 		AllowedTools:    p.AllowedTools,
+		PR:              pr,
+		CleanupMerged:   p.CleanupMerged,
 	})
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)

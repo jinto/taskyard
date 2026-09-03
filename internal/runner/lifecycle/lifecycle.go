@@ -40,7 +40,11 @@ type Config struct {
 	BrokerURL    string
 	BrokerToken  string
 	ClaudeBinary string
-	Publish      PublishFunc
+	// GHBinary는 gh 실행 파일(비어 있으면 PATH의 gh). PRPollInterval은 PR 추적
+	// 주기(비어 있으면 60s).
+	GHBinary       string
+	PRPollInterval time.Duration
+	Publish        PublishFunc
 }
 
 type Manager struct {
@@ -68,6 +72,9 @@ type runSpec struct {
 	prompt          string
 	resumeSessionID string
 	allowedTools    []string
+	baseBranch      string
+	pr              *protocol.PRSpec // nil이면 PR을 만들지 않는다
+	cleanupMerged   bool
 	repoPath        string // 원장에 남기는 정규화 경로
 	workspaceRunID  string // worktree·브랜치의 주인 Run. 이어서 재시도는 이전 Run
 	startedAt       int64
@@ -84,6 +91,7 @@ func (s runSpec) record(state string) spool.RunRecord {
 		StartedAtUnix:  s.startedAt,
 		RepoPath:       s.repoPath,
 		WorkspaceRunID: s.workspaceRunID,
+		CleanupMerged:  s.cleanupMerged,
 	}
 }
 
@@ -238,6 +246,9 @@ func (m *Manager) handleRunStart(ctx context.Context, env protocol.Envelope) err
 		runID:           env.RunID,
 		resumeSessionID: body.ResumeSessionID,
 		allowedTools:    body.AllowedTools,
+		baseBranch:      baseBranch,
+		pr:              body.PR,
+		cleanupMerged:   body.CleanupMerged,
 		repoPath:        repoPath,
 		workspaceRunID:  wsID,
 		startedAt:       time.Now().Unix(),
@@ -326,14 +337,18 @@ func readWorktreeFile(worktree, rel string, max int) (content string, truncated,
 // 다음 Run이나 salvage가 그 삭제를 실어 간다 — 결정적이고 무해하다.
 func takeAttention(worktree string) (string, bool) {
 	reason, truncated, ok := readWorktreeFile(worktree, attentionFile, maxAttentionBytes)
-	if !ok || strings.TrimSpace(reason) == "" {
+	if !ok {
+		return "", false
+	}
+	// 비어 있어도 지운다 — 남기면 salvage가 커밋한다.
+	if err := os.Remove(filepath.Join(worktree, attentionFile)); err != nil {
+		slog.Warn("could not remove attention file", "err", err)
+	}
+	if strings.TrimSpace(reason) == "" {
 		return "", false
 	}
 	if truncated {
 		reason += "\n…(attention.md truncated at 4KiB)"
-	}
-	if err := os.Remove(filepath.Join(worktree, attentionFile)); err != nil {
-		slog.Warn("could not remove attention file", "err", err)
 	}
 	return reason, true
 }
@@ -378,7 +393,7 @@ func (m *Manager) failBeforeStart(env protocol.Envelope, body protocol.RunStartB
 		RepoPath:       repoPath,
 		WorkspaceRunID: wsID,
 	})
-	m.emitTerminal(env.RunID, "failed", cause.Error(), "")
+	m.emitTerminal(env.RunID, "failed", cause.Error(), "", "")
 	return nil
 }
 
@@ -401,7 +416,7 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, spec r
 			slog.Error("run failed", "run_id", runID, "err", err)
 		}
 		_ = m.cfg.Spool.SaveRun(spec.record(state))
-		m.emitTerminal(runID, state, detail, "")
+		m.emitTerminal(runID, state, detail, "", "")
 	}
 
 	args, err := claudecode.BuildArgs(claudecode.SpawnOptions{
@@ -484,18 +499,37 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, spec r
 	// Reconcile이 이미 종결 상태를 보고 이 Run을 다시 살펴보지 않으므로,
 	// salvage를 SaveRun보다 앞에 둬야 그 창에서 실행이 끊겨도 보존이
 	// 유실되지 않는다.
+	//
+	// .taskyard/ 산출물(변경 설명, 멈춤 보고)은 salvage보다 먼저 거둔다 —
+	// salvage는 git add -A라 그대로 두면 커밋에 들어간다.
 	finish := func(state, detail string, salvageFirst bool) {
+		summary := takeSummary(spec.ws.Path)
+		attention, hasAttention := takeAttention(spec.ws.Path)
 		if salvageFirst {
 			m.salvage(runID, spec.workspaceRunID, spec.git)
+		}
+		// 정상 종료. 에이전트가 멈춤 보고를 남겼으면 성공이 아니라 사람의
+		// 차례다(PRD §7.5). 실패·취소가 이 분기보다 앞서므로 실패가 우선한다.
+		if hasAttention {
+			if state == "succeeded" {
+				state, detail = "needs_attention", attention
+			} else {
+				// 실패·취소가 우선한다. 보고는 버리지 않고 detail에 덧붙인다.
+				detail += "\n\n에이전트 메모:\n" + attention
+			}
 		}
 		rec := spec.record(state)
 		rec.SessionID = session.SessionID
 		rec.PID = pid
+		if state == "succeeded" && spec.pr != nil {
+			state, detail = m.publishPR(spec, &rec, summary)
+			rec.State = state
+		}
 		_ = m.cfg.Spool.SaveRun(rec)
 		if state != "succeeded" && state != "needs_attention" {
 			slog.Error("run failed", "run_id", runID, "state", state, "detail", detail)
 		}
-		m.emitTerminal(runID, state, detail, session.SessionID)
+		m.emitTerminal(runID, state, detail, session.SessionID, summary)
 	}
 
 	switch {
@@ -510,12 +544,6 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, spec r
 		// result만 오는 스트림)의 마지막 방어선이기도 하다(PRD §13.2).
 		finish("failed", fmt.Sprintf("agent's billing identity is not a verified subscription login (apiKeySource=%q); refusing to continue", session.APIKeySource), true)
 	default:
-		// 정상 종료. 에이전트가 멈춤 보고를 남겼으면 성공이 아니라 사람의
-		// 차례다(PRD §7.5). 실패·취소가 이 분기보다 앞서므로 실패가 우선한다.
-		if reason, ok := takeAttention(spec.ws.Path); ok {
-			finish("needs_attention", reason, false)
-			return
-		}
 		finish("succeeded", "", false)
 	}
 }
@@ -616,10 +644,13 @@ func (m *Manager) emitState(runID, state, detail string) {
 // emitTerminal은 종결·정착 상태를 알린다. session_id를 함께 실어 Server가
 // 이어서 재시도에 쓸 세션을 알게 한다. 비어 있으면 싣지 않는다 — Server는
 // 알던 세션을 빈 값으로 지우지 않는다.
-func (m *Manager) emitTerminal(runID, state, detail, sessionID string) {
+func (m *Manager) emitTerminal(runID, state, detail, sessionID, summary string) {
 	body := map[string]any{"state": state, "detail": detail}
 	if sessionID != "" {
 		body["session_id"] = sessionID
+	}
+	if summary != "" {
+		body["summary"] = summary
 	}
 	m.publishState(runID, body)
 }

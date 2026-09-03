@@ -59,6 +59,8 @@
 6. **기본 템플릿의 PR 단계는 원격이 없는 저장소에서 막힌다.** 이번엔 템플릿에서 뺐다.
    프로젝트 설정에 "PR 생성 여부" 를 두거나, 러너가 원격 유무를 알려 템플릿이 분기하게 하는
    것이 merge 정책 PR의 일부가 되어야 한다.
+   → 해소(PR: PR 생성·추적). PR은 에이전트가 아니라 러너가 만들고, 프로젝트 설정
+   "PR 만들기"로 끈다. 템플릿의 PR 단계는 변경 설명 파일 작성으로 바뀌었다.
 7. **이슈 상태 전이가 관측대로 움직였다.** #1 succeeded → review, #2 needs_attention →
    in_progress 유지, #2′ succeeded → review. 재시도 Run의 `previous_run_id`·`feedback`·
    `workspace_run_id`가 원장에 남았다.

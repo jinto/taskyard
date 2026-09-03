@@ -845,3 +845,126 @@ func TestApprovePostFailsWithoutARunner(t *testing.T) {
 		t.Fatalf("approve returned 200 with no runner connected; the decision went nowhere")
 	}
 }
+
+// ---- PR 생성·추적 (계획 2026-09-03-phase1-pr) ----
+
+func TestUpdateSettingsSavesPolicies(t *testing.T) {
+	st, h := newServer(t)
+	seedProject(t, st, "shop", "/repos/shop")
+
+	// 체크박스 둘 다 켬.
+	rec := postForm(h, "/projects/shop/template", url.Values{
+		"execute_template": {"t"}, "create_pr": {"on"}, "cleanup_merged": {"on"},
+	})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	p, _ := st.GetProject("shop")
+	if !p.CreatePR || !p.CleanupMerged {
+		t.Fatalf("policies not saved: %+v", p)
+	}
+	// 체크박스는 안 보내면 false다.
+	rec = postForm(h, "/projects/shop/template", url.Values{"execute_template": {"t"}})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	p, _ = st.GetProject("shop")
+	if p.CreatePR || p.CleanupMerged {
+		t.Fatalf("unchecked boxes must save false: %+v", p)
+	}
+	body := get(h, "/projects/shop").Body.String()
+	if !strings.Contains(body, `name="create_pr"`) || !strings.Contains(body, `name="cleanup_merged"`) {
+		t.Fatalf("project page lacks policy checkboxes:\n%s", body)
+	}
+}
+
+func TestCreateProjectDefaultsPoliciesOn(t *testing.T) {
+	st, h := newServer(t)
+	rec := postForm(h, "/projects", url.Values{
+		"key": {"shop"}, "name": {"s"}, "repo_path": {"/repos/shop"}, "default_branch": {"main"},
+		"create_pr": {"on"}, "cleanup_merged": {"on"},
+	})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	p, _ := st.GetProject("shop")
+	if !p.CreatePR || !p.CleanupMerged {
+		t.Fatalf("create form did not save policies: %+v", p)
+	}
+	// 생성 폼은 기본 체크다.
+	index := get(h, "/").Body.String()
+	if !strings.Contains(index, `name="create_pr" checked`) {
+		t.Fatalf("create form does not default create_pr on:\n%s", index)
+	}
+}
+
+func TestRunIssueSendsPRSpec(t *testing.T) {
+	for _, createPR := range []bool{true, false} {
+		st, hb, h := newServerWithHub(t)
+		got := attachRunner(t, hb, h)
+		p, err := st.CreateProject(store.Project{Key: "shop", Name: "s", RepoPath: "/repos/shop", DefaultBranch: "main", ExecuteTemplate: "{{issue}}", CreatePR: createPR, CleanupMerged: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		seedTask(t, st, p, "Shout 추가", "대문자로 인사한다")
+
+		if rec := postForm(h, "/projects/shop/issues/1/run", nil); rec.Code != http.StatusSeeOther {
+			t.Fatalf("status = %d", rec.Code)
+		}
+		env, body := decodeStart(t, got, protocol.CmdRunStart)
+		if !createPR {
+			if body.PR != nil {
+				t.Fatalf("create_pr off but run.start has pr: %+v", body.PR)
+			}
+			continue
+		}
+		if body.PR == nil || body.PR.Title != "Shout 추가" || !body.CleanupMerged {
+			t.Fatalf("run.start pr = %+v cleanup = %v", body.PR, body.CleanupMerged)
+		}
+		if !strings.Contains(body.PR.Body, "#1") || !strings.Contains(body.PR.Body, env.RunID) || !strings.Contains(body.PR.Body, "대문자로 인사한다") {
+			t.Fatalf("pr body = %q; want issue number, run id and issue body", body.PR.Body)
+		}
+	}
+}
+
+func TestIssuePageShowsPRAndSummary(t *testing.T) {
+	st, h := newServer(t)
+	p, task := seedRetryProject(t, st)
+	seedRun(t, st, task, "run-1", store.StateRunning, "", "")
+	events := []protocol.Envelope{
+		mustEvent(t, protocol.EvRunStateChanged, "run-1", 1, map[string]any{"state": "succeeded", "detail": "", "summary": "Shout를 추가했다"}),
+		mustEvent(t, protocol.EvPRUpdated, "run-1", 2, map[string]any{"url": "https://github.com/o/r/pull/7", "number": 7, "state": "OPEN", "checks": "pending"}),
+	}
+	for _, e := range events {
+		if _, _, err := st.ApplyEvent(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	body := get(h, "/projects/"+p.Key+"/issues/1").Body.String()
+	for _, want := range []string{`href="https://github.com/o/r/pull/7"`, "#7", "OPEN", "pending", "Shout를 추가했다"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("issue page lacks %q", want)
+		}
+	}
+
+	if _, _, err := st.ApplyEvent(mustEvent(t, protocol.EvPRUpdated, "run-1", 3, map[string]any{"url": "https://github.com/o/r/pull/7", "number": 7, "state": "MERGED"})); err != nil {
+		t.Fatal(err)
+	}
+	body = get(h, "/projects/"+p.Key+"/issues/1").Body.String()
+	if !strings.Contains(body, "MERGED") || !strings.Contains(body, "done") {
+		t.Fatalf("issue page after merge lacks MERGED/done:\n%s", body)
+	}
+	if strings.Contains(body, `/issues/1/run"`) {
+		t.Fatal("done issue should not offer [실행]")
+	}
+}
+
+func mustEvent(t *testing.T, evType, runID string, seq uint64, body map[string]any) protocol.Envelope {
+	t.Helper()
+	env, err := protocol.NewEvent(evType, runID, seq, map[string]any{"body": body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.Seq = seq
+	return env
+}

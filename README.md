@@ -35,6 +35,12 @@ bin/taskyard-runner --pairing-token secret \
 잦으면 프로젝트 설정의 "승인 없이 허용할 도구"에 `Edit`, `Bash(go test:*)`처럼
 한 줄에 하나씩 적습니다(`--allowedTools`로 넘어갑니다).
 
+실행이 성공하면 러너가 브랜치를 `origin`에 push하고 `gh`로 PR을 엽니다(사용자의
+`gh auth login`을 그대로 씁니다). 본문은 에이전트가 `.taskyard/summary.md`에 남긴
+변경 설명입니다. 러너가 PR 상태를 주기적으로 보고(`--pr-poll`, 기본 1분), merge가
+확인되면 이슈는 done이 되고 worktree는 정리됩니다. 원격이 없는 저장소는 프로젝트
+설정에서 "PR 만들기"를 끄세요.
+
 ## 이름에 대하여
 
 npm의 `taskyard`(kolbyjayce — 에이전트용 todo MCP 서버)와는 무관한 별개 프로젝트입니다.

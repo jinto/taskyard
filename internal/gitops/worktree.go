@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -50,6 +51,9 @@ func (m *Manager) WorktreePath(runID string) string {
 func (m *Manager) git(ctx context.Context, dir string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
+	// 사용자 환경 그대로(push는 사용자의 인증에 기댄다, GH-05). 다만 터미널
+	// 프롬프트는 막는다 — 인증이 없으면 멈추지 말고 실패해야 한다.
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -169,4 +173,45 @@ func (m *Manager) Salvage(ctx context.Context, runID string) (string, bool, erro
 		return "", false, fmt.Errorf("read salvage sha for %s: %w", runID, err)
 	}
 	return strings.TrimSpace(out), true, nil
+}
+
+// AheadOf는 Run 브랜치가 base보다 앞선 커밋 수다. 0이면 PR을 만들 것이 없다.
+func (m *Manager) AheadOf(ctx context.Context, runID, base string) (int, error) {
+	return m.count(ctx, runID, base+"..HEAD")
+}
+
+// Unpushed는 upstream에 없는 커밋 수다. upstream이 없으면(push한 적 없음)
+// 오류다 — 호출자는 그것을 "확인 불가"로 다루고 worktree를 보존한다.
+func (m *Manager) Unpushed(ctx context.Context, runID string) (int, error) {
+	return m.count(ctx, runID, "@{u}..HEAD")
+}
+
+func (m *Manager) count(ctx context.Context, runID, rng string) (int, error) {
+	out, err := m.git(ctx, m.WorktreePath(runID), "rev-list", "--count", rng)
+	if err != nil {
+		return 0, fmt.Errorf("count %s for %s: %w", rng, runID, err)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil {
+		return 0, fmt.Errorf("parse rev-list count %q: %w", out, err)
+	}
+	return n, nil
+}
+
+// Push는 Run 브랜치를 origin에 올리고 upstream으로 잇는다. 두 번 불러도 된다.
+func (m *Manager) Push(ctx context.Context, runID string) error {
+	if _, err := m.git(ctx, m.WorktreePath(runID), "push", "-u", "origin", m.BranchName(runID)); err != nil {
+		return fmt.Errorf("push %s: %w", runID, err)
+	}
+	return nil
+}
+
+// Remove는 worktree를 지운다. 브랜치는 남긴다. 호출자가 merge 확인과
+// 미커밋·미push 검사를 마친 뒤에만 부른다(GH-10, §8.7.1) — 여기서는 다시
+// 확인하지 않으므로 --force 없이 부르고, git이 더러우면 거부하게 둔다.
+func (m *Manager) Remove(ctx context.Context, runID string) error {
+	if _, err := m.git(ctx, m.repoPath, "worktree", "remove", m.WorktreePath(runID)); err != nil {
+		return fmt.Errorf("remove worktree %s: %w", runID, err)
+	}
+	return nil
 }

@@ -43,6 +43,9 @@ const (
 	EvTurnCompleted     = "turn_completed"
 	EvError             = "error"
 	EvHeartbeat         = "runner.heartbeat"
+	// EvPRUpdated는 러너가 PR을 만들거나 상태 변화를 감지했을 때 보낸다(GH-06).
+	// body는 PRUpdatedBody. 같은 값이면 다시 보내지 않는다.
+	EvPRUpdated = "pr.updated"
 )
 
 // Envelope은 모든 메시지의 공통 껍데기다.
@@ -74,6 +77,30 @@ type RunStartBody struct {
 	ResumeSessionID string `json:"resume_session_id,omitempty"`
 	// AllowedTools는 승인 없이 통과시킬 도구 패턴이다(PRD §11.6.3). 프로젝트 설정.
 	AllowedTools []string `json:"allowed_tools,omitempty"`
+	// PR이 있으면 Run이 성공했을 때 러너가 push하고 PR을 만든다(GH-05). nil이면
+	// 만들지 않는다 — 원격이 없는 저장소. CleanupMerged는 merge 확인 후
+	// worktree를 지울지다(GH-10). 둘 다 run.start 시점의 프로젝트 정책 스냅샷.
+	PR            *PRSpec `json:"pr,omitempty"`
+	CleanupMerged bool    `json:"cleanup_merged,omitempty"`
+}
+
+// PRSpec은 러너가 PR을 만들 때 쓰는 재료다. Title은 이슈 제목. Body는
+// 에이전트가 변경 설명(.taskyard/summary.md)을 남기지 않았을 때의 본문이다.
+type PRSpec struct {
+	Title string `json:"title"`
+	Body  string `json:"body,omitempty"`
+}
+
+// PRUpdatedBody는 pr.updated의 본문이다. State는 gh의 OPEN/MERGED/CLOSED,
+// Checks는 statusCheckRollup을 none/pending/success/failure로 줄인 것,
+// Review는 reviewDecision 그대로. WorktreeRemoved는 merge 후 정리가 됐는지.
+type PRUpdatedBody struct {
+	URL             string `json:"url"`
+	Number          int    `json:"number"`
+	State           string `json:"state"`
+	Checks          string `json:"checks,omitempty"`
+	Review          string `json:"review,omitempty"`
+	WorktreeRemoved bool   `json:"worktree_removed,omitempty"`
 }
 
 func marshalBody(body any) (json.RawMessage, error) {

@@ -54,6 +54,13 @@ CREATE TABLE IF NOT EXISTS runs (
 var runsMigrations = []sqlitex.Column{
 	{Name: "repo_path", DDL: "TEXT NOT NULL DEFAULT ''"},
 	{Name: "workspace_run_id", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "pr_url", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "pr_number", DDL: "INTEGER NOT NULL DEFAULT 0"},
+	{Name: "pr_state", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "pr_checks", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "pr_review", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "cleanup_merged", DDL: "INTEGER NOT NULL DEFAULT 0"},
+	{Name: "worktree_removed", DDL: "INTEGER NOT NULL DEFAULT 0"},
 }
 
 // Spool은 SQLite로 뒷받침되는 이벤트 대기열이다.
@@ -237,13 +244,25 @@ type RunRecord struct {
 	// WorkspaceRunID는 worktree·브랜치의 주인 Run이다. 이어서 재시도한 Run은
 	// 이전 Run의 것을 쓴다. 비어 있으면 자기 자신(RunID).
 	WorkspaceRunID string
+	// PR 필드는 이 Run이 만들었거나 붙은 PR이다(GH-06). PRState가 OPEN인
+	// 기록이 추적 대상이고, 같은 브랜치의 옛 기록은 "superseded"로 빠진다.
+	// CleanupMerged는 run.start 시점의 정책 스냅샷, WorktreeRemoved는 merge
+	// 후 정리가 실제로 됐는지다.
+	PRURL           string
+	PRNumber        int
+	PRState         string
+	PRChecks        string
+	PRReview        string
+	CleanupMerged   bool
+	WorktreeRemoved bool
 }
 
 // SaveRun은 실행 기록을 만들거나 덮어쓴다.
 func (s *Spool) SaveRun(r RunRecord) error {
 	_, err := s.db.Exec(
-		`INSERT INTO runs (run_id, state, session_id, branch, worktree_path, pid, started_at, repo_path, workspace_run_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO runs (run_id, state, session_id, branch, worktree_path, pid, started_at, repo_path, workspace_run_id,
+		                   pr_url, pr_number, pr_state, pr_checks, pr_review, cleanup_merged, worktree_removed)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(run_id) DO UPDATE SET
 		   state            = excluded.state,
 		   session_id       = excluded.session_id,
@@ -252,8 +271,16 @@ func (s *Spool) SaveRun(r RunRecord) error {
 		   pid              = excluded.pid,
 		   started_at       = excluded.started_at,
 		   repo_path        = excluded.repo_path,
-		   workspace_run_id = excluded.workspace_run_id`,
+		   workspace_run_id = excluded.workspace_run_id,
+		   pr_url           = excluded.pr_url,
+		   pr_number        = excluded.pr_number,
+		   pr_state         = excluded.pr_state,
+		   pr_checks        = excluded.pr_checks,
+		   pr_review        = excluded.pr_review,
+		   cleanup_merged   = excluded.cleanup_merged,
+		   worktree_removed = excluded.worktree_removed`,
 		r.RunID, r.State, r.SessionID, r.Branch, r.WorktreePath, r.PID, r.StartedAtUnix, r.RepoPath, r.WorkspaceRunID,
+		r.PRURL, r.PRNumber, r.PRState, r.PRChecks, r.PRReview, r.CleanupMerged, r.WorktreeRemoved,
 	)
 	if err != nil {
 		return fmt.Errorf("save run: %w", err)
@@ -261,10 +288,35 @@ func (s *Spool) SaveRun(r RunRecord) error {
 	return nil
 }
 
+// PRUpdate는 추적이 바꾸는 PR 필드다.
+type PRUpdate struct {
+	State, Checks, Review string
+	WorktreeRemoved       bool
+}
+
+// UpdatePR은 PR 필드만 바꾼다 — 기록 전체를 덮어쓰지 않는다. 추적 goroutine이
+// 읽은 뒤 finish가 종결 상태를 쓰거나 재시도가 superseded로 바꿨을 수 있으므로,
+// 읽었을 때의 pr_state(expect)와 같을 때만 쓴다(compare-and-set). 바뀌었으면
+// ok=false — 호출자는 이벤트를 내지 않는다.
+func (s *Spool) UpdatePR(runID, expect string, u PRUpdate) (bool, error) {
+	res, err := s.db.Exec(
+		`UPDATE runs SET pr_state = ?, pr_checks = ?, pr_review = ?, worktree_removed = ?
+		 WHERE run_id = ? AND pr_state = ?`,
+		u.State, u.Checks, u.Review, u.WorktreeRemoved, runID, expect,
+	)
+	if err != nil {
+		return false, fmt.Errorf("update run pr: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 // LoadRuns는 모든 실행 기록을 돌려준다.
 func (s *Spool) LoadRuns() ([]RunRecord, error) {
 	rows, err := s.db.Query(
-		`SELECT run_id, state, session_id, branch, worktree_path, pid, started_at, repo_path, workspace_run_id FROM runs ORDER BY run_id`,
+		`SELECT run_id, state, session_id, branch, worktree_path, pid, started_at, repo_path, workspace_run_id,
+		        pr_url, pr_number, pr_state, pr_checks, pr_review, cleanup_merged, worktree_removed
+		 FROM runs ORDER BY run_id`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query runs: %w", err)
@@ -274,7 +326,8 @@ func (s *Spool) LoadRuns() ([]RunRecord, error) {
 	var out []RunRecord
 	for rows.Next() {
 		var r RunRecord
-		if err := rows.Scan(&r.RunID, &r.State, &r.SessionID, &r.Branch, &r.WorktreePath, &r.PID, &r.StartedAtUnix, &r.RepoPath, &r.WorkspaceRunID); err != nil {
+		if err := rows.Scan(&r.RunID, &r.State, &r.SessionID, &r.Branch, &r.WorktreePath, &r.PID, &r.StartedAtUnix, &r.RepoPath, &r.WorkspaceRunID,
+			&r.PRURL, &r.PRNumber, &r.PRState, &r.PRChecks, &r.PRReview, &r.CleanupMerged, &r.WorktreeRemoved); err != nil {
 			return nil, fmt.Errorf("scan run: %w", err)
 		}
 		out = append(out, r)
