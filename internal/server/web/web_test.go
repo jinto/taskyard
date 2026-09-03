@@ -992,7 +992,7 @@ func TestRunPageShowsToolInputForApprovalAndToolStart(t *testing.T) {
 		}
 	}
 	// 사용량은 로그 행이 아니라 머리말 한 줄이다.
-	eventsHTML := body[strings.Index(body, `id="events"`):]
+	eventsHTML := body[strings.Index(body, `id="events"`):strings.Index(body, "<script>")]
 	if strings.Contains(eventsHTML, "usage_updated") {
 		t.Error("usage_updated should not be an event row")
 	}
