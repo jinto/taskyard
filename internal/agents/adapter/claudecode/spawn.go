@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -60,6 +61,25 @@ type SpawnOptions struct {
 	ResumeSessionID string
 	BrokerURL       string
 	BrokerToken     string
+	// AllowedTools는 승인 없이 통과시킬 도구 패턴이다(PRD §11.6.3). 예: "Edit",
+	// "Bash(go test:*)". 그 밖의 도구는 여전히 브로커를 거친다.
+	AllowedTools []string
+}
+
+// allowedToolPattern은 허용 도구 항목의 문법이다: 도구 이름, 선택적으로
+// 괄호 안의 패턴. 쉼표·공백·줄바꿈은 안 된다 — 쉼표로 이어 값 하나로 넘기고,
+// "-"로 시작하는 것은 플래그로 파싱될 수 있다.
+var allowedToolPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*(\([^(),\s][^(),\n]*\))?$`)
+
+// CheckAllowedTools는 항목 전부가 문법에 맞는지 본다. 웹 설정 폼과 BuildArgs가
+// 같은 규칙을 쓴다.
+func CheckAllowedTools(tools []string) error {
+	for _, t := range tools {
+		if !allowedToolPattern.MatchString(t) {
+			return fmt.Errorf("claudecode: invalid allowed tool %q (want Name or Name(pattern), no commas or spaces)", t)
+		}
+	}
+	return nil
 }
 
 // BuildArgs는 `claude`에 넘길 인자를 만든다. 여기가 PRD §13.2.1의
@@ -79,6 +99,9 @@ func BuildArgs(opts SpawnOptions) ([]string, error) {
 	}
 	if strings.HasPrefix(opts.ResumeSessionID, "-") {
 		return nil, errors.New("claudecode: ResumeSessionID must not start with '-'; it could be parsed as a CLI flag")
+	}
+	if err := CheckAllowedTools(opts.AllowedTools); err != nil {
+		return nil, err
 	}
 
 	mcpConfig, err := brokerMCPConfig(opts.BrokerURL, opts.BrokerToken)
@@ -100,6 +123,10 @@ func BuildArgs(opts SpawnOptions) ([]string, error) {
 
 	if opts.ResumeSessionID != "" {
 		args = append(args, "--resume", opts.ResumeSessionID)
+	}
+	if len(opts.AllowedTools) > 0 {
+		// 가변 인자로 넘기면 뒤따르는 플래그까지 값으로 먹을 수 있어 쉼표로 잇는다.
+		args = append(args, "--allowedTools", strings.Join(opts.AllowedTools, ","))
 	}
 	return args, nil
 }

@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -106,7 +107,8 @@ CREATE TABLE IF NOT EXISTS projects (
   repo_path        TEXT    NOT NULL,
   default_branch   TEXT    NOT NULL,
   execute_template TEXT    NOT NULL,
-  created_at       INTEGER NOT NULL
+  created_at       INTEGER NOT NULL,
+  allowed_tools    TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -130,6 +132,11 @@ var runsMigrations = []sqlitex.Column{
 	{Name: "previous_run_id", DDL: "TEXT NOT NULL DEFAULT ''"},
 	{Name: "workspace_run_id", DDL: "TEXT NOT NULL DEFAULT ''"},
 	{Name: "feedback", DDL: "TEXT NOT NULL DEFAULT ''"},
+}
+
+// projectsMigrations는 PR #3 이후 projects 테이블에 추가된 컬럼이다.
+var projectsMigrations = []sqlitex.Column{
+	{Name: "allowed_tools", DDL: "TEXT NOT NULL DEFAULT ''"},
 }
 
 var (
@@ -181,6 +188,18 @@ type Project struct {
 	DefaultBranch   string
 	ExecuteTemplate string
 	CreatedAt       time.Time
+	// AllowedTools는 승인 없이 통과시킬 도구 패턴이다(PRD §11.6.3). 줄 단위로
+	// 저장한다.
+	AllowedTools []string
+}
+
+func joinTools(tools []string) string { return strings.Join(tools, "\n") }
+
+func splitTools(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, "\n")
 }
 
 // Task는 이슈다. Number는 프로젝트 안에서 1부터 증가한다.
@@ -210,6 +229,10 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("create server schema: %w", err)
 	}
 	if err := sqlitex.AddMissingColumns(db, "runs", runsMigrations); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := sqlitex.AddMissingColumns(db, "projects", projectsMigrations); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -518,17 +541,19 @@ func (s *Store) Events(runID string, afterSeq uint64, limit int) ([]protocol.Env
 
 // ---- Project ----
 
-const projectColumns = `id, key, name, repo_path, default_branch, execute_template, created_at`
+const projectColumns = `id, key, name, repo_path, default_branch, execute_template, created_at, allowed_tools`
 
 func scanProject(sc rowScanner) (Project, error) {
 	var (
 		p       Project
 		created int64
+		tools   string
 	)
-	if err := sc.Scan(&p.ID, &p.Key, &p.Name, &p.RepoPath, &p.DefaultBranch, &p.ExecuteTemplate, &created); err != nil {
+	if err := sc.Scan(&p.ID, &p.Key, &p.Name, &p.RepoPath, &p.DefaultBranch, &p.ExecuteTemplate, &created, &tools); err != nil {
 		return Project{}, err
 	}
 	p.CreatedAt = time.Unix(0, created)
+	p.AllowedTools = splitTools(tools)
 	return p, nil
 }
 
@@ -559,8 +584,8 @@ func (s *Store) CreateProject(p Project) (Project, error) {
 	}
 
 	if _, err := tx.Exec(
-		`INSERT INTO projects (`+projectColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		p.ID, p.Key, p.Name, p.RepoPath, p.DefaultBranch, p.ExecuteTemplate, p.CreatedAt.UnixNano(),
+		`INSERT INTO projects (`+projectColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ID, p.Key, p.Name, p.RepoPath, p.DefaultBranch, p.ExecuteTemplate, p.CreatedAt.UnixNano(), joinTools(p.AllowedTools),
 	); err != nil {
 		return Project{}, fmt.Errorf("insert project: %w", err)
 	}
@@ -615,6 +640,19 @@ func (s *Store) UpdateProjectTemplate(key, executeTemplate string) error {
 	res, err := s.db.Exec(`UPDATE projects SET execute_template = ? WHERE key = ?`, executeTemplate, key)
 	if err != nil {
 		return fmt.Errorf("update project template: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrProjectNotFound
+	}
+	return nil
+}
+
+// UpdateProjectAllowedTools는 허용 도구 목록을 통째로 바꾼다. nil이면 비운다.
+// 항목 문법 검사는 호출자(웹 폼)의 몫이다.
+func (s *Store) UpdateProjectAllowedTools(key string, tools []string) error {
+	res, err := s.db.Exec(`UPDATE projects SET allowed_tools = ? WHERE key = ?`, joinTools(tools), key)
+	if err != nil {
+		return fmt.Errorf("update project allowed tools: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrProjectNotFound

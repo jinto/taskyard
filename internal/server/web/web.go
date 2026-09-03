@@ -18,9 +18,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/google/uuid"
 
+	"github.com/jinto/taskyard/internal/agents/adapter/claudecode"
 	"github.com/jinto/taskyard/internal/protocol"
 	"github.com/jinto/taskyard/internal/server/hub"
 	"github.com/jinto/taskyard/internal/server/pipeline"
@@ -173,7 +175,24 @@ func (s *Server) handleTemplateUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	// 허용 도구는 줄 단위. 빈 줄과 양끝 공백은 버리고, 문법은 러너가 쓰는
+	// 규칙(claudecode.CheckAllowedTools)으로 여기서 먼저 거른다 — 틀린 항목이
+	// 러너까지 가서 Run을 실패시키지 않게. 틀리면 아무것도 바꾸지 않는다.
+	var tools []string
+	for _, line := range strings.Split(r.FormValue("allowed_tools"), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			tools = append(tools, line)
+		}
+	}
+	if err := claudecode.CheckAllowedTools(tools); err != nil {
+		http.Error(w, "허용 도구 형식이 잘못됐습니다: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 	if err := s.st.UpdateProjectTemplate(p.Key, r.FormValue("execute_template")); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if err := s.st.UpdateProjectAllowedTools(p.Key, tools); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -293,6 +312,7 @@ func (s *Server) launch(w http.ResponseWriter, r *http.Request, p store.Project,
 		BaseBranch:      p.DefaultBranch,
 		WorkspaceRunID:  wsID,
 		ResumeSessionID: l.resumeSession,
+		AllowedTools:    p.AllowedTools,
 	})
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)

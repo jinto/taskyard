@@ -72,6 +72,8 @@ type RunStartBody struct {
 	BaseBranch      string `json:"base_branch,omitempty"`
 	WorkspaceRunID  string `json:"workspace_run_id,omitempty"`
 	ResumeSessionID string `json:"resume_session_id,omitempty"`
+	// AllowedTools는 승인 없이 통과시킬 도구 패턴이다(PRD §11.6.3). 프로젝트 설정.
+	AllowedTools []string `json:"allowed_tools,omitempty"`
 }
 
 func marshalBody(body any) (json.RawMessage, error) {

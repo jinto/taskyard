@@ -67,6 +67,7 @@ type runSpec struct {
 	runID           string
 	prompt          string
 	resumeSessionID string
+	allowedTools    []string
 	repoPath        string // 원장에 남기는 정규화 경로
 	workspaceRunID  string // worktree·브랜치의 주인 Run. 이어서 재시도는 이전 Run
 	startedAt       int64
@@ -236,6 +237,7 @@ func (m *Manager) handleRunStart(ctx context.Context, env protocol.Envelope) err
 	spec := runSpec{
 		runID:           env.RunID,
 		resumeSessionID: body.ResumeSessionID,
+		allowedTools:    body.AllowedTools,
 		repoPath:        repoPath,
 		workspaceRunID:  wsID,
 		startedAt:       time.Now().Unix(),
@@ -406,6 +408,7 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, spec r
 		Prompt:          spec.prompt,
 		WorkDir:         spec.ws.Path,
 		ResumeSessionID: spec.resumeSessionID,
+		AllowedTools:    spec.allowedTools,
 		BrokerURL:       m.cfg.BrokerURL,
 		BrokerToken:     m.cfg.BrokerToken,
 	})
