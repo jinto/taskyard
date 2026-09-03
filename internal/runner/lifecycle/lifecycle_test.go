@@ -168,10 +168,10 @@ type harnessOpts struct {
 	origin     bool
 }
 
-func withBinary(path string) harnessOpt   { return func(o *harnessOpts) { o.binary = path } }
-func withRepos(paths ...string) harnessOpt { return func(o *harnessOpts) { o.extraRepos = paths } }
-func withBaseBranch(b string) harnessOpt   { return func(o *harnessOpts) { o.baseBranch = b } }
-func withGH(path string) harnessOpt        { return func(o *harnessOpts) { o.gh = path } }
+func withBinary(path string) harnessOpt     { return func(o *harnessOpts) { o.binary = path } }
+func withRepos(paths ...string) harnessOpt  { return func(o *harnessOpts) { o.extraRepos = paths } }
+func withBaseBranch(b string) harnessOpt    { return func(o *harnessOpts) { o.baseBranch = b } }
+func withGH(path string) harnessOpt         { return func(o *harnessOpts) { o.gh = path } }
 func withPRPoll(d time.Duration) harnessOpt { return func(o *harnessOpts) { o.prPoll = d } }
 
 // withOrigin은 첫 저장소에 bare 저장소를 origin으로 붙인다 — push가 진짜로 돈다.

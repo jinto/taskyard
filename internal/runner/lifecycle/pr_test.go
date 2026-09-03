@@ -109,7 +109,7 @@ func scriptedAgent(t *testing.T, lines []string, exitCode int) string {
 
 const (
 	writeSummary = "mkdir -p .taskyard && printf 'Shout를 추가했다\\n' > .taskyard/summary.md"
-	commitOne    = "echo x > a.txt && git add a.txt && git -c user.name=t -c user.email=t@t commit -q -m 'agent commit'"
+	commitOne    = "echo $$ > a.txt && git add a.txt && git -c user.name=t -c user.email=t@t commit -q -m 'agent commit'"
 )
 
 func prUpdatesOf(t *testing.T, col *collector, runID string) []protocol.PRUpdatedBody {

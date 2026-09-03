@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/jinto/taskyard/internal/approval"
 	"github.com/jinto/taskyard/internal/buildinfo"
@@ -29,6 +30,8 @@ func main() {
 		dbPath      = flag.String("db", "taskyard-runner.db", "sqlite path")
 		worktrees   = flag.String("worktrees", "", "worktree root")
 		baseBranch  = flag.String("base-branch", "main", "default base branch when run.start names none")
+		ghBinary    = flag.String("gh", "gh", "gh executable used to create and track PRs")
+		prPoll      = flag.Duration("pr-poll", time.Minute, "how often to poll open PRs")
 		showVersion = flag.Bool("version", false, "print version and exit")
 		allowRepos  []string
 	)
@@ -91,12 +94,14 @@ func main() {
 	var l *link.Link
 
 	lm, err := lifecycle.New(lifecycle.Config{
-		Spool:       sp,
-		Repos:       repos,
-		Broker:      broker,
-		BaseBranch:  *baseBranch,
-		BrokerURL:   brokerURL,
-		BrokerToken: brokerToken,
+		Spool:          sp,
+		Repos:          repos,
+		Broker:         broker,
+		BaseBranch:     *baseBranch,
+		BrokerURL:      brokerURL,
+		BrokerToken:    brokerToken,
+		GHBinary:       *ghBinary,
+		PRPollInterval: *prPoll,
 		Publish: func(runID string, env protocol.Envelope) error {
 			return l.Publish(runID, env)
 		},
@@ -121,6 +126,7 @@ func main() {
 
 	// 여기부터 l이 유효하다. 위 불변식대로 발행자들을 그 뒤에 띄운다.
 	go lm.Start(ctx)
+	go lm.TrackPRs(ctx)
 
 	// 재시작 직후 남아 있는 Run의 실제 상태를 먼저 맞춘다(PRD §11.7).
 	if err := lm.Reconcile(ctx); err != nil {
