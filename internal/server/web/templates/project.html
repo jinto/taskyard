@@ -1,34 +1,35 @@
+{{define "crumbs"}}<span class="text-muted">/</span><span>{{.Project.Name}}</span>{{end}}
 {{define "content"}}
-<h1><a href="/">←</a> {{.Project.Name}}</h1>
-<div class="state">{{.Project.Key}} · {{.Project.RepoPath}} · {{.Project.DefaultBranch}}</div>
+<h1 class="text-2xl font-semibold tracking-tight">{{.Project.Name}}</h1>
+<p class="hint mt-1 font-mono text-xs">{{.Project.RepoPath}} <span class="mx-1">·</span> {{.Project.DefaultBranch}}</p>
 
-<h2>이슈</h2>
-<form method="post" action="/projects/{{.Project.Key}}/issues" class="form">
-  <label>제목 <input type="text" name="title" placeholder="로그인 이메일 대소문자 무시" required></label>
-  <label>본문 <textarea name="body" rows="4" placeholder="무엇이 문제이고 어떻게 되어야 하는지"></textarea></label>
-  <button type="submit">이슈 만들기</button>
-</form>
-
+<h2 class="section">이슈</h2>
 {{range .Tasks}}
-  <div class="run">
-    <a href="/projects/{{$.Project.Key}}/issues/{{.Number}}">#{{.Number}} {{.Title}}</a>
-    <div class="state">{{.Status}}</div>
+  <div class="row flex items-baseline gap-3">
+    <span class="w-10 shrink-0 font-mono text-xs text-muted">#{{.Number}}</span>
+    <a href="/projects/{{$.Project.Key}}/issues/{{.Number}}" class="grow font-medium hover:underline">{{.Title}}</a>
+    <span class="badge {{badge .Status}}">{{.Status}}</span>
   </div>
 {{else}}
-  <p class="state">아직 이슈가 없습니다.</p>
+  <p class="hint">아직 이슈가 없습니다. 아래에서 첫 이슈를 만드세요.</p>
 {{end}}
 
-<h2>실행 설정</h2>
-<form method="post" action="/projects/{{.Project.Key}}/template" class="form">
-  <label>실행 템플릿
-  <textarea name="execute_template" rows="14">{{.Project.ExecuteTemplate}}</textarea></label>
-  <p class="state"><code>{{"{{issue}}"}}</code>는 이슈 번호·제목·본문으로, <code>{{"{{memory}}"}}</code>는 저장소의 <code>.taskyard/memory.md</code>로, <code>{{"{{previous_run}}"}}</code>·<code>{{"{{feedback}}"}}</code>은 재시도 정보로 치환됩니다.</p>
-  <label>승인 없이 허용할 도구 (한 줄에 하나)
-  <textarea name="allowed_tools" rows="4" placeholder="Edit&#10;Bash(go test:*)">{{range .Project.AllowedTools}}{{.}}
+<h2 class="section">새 이슈</h2>
+<form method="post" action="/projects/{{.Project.Key}}/issues" class="max-w-xl space-y-4">
+  <label class="field"><span>제목</span><input type="text" name="title" placeholder="로그인 이메일 대소문자 무시" required></label>
+  <label class="field"><span>본문</span><textarea name="body" rows="4" class="!font-sans !text-[15px]" placeholder="무엇이 문제이고 어떻게 되어야 하는지"></textarea></label>
+  <button type="submit" class="btn btn-primary">이슈 만들기</button>
+</form>
+
+<h2 class="section">실행 설정</h2>
+<form method="post" action="/projects/{{.Project.Key}}/template" class="max-w-xl space-y-4">
+  <label class="field"><span>실행 템플릿</span><textarea name="execute_template" rows="14">{{.Project.ExecuteTemplate}}</textarea></label>
+  <p class="hint -mt-2"><code>{{"{{issue}}"}}</code>는 이슈 번호·제목·본문, <code>{{"{{memory}}"}}</code>는 저장소의 <code>.taskyard/memory.md</code>, <code>{{"{{previous_run}}"}}</code>과 <code>{{"{{feedback}}"}}</code>은 재시도 정보로 치환됩니다.</p>
+  <label class="field"><span>승인 없이 허용할 도구 (한 줄에 하나)</span><textarea name="allowed_tools" rows="4" placeholder="Edit&#10;Bash(go test:*)">{{range .Project.AllowedTools}}{{.}}
 {{end}}</textarea></label>
-  <p class="state">여기 없는 도구 호출은 지금처럼 승인을 묻습니다. 예: <code>Edit</code>, <code>Write</code>, <code>Bash(go test:*)</code>, <code>Bash(git commit:*)</code>.</p>
-  <label><input type="checkbox" name="create_pr"{{if .Project.CreatePR}} checked{{end}}> PR 만들기 — 실행이 성공하면 러너가 <code>origin</code>에 push하고 PR을 엽니다. 원격이 없는 저장소는 끕니다.</label>
-  <label><input type="checkbox" name="cleanup_merged"{{if .Project.CleanupMerged}} checked{{end}}> merge 후 worktree 삭제 — 미커밋·미push가 없을 때만.</label>
-  <button type="submit">저장</button>
+  <p class="hint -mt-2">여기 없는 도구 호출은 승인을 묻습니다. 예: <code>Edit</code>, <code>Write</code>, <code>Bash(go test:*)</code>, <code>Bash(git commit:*)</code>.</p>
+  <label class="check"><input type="checkbox" name="create_pr"{{if .Project.CreatePR}} checked{{end}}> <span>PR 만들기<br><span class="hint">실행이 성공하면 러너가 <code>origin</code>에 push하고 PR을 엽니다. 원격이 없는 저장소는 끄세요.</span></span></label>
+  <label class="check"><input type="checkbox" name="cleanup_merged"{{if .Project.CleanupMerged}} checked{{end}}> <span>merge 후 worktree 삭제<br><span class="hint">미커밋·미push가 없을 때만 지웁니다.</span></span></label>
+  <button type="submit" class="btn btn-primary">설정 저장</button>
 </form>
 {{end}}

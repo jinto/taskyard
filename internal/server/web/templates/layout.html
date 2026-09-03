@@ -4,35 +4,59 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{.Title}} · Taskyard</title>
-<style>
-  :root { color-scheme: light dark; --fg: #16181d; --bg: #fbfbfa; --muted: #6b7280; --line: #e5e7eb; }
-  @media (prefers-color-scheme: dark) {
-    :root { --fg: #e8e8e6; --bg: #16181d; --muted: #9ca3af; --line: #2c2f36; }
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    darkMode: "media",
+    theme: {
+      extend: {
+        colors: {
+          ink: "#1C2127", muted: "#5F6B72", line: "#D9DDD6",
+          go: { DEFAULT: "#0F6E56", soft: "#E3F1EA" },
+          attention: { DEFAULT: "#C2410C", soft: "#FCE9DF" },
+        },
+        fontFamily: {
+          sans: ["ui-sans-serif", "-apple-system", "Apple SD Gothic Neo", "Pretendard", "Noto Sans KR", "sans-serif"],
+          mono: ["ui-monospace", "SFMono-Regular", "Menlo", "monospace"],
+        },
+      },
+    },
+  };
+</script>
+<style type="text/tailwindcss">
+  @layer components {
+    .field { @apply block text-sm; }
+    .field > span { @apply block mb-1 text-muted dark:text-zinc-400; }
+    .field input[type=text], .field input[type=number], .field textarea {
+      @apply w-full rounded border border-line bg-white px-3 py-2 text-ink placeholder:text-zinc-400
+             focus:outline-none focus:ring-2 focus:ring-go/40 focus:border-go
+             dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100;
+    }
+    .field textarea { @apply font-mono text-[13px] leading-relaxed; }
+    .check { @apply flex items-start gap-2 text-sm; }
+    .check input { @apply mt-1 accent-go; }
+    .btn { @apply inline-flex items-center rounded px-3 py-1.5 text-sm font-medium border border-line
+                  bg-white text-ink hover:bg-zinc-50 focus:outline-none focus:ring-2 focus:ring-go/40
+                  dark:bg-zinc-900 dark:text-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800; }
+    .btn-primary { @apply bg-go text-white border-go hover:bg-go/90 dark:bg-go dark:border-go dark:hover:bg-go/90; }
+    .btn-attention { @apply bg-attention text-white border-attention hover:bg-attention/90 dark:bg-attention dark:border-attention; }
+    .badge { @apply inline-block rounded-full px-2 py-0.5 text-xs font-medium leading-5 align-middle; }
+    .hint { @apply text-sm text-muted dark:text-zinc-400; }
+    .hint code, .prose-code code { @apply font-mono text-[0.85em] rounded bg-zinc-100 px-1 py-0.5 dark:bg-zinc-800; }
+    .row { @apply py-3 border-b border-line dark:border-zinc-800; }
+    h2.section { @apply mt-10 mb-3 text-base font-semibold; }
   }
-  body { margin: 0; padding: 2rem; background: var(--bg); color: var(--fg);
-         font: 15px/1.6 ui-sans-serif, -apple-system, "Segoe UI", sans-serif; }
-  h1 { font-size: 1.25rem; margin: 0 0 1.5rem; }
-  a { color: inherit; }
-  .run { padding: .75rem 0; border-bottom: 1px solid var(--line); }
-  .state { font-size: .8rem; color: var(--muted); }
-  #events { margin-top: 1rem; border: 1px solid var(--line); border-radius: 6px;
-            max-height: 60vh; overflow-y: auto; }
-  .ev { padding: .5rem .75rem; border-bottom: 1px solid var(--line);
-        font-family: ui-monospace, SFMono-Regular, monospace; font-size: .8rem; }
-  .ev-type { color: var(--muted); margin-right: .5rem; }
-  .approval { margin: 1rem 0; padding: 1rem; border: 2px solid #d97706; border-radius: 6px; }
-  button { font: inherit; padding: .4rem .9rem; margin-right: .5rem; cursor: pointer; }
-  h2 { font-size: 1rem; margin: 2rem 0 .75rem; }
-  .form { margin: 0 0 1.5rem; }
-  .form label { display: block; margin: .35rem 0; }
-  .form input, .form textarea { font: inherit; width: 100%; max-width: 40rem; padding: .35rem .5rem;
-                                box-sizing: border-box; background: var(--bg); color: var(--fg);
-                                border: 1px solid var(--line); border-radius: 4px; }
-  .form textarea { font-family: ui-monospace, SFMono-Regular, monospace; font-size: .85rem; }
-  pre.body { white-space: pre-wrap; font: inherit; margin: 1rem 0; }
 </style>
 </head>
-<body>
+<body class="min-h-screen bg-white font-sans text-[15px] leading-relaxed text-ink antialiased dark:bg-zinc-950 dark:text-zinc-100">
+<header class="border-b border-line dark:border-zinc-800">
+  <nav class="mx-auto flex h-12 max-w-3xl items-center gap-2 px-6 text-sm">
+    <a href="/" class="font-semibold tracking-tight">Taskyard</a>
+    {{block "crumbs" .}}{{end}}
+  </nav>
+</header>
+<main class="mx-auto max-w-3xl px-6 py-8">
 {{template "content" .}}
+</main>
 </body>
 </html>{{end}}

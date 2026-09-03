@@ -968,3 +968,24 @@ func mustEvent(t *testing.T, evType, runID string, seq uint64, body map[string]a
 	env.Seq = seq
 	return env
 }
+
+func TestRunPageShowsToolInputForApprovalAndToolStart(t *testing.T) {
+	st, h := newServer(t)
+	_, task := seedRetryProject(t, st)
+	seedRun(t, st, task, "run-1", store.StateRunning, "", "")
+	events := []protocol.Envelope{
+		mustEvent(t, protocol.EvToolStarted, "run-1", 1, map[string]any{"tool_name": "Edit", "input": map[string]any{"file_path": "/wt/greet.go", "old_string": "x"}}),
+		mustEvent(t, protocol.EvApprovalRequested, "run-1", 2, map[string]any{"tool_name": "Bash", "request_id": "r1", "tool_use_id": "t1", "input": map[string]any{"command": "go test ./... -v"}}),
+	}
+	for _, e := range events {
+		if _, _, err := st.ApplyEvent(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	body := get(h, "/runs/run-1").Body.String()
+	for _, want := range []string{"→ Edit: /wt/greet.go", "승인 요청: Bash: go test ./... -v"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("run page lacks %q", want)
+		}
+	}
+}

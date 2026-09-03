@@ -1,62 +1,77 @@
+{{define "crumbs"}}<span class="text-muted">/</span><a href="/projects/{{.Project.Key}}" class="hover:underline">{{.Project.Name}}</a><span class="text-muted">/</span><span>#{{.Task.Number}}</span>{{end}}
 {{define "content"}}
-<h1><a href="/projects/{{.Project.Key}}">←</a> #{{.Task.Number}} {{.Task.Title}}</h1>
-<div class="state">{{.Task.Status}} · {{.Project.Key}}</div>
+<div class="flex items-start gap-3">
+  <span class="mt-1.5 font-mono text-sm text-muted">#{{.Task.Number}}</span>
+  <h1 class="grow text-2xl font-semibold tracking-tight">{{.Task.Title}}</h1>
+  <span class="badge mt-2 {{badge .Task.Status}}">{{.Task.Status}}</span>
+</div>
 
-{{if .Task.Body}}<pre class="body">{{.Task.Body}}</pre>{{end}}
+{{if .Task.Body}}<pre class="mt-4 max-w-prose whitespace-pre-wrap font-sans text-[15px]">{{.Task.Body}}</pre>{{end}}
 
+<div class="mt-8 space-y-4">
 {{if .Done}}
-<p class="state">완료 — PR이 merge됐습니다. 다시 열려면 아래에서 재시도하세요.</p>
+  <p class="hint">완료 — PR이 merge됐습니다. 다시 열려면 아래에서 재시도하세요.</p>
 {{else if or (not .HasLatest) .LatestSettled}}
-<form method="post" action="/projects/{{.Project.Key}}/issues/{{.Task.Number}}/run" class="form">
-  <button type="submit">실행</button>
-  <span class="state">프로젝트의 실행 템플릿으로 에이전트를 새 세션에서 띄웁니다{{if .HasLatest}} (이전 실행 맥락 없이){{end}}.</span>
-</form>
+  <form method="post" action="/projects/{{.Project.Key}}/issues/{{.Task.Number}}/run" class="flex items-center gap-3">
+    <button type="submit" class="btn btn-primary">실행</button>
+    <span class="hint">프로젝트의 실행 템플릿으로 에이전트를 새 세션에서 띄웁니다{{if .HasLatest}} (이전 실행 맥락 없이){{end}}.</span>
+  </form>
 {{end}}
+
 {{if not .HasLatest}}
 {{else if .LatestSettled}}
   {{if .Latest.Detail}}
-  <div class="approval">
-    <div class="state">{{.Latest.ID}} · {{.Latest.State}}</div>
-    <pre class="body">{{.Latest.Detail}}</pre>
+  <div class="rounded border {{if eq .Latest.State "needs_attention"}}border-attention bg-attention-soft dark:bg-attention/15{{else}}border-line dark:border-zinc-800{{end}} px-4 py-3">
+    <div class="flex items-center gap-2 text-sm"><span class="badge {{badge .Latest.State}}">{{.Latest.State}}</span><span class="font-mono text-xs text-muted">{{.Latest.ID}}</span></div>
+    <pre class="mt-2 whitespace-pre-wrap font-sans text-sm">{{.Latest.Detail}}</pre>
   </div>
   {{end}}
   {{if .Latest.PRURL}}
-  <div class="run">
-    PR <a href="{{.Latest.PRURL}}">#{{.Latest.PRNumber}}</a>
-    <div class="state">{{.Latest.PRState}}{{if .Latest.PRChecks}} · checks {{.Latest.PRChecks}}{{end}}{{if .Latest.PRReview}} · review {{.Latest.PRReview}}{{end}}</div>
+  <div class="flex flex-wrap items-center gap-2 text-sm">
+    <span class="text-muted">PR</span>
+    <a href="{{.Latest.PRURL}}" class="font-medium text-go hover:underline">#{{.Latest.PRNumber}}</a>
+    <span class="badge {{badge .Latest.PRState}}">{{.Latest.PRState}}</span>
+    {{if .Latest.PRChecks}}<span class="hint">checks {{.Latest.PRChecks}}</span>{{end}}
+    {{if .Latest.PRReview}}<span class="hint">review {{.Latest.PRReview}}</span>{{end}}
   </div>
   {{end}}
   {{if .Latest.Summary}}
-  <h2>변경 설명</h2>
-  <pre class="body">{{.Latest.Summary}}</pre>
+  <h2 class="section !mt-6">변경 설명</h2>
+  <pre class="max-w-prose whitespace-pre-wrap font-sans text-[15px]">{{.Latest.Summary}}</pre>
   {{end}}
-  <form method="post" action="/runs/{{.Latest.ID}}/retry" class="form">
-    <label><input type="radio" name="mode" value="continue"{{if .LatestResumable}} checked{{else}} disabled{{end}}> 이어서 재시도 — 같은 worktree, 같은 세션{{if not .LatestResumable}} (이어갈 세션 없음){{end}}</label>
-    <label><input type="radio" name="mode" value="fresh"{{if not .LatestResumable}} checked{{end}}> 처음부터 재시도 — 새 worktree, 새 세션</label>
-    <label>메모 <input type="text" name="feedback" placeholder="에이전트에게 남길 한 줄"></label>
-    <button type="submit">재시도</button>
+  <form method="post" action="/runs/{{.Latest.ID}}/retry" class="max-w-xl space-y-2 rounded border border-line p-4 dark:border-zinc-800">
+    <div class="text-sm font-medium">재시도</div>
+    <label class="check"><input type="radio" name="mode" value="continue"{{if .LatestResumable}} checked{{else}} disabled{{end}}> <span>이어서 — 같은 worktree, 같은 세션{{if not .LatestResumable}} <span class="hint">(이어갈 세션 없음)</span>{{end}}</span></label>
+    <label class="check"><input type="radio" name="mode" value="fresh"{{if not .LatestResumable}} checked{{end}}> <span>처음부터 — 새 worktree, 새 세션</span></label>
+    <label class="field"><span>에이전트에게 남길 메모</span><input type="text" name="feedback" placeholder="예: 테스트 이름을 기존 방식에 맞춰 줘"></label>
+    <button type="submit" class="btn">재시도</button>
   </form>
   {{if .LatestCancellable}}
-  <form method="post" action="/runs/{{.Latest.ID}}/cancel" class="form">
-    <button type="submit">취소</button>
-    <span class="state">이슈를 backlog로 되돌립니다. worktree는 보존됩니다.</span>
+  <form method="post" action="/runs/{{.Latest.ID}}/cancel" class="flex items-center gap-3">
+    <button type="submit" class="btn">취소</button>
+    <span class="hint">이슈를 backlog로 되돌립니다. worktree는 보존됩니다.</span>
   </form>
   {{end}}
 {{else}}
-<form method="post" action="/runs/{{.Latest.ID}}/cancel" class="form">
-  <button type="submit">취소</button>
-  <span class="state">{{.Latest.ID}} · {{.Latest.State}} — 프로세스를 멈추고 미커밋 변경을 보존합니다.</span>
-</form>
+  <form method="post" action="/runs/{{.Latest.ID}}/cancel" class="flex items-center gap-3">
+    <button type="submit" class="btn">취소</button>
+    <span class="hint"><a href="/runs/{{.Latest.ID}}" class="font-mono text-xs hover:underline">{{.Latest.ID}}</a> <span class="badge {{badge .Latest.State}}">{{.Latest.State}}</span> — 프로세스를 멈추고 미커밋 변경을 보존합니다.</span>
+  </form>
 {{end}}
+</div>
 
-<h2>실행</h2>
+<h2 class="section">실행</h2>
 {{range .Runs}}
-  <div class="run">
-    <a href="/runs/{{.ID}}">{{.ID}}</a>
-    <div class="state">{{.State}} · {{.Stage}} · {{.CreatedAt.Format "2006-01-02 15:04:05"}}{{if .Branch}} · {{.Branch}}{{end}}{{if .PreviousRunID}} · ← {{.PreviousRunID}}{{end}}{{if .PRURL}} · PR <a href="{{.PRURL}}">#{{.PRNumber}}</a> {{.PRState}}{{end}}</div>
-    {{if .Detail}}<div class="state">{{.Detail}}</div>{{end}}
+  <div class="row">
+    <div class="flex flex-wrap items-center gap-2">
+      <a href="/runs/{{.ID}}" class="font-mono text-sm hover:underline">{{.ID}}</a>
+      <span class="badge {{badge .State}}">{{.State}}</span>
+      {{if .PRURL}}<a href="{{.PRURL}}" class="text-sm text-go hover:underline">PR #{{.PRNumber}}</a> <span class="badge {{badge .PRState}}">{{.PRState}}</span>{{end}}
+    </div>
+    <div class="hint mt-1 font-mono text-xs">{{.CreatedAt.Format "2006-01-02 15:04:05"}}{{if .Stage}} <span class="mx-1">·</span> {{.Stage}}{{end}}{{if .Branch}} <span class="mx-1">·</span> {{.Branch}}{{end}}{{if .PreviousRunID}} <span class="mx-1">·</span> ← {{.PreviousRunID}}{{end}}</div>
+    {{if .Detail}}<div class="hint mt-1 line-clamp-2">{{.Detail}}</div>{{end}}
   </div>
 {{else}}
-  <p class="state">아직 실행이 없습니다.</p>
+  <p class="hint">아직 실행이 없습니다.</p>
 {{end}}
 {{end}}
