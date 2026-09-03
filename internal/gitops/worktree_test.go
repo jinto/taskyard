@@ -277,3 +277,95 @@ func TestEnsureRecreatesWhenDirectoryMissingButBranchExists(t *testing.T) {
 		t.Fatalf("worktree branch = %q, want taskyard/run/run-1", branch)
 	}
 }
+
+// ---- push·앞선 커밋·미push·삭제 (계획 2026-09-03-phase1-pr) ----
+
+// newRepoWithOrigin은 newRepo에 bare 저장소를 origin으로 붙인다. push가
+// 인터넷 없이 진짜로 돈다.
+func newRepoWithOrigin(t *testing.T) (repoPath, worktreeRoot, bare string) {
+	t.Helper()
+	repoPath, worktreeRoot = newRepo(t)
+	bare = filepath.Join(filepath.Dir(repoPath), "origin.git")
+	run(t, filepath.Dir(repoPath), "init", "-q", "--bare", bare)
+	run(t, repoPath, "remote", "add", "origin", bare)
+	return repoPath, worktreeRoot, bare
+}
+
+func commitFile(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, dir, "add", name)
+	run(t, dir, "commit", "-q", "-m", "add "+name)
+}
+
+func TestAheadOfCountsCommitsOverBase(t *testing.T) {
+	repo, root := newRepo(t)
+	m := New(repo, root)
+	ws, err := m.Ensure(context.Background(), "run-1", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := m.AheadOf(context.Background(), "run-1", "main"); err != nil || n != 0 {
+		t.Fatalf("AheadOf fresh = %d, %v; want 0", n, err)
+	}
+	commitFile(t, ws.Path, "a.txt", "a")
+	if n, err := m.AheadOf(context.Background(), "run-1", "main"); err != nil || n != 1 {
+		t.Fatalf("AheadOf after commit = %d, %v; want 1", n, err)
+	}
+}
+
+func TestPushPublishesBranchAndTracksUpstream(t *testing.T) {
+	repo, root, bare := newRepoWithOrigin(t)
+	m := New(repo, root)
+	ws, _ := m.Ensure(context.Background(), "run-1", "main")
+	commitFile(t, ws.Path, "a.txt", "a")
+
+	if _, err := m.Unpushed(context.Background(), "run-1"); err == nil {
+		t.Fatal("Unpushed before push should fail: no upstream")
+	}
+	if err := m.Push(context.Background(), "run-1"); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	run(t, bare, "rev-parse", "--verify", "refs/heads/"+m.BranchName("run-1"))
+	if n, err := m.Unpushed(context.Background(), "run-1"); err != nil || n != 0 {
+		t.Fatalf("Unpushed after push = %d, %v; want 0", n, err)
+	}
+	commitFile(t, ws.Path, "b.txt", "b")
+	if n, err := m.Unpushed(context.Background(), "run-1"); err != nil || n != 1 {
+		t.Fatalf("Unpushed after local commit = %d, %v; want 1", n, err)
+	}
+	// 두 번째 push는 갱신 — 멱등하다.
+	if err := m.Push(context.Background(), "run-1"); err != nil {
+		t.Fatalf("second Push: %v", err)
+	}
+}
+
+func TestPushFailsWithoutRemote(t *testing.T) {
+	repo, root := newRepo(t)
+	m := New(repo, root)
+	ws, _ := m.Ensure(context.Background(), "run-1", "main")
+	commitFile(t, ws.Path, "a.txt", "a")
+	if err := m.Push(context.Background(), "run-1"); err == nil {
+		t.Fatal("Push without origin should fail")
+	}
+}
+
+func TestRemoveDeletesWorktreeButKeepsBranch(t *testing.T) {
+	repo, root := newRepo(t)
+	m := New(repo, root)
+	ws, _ := m.Ensure(context.Background(), "run-1", "main")
+	commitFile(t, ws.Path, "a.txt", "a")
+
+	if err := m.Remove(context.Background(), "run-1"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if _, err := os.Stat(ws.Path); !os.IsNotExist(err) {
+		t.Fatalf("worktree path still exists: %v", err)
+	}
+	if out := run(t, repo, "worktree", "list"); strings.Contains(out, ws.Path) {
+		t.Fatalf("worktree still listed:\n%s", out)
+	}
+	run(t, repo, "rev-parse", "--verify", "refs/heads/"+ws.Branch)
+}
