@@ -307,17 +307,21 @@ func (s *Server) launch(w http.ResponseWriter, r *http.Request, p store.Project,
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if err := s.st.UpdateTaskStatus(task.ID, store.TaskInProgress); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	if err := s.hub.SendCommand(cmd); err != nil {
-		slog.Warn("run.start could not be delivered", "run_id", runID, "task_id", task.ID, "err", err)
+	// 여기서부터 실패하면 방금 만든 Run을 failed로 정리하고 이슈 상태를 되돌린다 —
+	// queued로 영영 남겨 사용자가 실행 중이라고 믿게 하지 않는다.
+	abort := func(status int, msg string) {
 		run.State = store.StateFailed
 		_ = s.st.UpsertRun(run)
 		_ = s.st.UpdateTaskStatus(task.ID, task.Status)
-		http.Error(w, "runner is not connected", http.StatusServiceUnavailable)
+		http.Error(w, msg, status)
+	}
+	if err := s.st.UpdateTaskStatus(task.ID, store.TaskInProgress); err != nil {
+		abort(http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := s.hub.SendCommand(cmd); err != nil {
+		slog.Warn("run.start could not be delivered", "run_id", runID, "task_id", task.ID, "err", err)
+		abort(http.StatusServiceUnavailable, "runner is not connected")
 		return
 	}
 	http.Redirect(w, r, "/runs/"+runID, http.StatusSeeOther)

@@ -769,7 +769,17 @@ func TestCancelRunningRunReturnsIssueToBacklog(t *testing.T) {
 		t.Fatalf("cancel: status = %d location = %q", rec.Code, rec.Header().Get("Location"))
 	}
 	waitRunState(t, s, runID, store.StateCancelled)
-	time.Sleep(300 * time.Millisecond) // failed가 뒤따라온다면 이 사이에 온다
+	// 러너 원장의 종결 기록(PID 채워짐)이 보이면 execute의 종결 switch가 끝난
+	// 것이다. 뒤따를 failed가 있었다면 그 전에 발행됐고 spool을 거쳐 서버에
+	// 도착했을 테니, 서버 이벤트를 한 번 더 기다린 뒤 확인한다.
+	waitFor(t, "runner ledger settled", func() bool {
+		ledger, _ := s.sp.LoadRuns()
+		return len(ledger) == 1 && ledger[0].State == "cancelled" && ledger[0].PID != 0
+	})
+	waitFor(t, "spool drained", func() bool {
+		n, err := s.sp.Pending(runID)
+		return err == nil && n == 0
+	})
 
 	run, _ := s.st.GetRun(runID)
 	if run.State != store.StateCancelled {

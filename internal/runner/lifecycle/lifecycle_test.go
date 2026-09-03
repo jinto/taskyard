@@ -994,10 +994,12 @@ func TestCancelledRunEndsAsCancelledNotFailed(t *testing.T) {
 	if err := h.m.HandleCommand(ctx, cancelCmd); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "terminal event after process death", func() bool {
-		return len(stateEventsOf(t, col, "run-1")) >= 2
+	// execute의 종결 기록은 PID를 채운다(handleRunCancel의 기록은 PID 0).
+	// 그것이 보이면 종결 switch가 끝난 것이라, 뒤따를 이벤트가 있다면 이미 왔다.
+	waitFor(t, "execute to finish after process death", func() bool {
+		rec := loadOnlyRun(t, h.sp)
+		return rec.State == "cancelled" && rec.PID != 0
 	})
-	time.Sleep(200 * time.Millisecond) // failed가 뒤따라온다면 이 사이에 온다
 
 	states := stateEventsOf(t, col, "run-1")
 	if last := states[len(states)-1]; last.state != "cancelled" {

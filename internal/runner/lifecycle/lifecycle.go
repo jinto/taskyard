@@ -187,13 +187,13 @@ func (m *Manager) handleRunStart(ctx context.Context, env protocol.Envelope) err
 	git, repoPath, err := m.cfg.Repos.resolve(body.RepoPath)
 	if errors.Is(err, ErrRepoNotAllowed) {
 		// 허용 목록 밖의 저장소는 명령 처리 오류가 아니라 이 Run의 실패다.
-		return m.failBeforeStart(env, body.RepoPath, err)
+		return m.failBeforeStart(env, body, body.RepoPath, err)
 	}
 	if err != nil {
 		return fmt.Errorf("resolve repository: %w", err)
 	}
 	if m.otherRunActive(env.RunID) {
-		return m.failBeforeStart(env, repoPath, errRunnerBusy)
+		return m.failBeforeStart(env, body, repoPath, errRunnerBusy)
 	}
 
 	baseBranch := body.BaseBranch
@@ -357,7 +357,7 @@ func (m *Manager) otherRunActive(runID string) bool {
 // failBeforeStart는 프로세스를 띄우기 전에 정해진 실패(허용 목록 밖 저장소,
 // 바쁜 러너)를 기록한다. 관문을 먼저 통과시켜 재전송이 같은 실패를 다시
 // 발행하지 않게 하고, 원장에는 요청받은 경로를 그대로 남긴다.
-func (m *Manager) failBeforeStart(env protocol.Envelope, repoPath string, cause error) error {
+func (m *Manager) failBeforeStart(env protocol.Envelope, body protocol.RunStartBody, repoPath string, cause error) error {
 	_, first, err := m.cfg.Spool.RememberCommand(env.ID, []byte(`{"accepted":true}`))
 	if err != nil {
 		return fmt.Errorf("remember command: %w", err)
@@ -365,11 +365,16 @@ func (m *Manager) failBeforeStart(env protocol.Envelope, repoPath string, cause 
 	if !first {
 		return nil
 	}
+	wsID := body.WorkspaceRunID
+	if wsID == "" {
+		wsID = env.RunID
+	}
 	_ = m.cfg.Spool.SaveRun(spool.RunRecord{
-		RunID:         env.RunID,
-		State:         "failed",
-		StartedAtUnix: time.Now().Unix(),
-		RepoPath:      repoPath,
+		RunID:          env.RunID,
+		State:          "failed",
+		StartedAtUnix:  time.Now().Unix(),
+		RepoPath:       repoPath,
+		WorkspaceRunID: wsID,
 	})
 	m.emitTerminal(env.RunID, "failed", cause.Error(), "")
 	return nil
@@ -383,12 +388,18 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, spec r
 		m.mu.Unlock()
 	}()
 
-	// Agent 프로세스를 아예 띄우지 못한 실패. 어떤 세션도 시작되기 전이므로
-	// SessionID·PID는 비어 있다.
+	// Agent 프로세스를 아예 띄우지 못한 종결. 어떤 세션도 시작되기 전이므로
+	// SessionID·PID는 비어 있다. 취소가 cmd.Start보다 먼저 도착하면 Start가
+	// 취소된 ctx로 실패하는데, 그것은 실패가 아니라 취소다 — terminalState가
+	// 가른다.
 	earlyFail := func(err error) {
-		slog.Error("run failed", "run_id", runID, "err", err)
-		_ = m.cfg.Spool.SaveRun(spec.record("failed"))
-		m.emitTerminal(runID, "failed", err.Error(), "")
+		state := m.terminalState(runID)
+		detail := m.terminalDetail(runID, err)
+		if state != "cancelled" {
+			slog.Error("run failed", "run_id", runID, "err", err)
+		}
+		_ = m.cfg.Spool.SaveRun(spec.record(state))
+		m.emitTerminal(runID, state, detail, "")
 	}
 
 	args, err := claudecode.BuildArgs(claudecode.SpawnOptions{

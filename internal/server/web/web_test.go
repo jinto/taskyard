@@ -599,6 +599,15 @@ func TestIssuePageShowsCancelForActiveAndRetryForSettled(t *testing.T) {
 	st, h := newServer(t)
 	_, task := seedRetryProject(t, st)
 
+	// Run이 없으면 [실행]만. 템플릿의 or/not 조합이 빈 맵 키에서도 렌더돼야 한다.
+	rec := get(h, "/projects/shop/issues/1")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `action="/projects/shop/issues/1/run"`) {
+		t.Fatalf("issue page without runs: status = %d body:\n%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "/cancel") || strings.Contains(rec.Body.String(), "/retry") {
+		t.Fatalf("issue page without runs offers cancel/retry:\n%s", rec.Body.String())
+	}
+
 	seedRun(t, st, task, "run-1", store.StateRunning, "", "")
 	body := get(h, "/projects/shop/issues/1").Body.String()
 	if !strings.Contains(body, `action="/runs/run-1/cancel"`) {
