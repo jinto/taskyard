@@ -88,7 +88,11 @@ func (m *Manager) publishPR(spec runSpec, rec *spool.RunRecord, summary string) 
 
 	rec.PRURL, rec.PRNumber, rec.PRState, rec.PRChecks, rec.PRReview = pr.URL, pr.Number, pr.State, pr.Checks, pr.Review
 	m.supersede(spec.ws.Branch, spec.runID)
-	if err := m.cfg.Spool.SaveRun(*rec); err != nil {
+	// 아직 running으로 저장한다. 종결 상태로 저장했다가 emitTerminal 전에 죽으면
+	// Reconcile이 종결 기록으로 보고 건너뛰어 서버가 종결을 영영 못 받는다.
+	interim := *rec
+	interim.State = "running"
+	if err := m.cfg.Spool.SaveRun(interim); err != nil {
 		slog.Error("save run pr fields failed", "run_id", spec.runID, "err", err)
 	}
 	m.emitPR(spec.runID, protocol.PRUpdatedBody{URL: pr.URL, Number: pr.Number, State: pr.State, Checks: pr.Checks, Review: pr.Review})
