@@ -166,6 +166,11 @@ func (m *Manager) pollPRs(ctx context.Context) {
 		return
 	}
 	for _, rec := range trackedPRs(records) {
+		// finish가 아직 PR 필드를 쓰는 중인 Run은 건너뛴다 — 두 goroutine이
+		// 같은 기록을 번갈아 덮어쓰지 않게.
+		if m.isActive(rec.RunID) {
+			continue
+		}
 		git, _, err := m.cfg.Repos.resolve(rec.RepoPath)
 		if err != nil {
 			slog.Warn("cannot track pr: repository no longer allowed", "run_id", rec.RunID, "err", err)
@@ -228,6 +233,13 @@ func (m *Manager) cleanupMerged(ctx context.Context, rec spool.RunRecord, git *g
 	}
 	slog.Info("removed merged worktree", "run_id", rec.RunID, "workspace", wsID)
 	return true
+}
+
+func (m *Manager) isActive(runID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.active[runID]
+	return ok
 }
 
 func (m *Manager) workspaceInUse(wsID string) bool {

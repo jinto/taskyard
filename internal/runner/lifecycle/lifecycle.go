@@ -506,8 +506,13 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, spec r
 		}
 		// 정상 종료. 에이전트가 멈춤 보고를 남겼으면 성공이 아니라 사람의
 		// 차례다(PRD §7.5). 실패·취소가 이 분기보다 앞서므로 실패가 우선한다.
-		if state == "succeeded" && hasAttention {
-			state, detail = "needs_attention", attention
+		if hasAttention {
+			if state == "succeeded" {
+				state, detail = "needs_attention", attention
+			} else {
+				// 실패·취소가 우선한다. 보고는 버리지 않고 로그에 남긴다.
+				slog.Info("attention note on a non-successful run", "run_id", runID, "state", state, "note", attention)
+			}
 		}
 		rec := spec.record(state)
 		rec.SessionID = session.SessionID
