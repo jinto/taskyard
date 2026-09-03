@@ -54,6 +54,31 @@ func PreviousRunText(id, state, detail string) string {
 	return head + "\n" + detail
 }
 
+// DefaultAnalyzeTemplate은 1단계(분석·설계)의 기본 템플릿이다(PRD §7.2). 코드를
+// 바꾸지 않고 보고서만 남긴다. 프로젝트의 analyze_template이 비어 있으면 이것.
+const DefaultAnalyzeTemplate = `다음 이슈를 분석하고 설계하라. 코드를 바꾸지 말고 커밋도 하지 마라 — 이 단계의 산출물은 보고서 하나다.
+
+{{issue}}
+
+프로젝트 기억:
+{{memory}}
+
+절차:
+1. 관련 코드를 읽고 이슈가 실제로 무엇을 요구하는지 정리한다.
+2. 보고서를 ` + "`.taskyard/artifacts/analysis.md`" + `에 쓴다. 담을 것:
+   - 문제: 무엇이 왜 문제인지, 한 문단
+   - 관련 코드: 파일과 함수, 바꿔야 할 자리
+   - 설계: 어떻게 바꿀지, 대안이 있으면 왜 이쪽인지
+   - 검증: 어떤 테스트로 확인할지
+   - 위험: 데이터·호환성·성능에 미치는 영향
+   - 크기: 한 번의 실행으로 끝낼 수 있는지. 아니면 어떻게 쪼갤지
+3. 보고서를 쓰면 정상 종료한다.
+
+멈추고 보고해야 하는 경우 — 이유를 ` + "`.taskyard/attention.md`" + ` 파일에 쓴 뒤 정상 종료하라:
+- 이슈가 요구하는 것이 코드베이스와 모순되거나 제품 동작을 바꿔야 할 때
+- 이슈만으로는 무엇을 원하는지 알 수 없을 때
+`
+
 // DefaultExecuteTemplate은 프로젝트를 만들 때 채워지는 범용 실행 템플릿이다.
 // 특정 사용자의 스킬에 의존하지 않는다. 프로젝트 설정에서 덮어쓴다.
 const DefaultExecuteTemplate = `다음 이슈를 해결하라.
