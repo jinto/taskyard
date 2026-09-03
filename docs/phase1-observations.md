@@ -64,6 +64,17 @@
 7. **이슈 상태 전이가 관측대로 움직였다.** #1 succeeded → review, #2 needs_attention →
    in_progress 유지, #2′ succeeded → review. 재시도 Run의 `previous_run_id`·`feedback`·
    `workspace_run_id`가 원장에 남았다.
+8. **PR 경로 실전 확인(2026-09-04, PR #7 머지 뒤).** playground에 GitHub 원격
+   (`jinto/playground`)을 붙이고 이슈 #4(Whisper 함수)를 돌렸다. 러너가 사용자의 `gh`
+   로그인으로 push·PR 생성(`jinto/playground#1`), 이슈 `review`, 사람이 GitHub에서 merge
+   → 20초 폴링이 MERGED를 감지 → 이슈 `done`. 승인은 1회(복합 Bash 명령). 두 가지가 남았다:
+   - **worktree 정리가 `default.profraw` 때문에 보존됐다.** 관측 5번의 파일이 미추적 상태로
+     남아 "미커밋 변경 있음"으로 걸린다 — 규칙대로다. 이 머신에서 `go test`가 그 파일을
+     만드는 한 Go 저장소의 worktree는 자동 정리되지 않는다. 해법은 저장소의 `.gitignore`
+     (또는 사용자 전역 gitignore)에 `*.profraw`를 넣는 것이고, Taskyard가 무시 목록을 따로
+     갖지는 않는다.
+   - **PR 본문이 대체 텍스트였다.** live 프로젝트의 템플릿이 PR #7 이전 것이라 summary.md
+     지시가 없었다. 템플릿을 갱신했으니 다음 실행부터 에이전트의 변경 설명이 본문이 된다.
 
 ## 다음 PR(B: 산출물 + 단계)에 미치는 영향
 
