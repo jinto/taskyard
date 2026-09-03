@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -60,6 +61,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if err := os.MkdirAll(filepath.Dir(*dbPath), 0o755); err != nil {
+		slog.Error("create db directory failed", "err", err)
+		os.Exit(1)
+	}
 	sp, err := spool.Open(*dbPath)
 	if err != nil {
 		slog.Error("open spool failed", "err", err)
