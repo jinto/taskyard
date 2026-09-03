@@ -151,6 +151,26 @@ func brokerMCPConfig(url, token string) (string, error) {
 	return string(raw), nil
 }
 
+// mcpToolTimeout은 Claude Code가 MCP 도구 호출 하나를 기다리는 한도다(ms).
+// 승인 브로커도 MCP 도구라서 이 한도 안에 사람이 눌러야 한다 — 기본 60초는
+// 사람의 속도가 아니다. 지나면 "timed out" 오류가 에이전트에 돌아가고 같은
+// 승인을 다시 묻는다(2026-09-04 관측). 하루로 올린다.
+const mcpToolTimeout = "MCP_TOOL_TIMEOUT=86400000"
+
+// AgentEnv는 에이전트 프로세스의 환경이다: 과금 변수를 빼고(ScrubEnv) MCP
+// 도구 호출 한도를 올린다. 사용자가 이미 정한 MCP_TOOL_TIMEOUT은 덮어쓴다 —
+// 승인 대기가 그보다 짧아지면 안 된다.
+func AgentEnv(env []string) []string {
+	out := ScrubEnv(env)
+	kept := out[:0]
+	for _, entry := range out {
+		if !strings.HasPrefix(entry, "MCP_TOOL_TIMEOUT=") {
+			kept = append(kept, entry)
+		}
+	}
+	return append(kept, mcpToolTimeout)
+}
+
 // ScrubEnv는 API 과금용 변수를 제거한 환경을 돌려준다.
 func ScrubEnv(env []string) []string {
 	out := make([]string, 0, len(env))

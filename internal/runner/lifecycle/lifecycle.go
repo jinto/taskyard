@@ -434,7 +434,7 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, spec r
 
 	cmd := exec.CommandContext(ctx, m.cfg.ClaudeBinary, args...)
 	cmd.Dir = spec.ws.Path
-	cmd.Env = claudecode.ScrubEnv(os.Environ())
+	cmd.Env = claudecode.AgentEnv(os.Environ())
 	cmd.Stderr = os.Stderr
 
 	stdout, err := cmd.StdoutPipe()

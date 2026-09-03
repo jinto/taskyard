@@ -46,6 +46,11 @@
     list.appendChild(row);
     list.scrollTop = list.scrollHeight;
 
+    if (ev.type === "run.state_changed" && ev.state) {
+      const badge = document.getElementById("run-state");
+      badge.textContent = ev.state;
+      badge.className = "badge " + ev.badge;
+    }
     if (ev.type === "approval_requested") {
       pendingRequestID = ev.request_id;
       text.textContent = ev.input || ev.summary;
