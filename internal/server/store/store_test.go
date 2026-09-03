@@ -238,21 +238,21 @@ func TestProjectAllowedToolsRoundTrip(t *testing.T) {
 	if len(got.AllowedTools) != 2 || got.AllowedTools[0] != "Edit" || got.AllowedTools[1] != "Bash(go test:*)" {
 		t.Fatalf("AllowedTools = %q", got.AllowedTools)
 	}
-	if err := s.UpdateProjectSettings(p.Key, p.ExecuteTemplate, []string{"Read"}); err != nil {
+	if err := s.UpdateProjectSettings(p.Key, ProjectSettings{ExecuteTemplate: p.ExecuteTemplate, AllowedTools: []string{"Read"}, CreatePR: true, CleanupMerged: true}); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = s.GetProject("shop")
 	if len(got.AllowedTools) != 1 || got.AllowedTools[0] != "Read" {
 		t.Fatalf("after update AllowedTools = %q", got.AllowedTools)
 	}
-	if err := s.UpdateProjectSettings(p.Key, p.ExecuteTemplate, nil); err != nil {
+	if err := s.UpdateProjectSettings(p.Key, ProjectSettings{ExecuteTemplate: p.ExecuteTemplate}); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = s.GetProject("shop")
 	if len(got.AllowedTools) != 0 {
 		t.Fatalf("cleared AllowedTools = %q, want none", got.AllowedTools)
 	}
-	if err := s.UpdateProjectSettings("nope", "x", nil); !errors.Is(err, ErrProjectNotFound) {
+	if err := s.UpdateProjectSettings("nope", ProjectSettings{ExecuteTemplate: "x"}); !errors.Is(err, ErrProjectNotFound) {
 		t.Fatalf("err = %v, want ErrProjectNotFound", err)
 	}
 }
@@ -281,7 +281,7 @@ func TestOpenMigratesProjectsAllowedTools(t *testing.T) {
 	if err != nil || len(p.AllowedTools) != 0 {
 		t.Fatalf("GetProject = %+v, err = %v", p, err)
 	}
-	if err := s.UpdateProjectSettings("shop", "t", []string{"Edit"}); err != nil {
+	if err := s.UpdateProjectSettings("shop", ProjectSettings{ExecuteTemplate: "t", AllowedTools: []string{"Edit"}}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -290,14 +290,14 @@ func TestUpdateProjectSettings(t *testing.T) {
 	s := openTemp(t)
 	seedProject(t, s, "shop")
 
-	if err := s.UpdateProjectSettings("shop", "new {{issue}}", []string{"Edit"}); err != nil {
+	if err := s.UpdateProjectSettings("shop", ProjectSettings{ExecuteTemplate: "new {{issue}}", AllowedTools: []string{"Edit"}}); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := s.GetProject("shop")
 	if got.ExecuteTemplate != "new {{issue}}" || len(got.AllowedTools) != 1 || got.AllowedTools[0] != "Edit" {
 		t.Fatalf("project = %+v", got)
 	}
-	if err := s.UpdateProjectSettings("nope", "x", nil); !errors.Is(err, ErrProjectNotFound) {
+	if err := s.UpdateProjectSettings("nope", ProjectSettings{ExecuteTemplate: "x"}); !errors.Is(err, ErrProjectNotFound) {
 		t.Fatalf("err = %v, want ErrProjectNotFound", err)
 	}
 }
@@ -741,4 +741,156 @@ func TestOpenIsIdempotentOnCurrentSchema(t *testing.T) {
 		t.Fatalf("second Open: %v", err)
 	}
 	_ = s2.Close()
+}
+
+// ---- PR 생성·추적 (계획 2026-09-03-phase1-pr) ----
+
+func prEvent(t *testing.T, runID string, seq uint64, pr protocol.PRUpdatedBody) protocol.Envelope {
+	t.Helper()
+	env, err := protocol.NewEvent(protocol.EvPRUpdated, runID, seq, map[string]any{"body": pr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.Seq = seq
+	return env
+}
+
+func TestProjectPolicyRoundTrip(t *testing.T) {
+	s := openTemp(t)
+	p, err := s.CreateProject(Project{Key: "shop", Name: "shop", RepoPath: "/r", DefaultBranch: "main", CreatePR: true, CleanupMerged: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetProject("shop")
+	if !got.CreatePR || got.CleanupMerged {
+		t.Fatalf("CreateProject lost policies: %+v", got)
+	}
+	if err := s.UpdateProjectSettings(p.Key, ProjectSettings{ExecuteTemplate: "t", CreatePR: false, CleanupMerged: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.GetProject("shop")
+	if got.CreatePR || !got.CleanupMerged || got.ExecuteTemplate != "t" {
+		t.Fatalf("UpdateProjectSettings lost policies: %+v", got)
+	}
+}
+
+func TestOpenMigratesProjectPolicies(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pr6.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// PR #6 시점의 projects 스키마(allowed_tools까지). 옛 행은 PRD 기본값 — 둘 다 켬.
+	if _, err := db.Exec(`CREATE TABLE projects (
+	  id TEXT PRIMARY KEY, key TEXT NOT NULL UNIQUE, name TEXT NOT NULL, repo_path TEXT NOT NULL,
+	  default_branch TEXT NOT NULL, execute_template TEXT NOT NULL, created_at INTEGER NOT NULL,
+	  allowed_tools TEXT NOT NULL DEFAULT '');
+	  INSERT INTO projects VALUES ('p1', 'shop', 'shop', '/r', 'main', 't', 1, '');`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on PR #6 schema: %v", err)
+	}
+	defer s.Close()
+	p, err := s.GetProject("shop")
+	if err != nil || !p.CreatePR || !p.CleanupMerged {
+		t.Fatalf("migrated project = %+v, err = %v; want both policies on", p, err)
+	}
+}
+
+func TestApplyPRUpdatedStoresAndMovesTaskToDone(t *testing.T) {
+	s := openTemp(t)
+	_, task := seedRunningTask(t, s)
+	if _, _, err := s.ApplyEvent(stateEvent(t, "run-1", 1, StateSucceeded)); err != nil {
+		t.Fatal(err)
+	}
+
+	open := protocol.PRUpdatedBody{URL: "https://github.com/o/r/pull/7", Number: 7, State: "OPEN", Checks: "pending"}
+	if _, _, err := s.ApplyEvent(prEvent(t, "run-1", 2, open)); err != nil {
+		t.Fatal(err)
+	}
+	run, _ := s.GetRun("run-1")
+	if run.PRURL != open.URL || run.PRNumber != 7 || run.PRState != "OPEN" || run.PRChecks != "pending" {
+		t.Fatalf("PR fields not stored: %+v", run)
+	}
+	if got, _ := s.GetTaskByID(task.ID); got.Status != TaskReview {
+		t.Fatalf("task after OPEN = %s, want review", got.Status)
+	}
+
+	merged := open
+	merged.State, merged.Checks, merged.Review, merged.WorktreeRemoved = "MERGED", "success", "APPROVED", true
+	if _, _, err := s.ApplyEvent(prEvent(t, "run-1", 3, merged)); err != nil {
+		t.Fatal(err)
+	}
+	run, _ = s.GetRun("run-1")
+	if run.PRState != "MERGED" || run.PRReview != "APPROVED" || run.PRChecks != "success" {
+		t.Fatalf("MERGED not stored: %+v", run)
+	}
+	if got, _ := s.GetTaskByID(task.ID); got.Status != TaskDone {
+		t.Fatalf("task after MERGED = %s, want done", got.Status)
+	}
+}
+
+func TestDoneDoesNotRegress(t *testing.T) {
+	s := openTemp(t)
+	_, task := seedRunningTask(t, s)
+	_, _, _ = s.ApplyEvent(stateEvent(t, "run-1", 1, StateSucceeded))
+	_, _, _ = s.ApplyEvent(prEvent(t, "run-1", 2, protocol.PRUpdatedBody{URL: "u", Number: 7, State: "MERGED"}))
+	if got, _ := s.GetTaskByID(task.ID); got.Status != TaskDone {
+		t.Fatalf("precondition: task = %s, want done", got.Status)
+	}
+
+	// 옛 Run의 늦은 succeeded는 done을 review로 되돌리지 못한다.
+	if _, _, err := s.ApplyEvent(stateEvent(t, "run-1", 3, StateSucceeded)); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetTaskByID(task.ID); got.Status != TaskDone {
+		t.Fatalf("late succeeded moved task to %s, want done kept", got.Status)
+	}
+
+	// 재시도로 새 Run이 최신이 되면, 옛 Run의 MERGED는 PR 필드만 저장하고 이슈는 건드리지 않는다.
+	if err := s.UpdateTaskStatus(task.ID, TaskInProgress); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertRun(Run{ID: "run-2", State: StateRunning, Kind: "structured", TaskID: task.ID, Stage: "execute", PreviousRunID: "run-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertRun(Run{ID: "run-old", State: StateSucceeded, Kind: "structured", TaskID: task.ID, Stage: "execute"}); err != nil {
+		t.Fatal(err)
+	}
+	// run-old는 run-2보다 뒤에 INSERT됐지만 created_at을 과거로 둔다 — 최신은 여전히 run-2.
+	if _, err := s.db.Exec(`UPDATE runs SET created_at = 1 WHERE id = 'run-old'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.ApplyEvent(prEvent(t, "run-old", 1, protocol.PRUpdatedBody{URL: "u2", Number: 8, State: "MERGED"})); err != nil {
+		t.Fatal(err)
+	}
+	if old, _ := s.GetRun("run-old"); old.PRState != "MERGED" {
+		t.Fatalf("PR fields not stored on non-latest run: %+v", old)
+	}
+	if got, _ := s.GetTaskByID(task.ID); got.Status != TaskInProgress {
+		t.Fatalf("MERGED on non-latest run moved task to %s, want in_progress kept", got.Status)
+	}
+}
+
+func TestApplyTerminalStoresSummary(t *testing.T) {
+	s := openTemp(t)
+	seedRunningTask(t, s)
+	env, err := protocol.NewEvent(protocol.EvRunStateChanged, "run-1", 1, map[string]any{
+		"body": map[string]any{"state": StateSucceeded, "detail": "", "summary": "Shout를 추가했다"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.Seq = 1
+	if _, _, err := s.ApplyEvent(env); err != nil {
+		t.Fatal(err)
+	}
+	run, _ := s.GetRun("run-1")
+	if run.Summary != "Shout를 추가했다" {
+		t.Fatalf("summary = %q", run.Summary)
+	}
 }
