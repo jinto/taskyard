@@ -95,3 +95,13 @@ func TestDefaultTemplateMentionsIssueAndMemory(t *testing.T) {
 		t.Error("DefaultExecuteTemplate has no stop-and-report instruction")
 	}
 }
+
+func TestDefaultTemplateAsksForSummaryNotPR(t *testing.T) {
+	// PR은 러너가 만든다(계획 2026-09-03-phase1-pr). 에이전트는 변경 설명만 남긴다.
+	if strings.Contains(DefaultExecuteTemplate, "gh pr create") {
+		t.Error("DefaultExecuteTemplate still tells the agent to create the PR")
+	}
+	if !strings.Contains(DefaultExecuteTemplate, ".taskyard/summary.md") {
+		t.Error("DefaultExecuteTemplate lacks the summary file instruction")
+	}
+}
