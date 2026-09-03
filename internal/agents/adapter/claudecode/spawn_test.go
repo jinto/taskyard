@@ -234,3 +234,19 @@ func TestScrubEnvRemovesBillingKeys(t *testing.T) {
 		t.Fatalf("kept %d vars (%v), want PATH and HOME only", len(got), got)
 	}
 }
+
+func TestAgentEnvScrubsBillingKeysAndLiftsMCPToolTimeout(t *testing.T) {
+	env := AgentEnv([]string{"ANTHROPIC_API_KEY=sk-x", "HOME=/h", "MCP_TOOL_TIMEOUT=1000"})
+	joined := strings.Join(env, "\n")
+	if strings.Contains(joined, "ANTHROPIC_API_KEY") {
+		t.Fatalf("billing key survived: %q", env)
+	}
+	if !strings.Contains(joined, "HOME=/h") {
+		t.Fatalf("ordinary variable dropped: %q", env)
+	}
+	// 승인 대기는 사람의 속도다. Claude Code의 MCP 도구 호출 기본 한도(60s)가
+	// 지나면 승인이 "실패"로 돌아가 에이전트가 다시 묻는다. 하루로 올린다.
+	if n := strings.Count(joined, "MCP_TOOL_TIMEOUT="); n != 1 || !strings.Contains(joined, "MCP_TOOL_TIMEOUT=86400000") {
+		t.Fatalf("MCP_TOOL_TIMEOUT not set exactly once to a day: %q", env)
+	}
+}
