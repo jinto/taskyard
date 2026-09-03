@@ -67,8 +67,9 @@ type SpawnOptions struct {
 }
 
 // allowedToolPattern은 허용 도구 항목의 문법이다: 도구 이름, 선택적으로
-// 괄호 안의 패턴. 쉼표·공백·줄바꿈은 안 된다 — 쉼표로 이어 값 하나로 넘기고,
-// "-"로 시작하는 것은 플래그로 파싱될 수 있다.
+// 괄호 안의 패턴("Bash(go test:*)"처럼 괄호 안 공백은 된다). 쉼표는 안
+// 된다 — 쉼표로 이어 값 하나로 넘기니까. 이름은 글자로 시작해야 하므로
+// "-"로 시작하는 플래그 모양은 걸러진다.
 var allowedToolPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*(\([^(),\s][^(),\n]*\))?$`)
 
 // CheckAllowedTools는 항목 전부가 문법에 맞는지 본다. 웹 설정 폼과 BuildArgs가
@@ -76,7 +77,7 @@ var allowedToolPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*(\([^(),\s][^
 func CheckAllowedTools(tools []string) error {
 	for _, t := range tools {
 		if !allowedToolPattern.MatchString(t) {
-			return fmt.Errorf("claudecode: invalid allowed tool %q (want Name or Name(pattern), no commas or spaces)", t)
+			return fmt.Errorf("claudecode: invalid allowed tool %q (want Name or Name(pattern), no commas or newlines)", t)
 		}
 	}
 	return nil
