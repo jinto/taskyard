@@ -4,7 +4,9 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/jinto/taskyard/internal/protocol"
 )
@@ -892,5 +894,186 @@ func TestApplyTerminalStoresSummary(t *testing.T) {
 	run, _ := s.GetRun("run-1")
 	if run.Summary != "Shout를 추가했다" {
 		t.Fatalf("summary = %q", run.Summary)
+	}
+}
+
+// ---- 산출물과 1단계 (계획 2026-09-04-phase1-stages) ----
+
+func artifactEvent(t *testing.T, runID string, seq uint64, name, content string, truncated bool) protocol.Envelope {
+	t.Helper()
+	env, err := protocol.NewEvent(protocol.EvArtifactAdded, runID, seq, map[string]any{
+		"body": protocol.ArtifactBody{Name: name, Content: content, Truncated: truncated},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.Seq = seq
+	return env
+}
+
+func TestArtifactEventIsStoredAndListed(t *testing.T) {
+	s := openTemp(t)
+	seedRunningTask(t, s)
+	for _, e := range []protocol.Envelope{
+		artifactEvent(t, "run-1", 1, "notes.txt", "n", false),
+		artifactEvent(t, "run-1", 2, "analysis.md", "# 분석", true),
+		artifactEvent(t, "run-1", 3, "analysis.md", "다른 내용", false), // 재전송: 첫 내용 유지
+	} {
+		if _, _, err := s.ApplyEvent(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	list, err := s.Artifacts("run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 || list[0].Name != "analysis.md" || list[1].Name != "notes.txt" {
+		t.Fatalf("Artifacts = %+v; want two, name order", list)
+	}
+	a, err := s.Artifact("run-1", "analysis.md")
+	if err != nil || a.Content != "# 분석" || !a.Truncated {
+		t.Fatalf("Artifact = %+v, err = %v", a, err)
+	}
+	if _, err := s.Artifact("run-1", "nope"); !errors.Is(err, ErrArtifactNotFound) {
+		t.Fatalf("err = %v, want ErrArtifactNotFound", err)
+	}
+}
+
+func TestAnalyzeSucceededKeepsTaskInProgress(t *testing.T) {
+	s := openTemp(t)
+	_, task := seedRunningTask(t, s)
+	if err := s.UpsertRun(Run{ID: "run-1", State: StateRunning, Kind: "structured", TaskID: task.ID, Stage: StageAnalyze}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.ApplyEvent(stateEvent(t, "run-1", 1, StateSucceeded)); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetTaskByID(task.ID); got.Status != TaskInProgress {
+		t.Fatalf("analyze succeeded moved task to %s, want in_progress", got.Status)
+	}
+	// 2단계는 기존대로 review.
+	if err := s.UpsertRun(Run{ID: "run-2", State: StateRunning, Kind: "structured", TaskID: task.ID, Stage: StageExecute}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.ApplyEvent(stateEvent(t, "run-2", 1, StateSucceeded)); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetTaskByID(task.ID); got.Status != TaskReview {
+		t.Fatalf("execute succeeded moved task to %s, want review", got.Status)
+	}
+}
+
+func TestLatestSucceededRunByStage(t *testing.T) {
+	s := openTemp(t)
+	_, task := seedRunningTask(t, s)
+	if _, ok, _ := s.LatestSucceededRun(task.ID, StageAnalyze); ok {
+		t.Fatal("no analyze run yet, got ok")
+	}
+	for i, r := range []Run{
+		{ID: "a1", State: StateSucceeded, Stage: StageAnalyze},
+		{ID: "e1", State: StateFailed, Stage: StageExecute},
+		{ID: "a2", State: StateSucceeded, Stage: StageAnalyze},
+		{ID: "a3", State: StateNeedsAttention, Stage: StageAnalyze},
+	} {
+		r.Kind, r.TaskID, r.CreatedAt = "structured", task.ID, time.Unix(int64(100+i), 0)
+		if err := s.UpsertRun(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, ok, err := s.LatestSucceededRun(task.ID, StageAnalyze)
+	if err != nil || !ok || got.ID != "a2" {
+		t.Fatalf("LatestSucceededRun = %+v ok=%v err=%v; want a2", got, ok, err)
+	}
+}
+
+func TestProjectAnalyzeSettingsRoundTripAndDefaults(t *testing.T) {
+	s := openTemp(t)
+	p, err := s.CreateProject(Project{Key: "shop", Name: "shop", RepoPath: "/r", DefaultBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetProject("shop")
+	if got.AnalyzeTemplate == "" || !strings.Contains(got.AnalyzeTemplate, "analysis.md") {
+		t.Fatalf("empty analyze template should read as the default, got %q", got.AnalyzeTemplate)
+	}
+	if err := s.UpdateProjectSettings(p.Key, ProjectSettings{ExecuteTemplate: "t", AnalyzeTemplate: "분석 {{issue}}", AnalyzeEnabled: false, AnalyzeSkipBelow: 50}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.GetProject("shop")
+	if got.AnalyzeTemplate != "분석 {{issue}}" || got.AnalyzeEnabled || got.AnalyzeSkipBelow != 50 {
+		t.Fatalf("settings lost: %+v", got)
+	}
+}
+
+func TestOpenMigratesProjectAnalyzeColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pr7.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// PR #7 시점의 projects 스키마. 옛 행: 1단계 켬, 200자 미만 생략, 기본 템플릿.
+	if _, err := db.Exec(`CREATE TABLE projects (
+	  id TEXT PRIMARY KEY, key TEXT NOT NULL UNIQUE, name TEXT NOT NULL, repo_path TEXT NOT NULL,
+	  default_branch TEXT NOT NULL, execute_template TEXT NOT NULL, created_at INTEGER NOT NULL,
+	  allowed_tools TEXT NOT NULL DEFAULT '', create_pr INTEGER NOT NULL DEFAULT 1, cleanup_merged INTEGER NOT NULL DEFAULT 1);
+	  INSERT INTO projects VALUES ('p1', 'shop', 'shop', '/r', 'main', 't', 1, '', 1, 1);`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on PR #7 schema: %v", err)
+	}
+	defer s.Close()
+	p, err := s.GetProject("shop")
+	if err != nil || !p.AnalyzeEnabled || p.AnalyzeSkipBelow != 200 || !strings.Contains(p.AnalyzeTemplate, "analysis.md") {
+		t.Fatalf("migrated project = %+v, err = %v", p, err)
+	}
+}
+
+func TestCreateRunIfIdle(t *testing.T) {
+	s := openTemp(t)
+	_, task := seedRunningTask(t, s) // run-1 running
+	err := s.CreateRunIfIdle(Run{ID: "run-2", State: StateQueued, Kind: "structured", TaskID: task.ID, Stage: StageExecute})
+	if !errors.Is(err, ErrRunActive) {
+		t.Fatalf("err = %v, want ErrRunActive", err)
+	}
+	if _, err := s.GetRun("run-2"); !errors.Is(err, ErrRunNotFound) {
+		t.Fatal("run-2 must not exist after a refused create")
+	}
+	if _, _, err := s.ApplyEvent(stateEvent(t, "run-1", 1, StateSucceeded)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateRunIfIdle(Run{ID: "run-2", State: StateQueued, Kind: "structured", TaskID: task.ID, Stage: StageExecute, ReportRunID: "run-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetRun("run-2"); got.ReportRunID != "run-1" {
+		t.Fatalf("ReportRunID lost: %+v", got)
+	}
+}
+
+func TestTasksAwaitingExecute(t *testing.T) {
+	s := openTemp(t)
+	p := seedProject(t, s, "shop")
+	t1 := seedTask(t, s, p, "one")
+	t2 := seedTask(t, s, p, "two")
+	t3 := seedTask(t, s, p, "three")
+	for i, r := range []Run{
+		{ID: "t1-a", TaskID: t1.ID, State: StateSucceeded, Stage: StageAnalyze},
+		{ID: "t2-a", TaskID: t2.ID, State: StateSucceeded, Stage: StageAnalyze},
+		{ID: "t2-e", TaskID: t2.ID, State: StateRunning, Stage: StageExecute},
+		{ID: "t3-a", TaskID: t3.ID, State: StateNeedsAttention, Stage: StageAnalyze},
+	} {
+		r.Kind, r.CreatedAt = "structured", time.Unix(int64(100+i), 0)
+		if err := s.UpsertRun(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.TasksAwaitingExecute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Task.ID != t1.ID || got[0].AnalyzeRun.ID != "t1-a" {
+		t.Fatalf("TasksAwaitingExecute = %+v; want only task one with t1-a", got)
 	}
 }
