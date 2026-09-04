@@ -342,6 +342,10 @@ func (s *Server) handleProject(w http.ResponseWriter, r *http.Request) {
 				c.Line = stopLine("판단 필요", run.Detail)
 			case run.State == store.StateFailed || run.State == store.StateOrphaned:
 				c.Line = stopLine("멈춤", run.Detail)
+			case run.Stage == store.StageAnalyze && run.State == store.StateSucceeded:
+				// 1단계는 보고서만 남긴다(PRD §7.2). 러너가 붙어 있으면 곧바로
+				// 2단계가 이어지지만, 그 전까지 카드는 무엇을 기다리는지 말한다.
+				c.Line = "분석 보고서 · 실행을 기다린다"
 			case run.State == store.StateRunning || run.State == store.StateQueued:
 				c.Live = true
 				if env, ok := activity[run.ID]; ok {

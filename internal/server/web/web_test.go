@@ -1586,3 +1586,20 @@ func readSSE(t *testing.T, r io.Reader) string {
 		return ""
 	}
 }
+
+func TestProjectBoardCardShowsTheReportIsWaiting(t *testing.T) {
+	st, h := newServer(t)
+	p := seedProject(t, st, "shop", "/repos/shop")
+	task := seedTask(t, st, p, "분석부터 하는 이슈", "")
+	if err := st.UpdateTaskStatus(task.ID, store.TaskReview); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertRun(store.Run{ID: "run-1", State: store.StateSucceeded, Kind: "structured", TaskID: task.ID, Stage: store.StageAnalyze}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1단계가 끝난 카드는 결과가 아니라 다음 차례를 말한다.
+	if body := get(h, "/projects/shop").Body.String(); !strings.Contains(body, "분석 보고서") {
+		t.Errorf("보고서가 나왔다는 것을 카드가 말하지 않는다:\n%s", body)
+	}
+}
