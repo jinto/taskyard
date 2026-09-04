@@ -16,10 +16,11 @@
     <h2 class="flex items-baseline gap-2 px-2 py-1.5 text-sm font-semibold">{{.Title}} <span class="font-normal text-muted">{{len .Cards}}</span></h2>
     <div class="space-y-2">
     {{range .Cards}}
-      <article class="rounded border border-line bg-white p-3 dark:border-zinc-800 dark:bg-zinc-900">
+      <article class="rounded border bg-white p-3 dark:bg-zinc-900 {{if .Waiting}}border-attention border-2 dark:border-attention{{else}}border-line dark:border-zinc-800{{end}}">
         <a href="/projects/{{$.Project.Key}}/issues/{{.Task.Number}}" class="block text-sm font-medium leading-snug hover:underline">{{.Task.Title}}</a>
         <div class="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted">
           <span class="font-mono">#{{.Task.Number}}</span>
+          {{if .Waiting}}<span class="badge bg-attention text-white">승인 대기</span>{{end}}
           {{with .Run}}
             <a href="/runs/{{.ID}}" class="badge {{badge .State}}">{{.State}}</a>
             <span class="font-mono">{{.Stage}}</span>

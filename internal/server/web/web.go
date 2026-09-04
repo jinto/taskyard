@@ -202,6 +202,9 @@ type column struct {
 type card struct {
 	Task store.Task
 	Run  *store.Run
+	// Waiting은 이 카드의 Run이 지금 사람의 승인을 기다린다는 뜻이다. 보드에서
+	// 유일하게 손이 필요한 카드이므로 눈에 띄게 그린다.
+	Waiting bool
 }
 
 // handleProject는 프로젝트를 칸반 보드로 그린다. 열 사이로 카드를 끌어 옮기는
@@ -223,6 +226,13 @@ func (s *Server) handleProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	waiting := map[string]bool{}
+	if pending, err := s.st.PendingApprovals(); err == nil {
+		for _, a := range pending {
+			waiting[a.RunID] = true
+		}
+	}
+
 	cols := []column{
 		{Status: store.TaskBacklog, Title: "대기"},
 		{Status: store.TaskInProgress, Title: "진행"},
@@ -241,6 +251,7 @@ func (s *Server) handleProject(w http.ResponseWriter, r *http.Request) {
 		c := card{Task: task}
 		if run, ok := latest[task.ID]; ok {
 			c.Run = &run
+			c.Waiting = waiting[run.ID]
 		}
 		cols[i].Cards = append(cols[i].Cards, c)
 	}

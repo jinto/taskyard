@@ -1391,3 +1391,27 @@ func TestSettingsMovesOffTheBoard(t *testing.T) {
 		t.Errorf("Location = %q, want /projects/shop/settings", loc)
 	}
 }
+
+func TestProjectBoardMarksCardsWaitingForApproval(t *testing.T) {
+	st, h := newServer(t)
+	p := seedProject(t, st, "shop", "/repos/shop")
+	task := seedTask(t, st, p, "승인을 기다리는 이슈", "")
+	if err := st.UpdateTaskStatus(task.ID, store.TaskInProgress); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertRun(store.Run{ID: "run-7", State: store.StateRunning, Kind: "structured", TaskID: task.ID, Stage: store.StageExecute}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.ApplyEvent(mustEvent(t, protocol.EvApprovalRequested, "run-7", 1, map[string]any{
+		"request_id": "r1", "tool_use_id": "t1", "tool_name": "Bash", "input": map[string]any{"command": "go test ./..."},
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	// 돌아가는 카드와 사람을 기다리는 카드는 한눈에 달라야 한다 — 기다리는
+	// 쪽이 보드에서 유일하게 사람의 손을 필요로 하는 카드다.
+	body := get(h, "/projects/shop").Body.String()
+	if !strings.Contains(body, "승인 대기") {
+		t.Fatalf("보드가 승인 대기를 표시하지 않는다:\n%s", body)
+	}
+}
