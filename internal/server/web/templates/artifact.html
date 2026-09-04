@@ -1,0 +1,6 @@
+{{define "crumbs"}}<span class="text-muted">/</span><a href="/runs/{{.Artifact.RunID}}" class="font-mono text-xs hover:underline">{{.Artifact.RunID}}</a><span class="text-muted">/</span><span>{{.Artifact.Name}}</span>{{end}}
+{{define "content"}}
+<h1 class="text-xl font-semibold tracking-tight">{{.Artifact.Name}}</h1>
+<p class="hint mt-1 font-mono text-xs">{{.Artifact.CreatedAt.Format "2006-01-02 15:04:05"}}{{if .Artifact.Truncated}} <span class="mx-1">·</span> 256KiB에서 잘렸습니다{{end}}</p>
+<pre class="mt-6 max-w-full overflow-x-auto whitespace-pre-wrap rounded border border-line p-4 font-mono text-[13px] leading-relaxed dark:border-zinc-800">{{.Artifact.Content}}</pre>
+{{end}}

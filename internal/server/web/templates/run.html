@@ -7,6 +7,7 @@
 </div>
 <p class="hint mt-1 font-mono text-xs">{{.Run.Stage}}{{if .Run.Branch}} <span class="mx-1">·</span> {{.Run.Branch}}{{end}}</p>
 <p class="hint mt-1 text-xs" id="usage">{{.Usage}}</p>
+{{if .Artifacts}}<div class="mt-3 flex flex-wrap items-center gap-2 text-sm"><span class="text-muted">산출물</span>{{range .Artifacts}}<a href="/runs/{{.RunID}}/artifacts/{{.Name}}" class="text-go hover:underline">{{.Name}}</a>{{end}}</div>{{end}}
 
 <div class="mt-6 rounded-lg border-2 border-attention bg-attention-soft p-4 dark:bg-attention/15" id="approval" hidden>
   <div class="text-sm font-semibold text-attention">승인이 필요합니다</div>
