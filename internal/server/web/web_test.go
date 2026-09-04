@@ -1,9 +1,11 @@
 package web_test
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -46,6 +48,13 @@ func newServerWithHub(t *testing.T) (*store.Store, *hub.Hub, http.Handler) {
 // attachRunner는 실제 link.Link로 가짜 러너를 hub에 붙인다. 받은 명령은
 // got 채널로 나온다. 웹 트리거가 실제로 어떤 봉투를 보내는지 확인할 때 쓴다.
 func attachRunner(t *testing.T, hb *hub.Hub, routes http.Handler) <-chan protocol.Envelope {
+	got, _, _ := attachRunnerLink(t, hb, routes)
+	return got
+}
+
+// attachRunnerLink는 붙인 러너의 Link와 서버 주소까지 돌려준다. 러너가 실제로
+// 이벤트를 올리는 흐름(러너 → hub → 화면)을 시험할 때 쓴다.
+func attachRunnerLink(t *testing.T, hb *hub.Hub, routes http.Handler) (<-chan protocol.Envelope, *link.Link, string) {
 	t.Helper()
 
 	mux := http.NewServeMux()
@@ -86,7 +95,7 @@ func attachRunner(t *testing.T, hb *hub.Hub, routes http.Handler) <-chan protoco
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	return got
+	return got, l, srv.URL
 }
 
 func get(h http.Handler, path string) *httptest.ResponseRecorder {
@@ -283,14 +292,22 @@ func TestUpdateTemplateFromProjectPage(t *testing.T) {
 
 // ---- 이슈 ----
 
-func TestCreateIssueAssignsNumber(t *testing.T) {
+func TestCreateIssueAssignsNumberAndStaysOnTheBoard(t *testing.T) {
 	st, h := newServer(t)
 	seedProject(t, st, "shop", "/repos/shop")
 
-	for i, want := range []string{"/projects/shop/issues/1", "/projects/shop/issues/2"} {
+	// 이슈를 만든 사람은 보드를 보고 있었다. 상세 화면으로 끌고 가지 않는다 —
+	// 연달아 여러 개를 적어 넣는 것이 보드에서 하는 가장 흔한 일이다.
+	for i := 1; i <= 2; i++ {
 		rec := postForm(h, "/projects/shop/issues", url.Values{"title": {"이슈"}, "body": {"본문"}})
-		if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != want {
-			t.Fatalf("issue %d: status = %d location = %q, want 303 to %s", i+1, rec.Code, rec.Header().Get("Location"), want)
+		if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/projects/shop" {
+			t.Fatalf("issue %d: status = %d location = %q, want 303 to /projects/shop", i, rec.Code, rec.Header().Get("Location"))
+		}
+	}
+	body := get(h, "/projects/shop").Body.String()
+	for _, want := range []string{"SHOP-1", "SHOP-2"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("보드에 %q 가 없다:\n%s", want, body)
 		}
 	}
 	if rec := postForm(h, "/projects/shop/issues", url.Values{"title": {""}}); rec.Code != http.StatusBadRequest {
@@ -1411,7 +1428,161 @@ func TestProjectBoardMarksCardsWaitingForApproval(t *testing.T) {
 	// 돌아가는 카드와 사람을 기다리는 카드는 한눈에 달라야 한다 — 기다리는
 	// 쪽이 보드에서 유일하게 사람의 손을 필요로 하는 카드다.
 	body := get(h, "/projects/shop").Body.String()
-	if !strings.Contains(body, "승인 대기") {
-		t.Fatalf("보드가 승인 대기를 표시하지 않는다:\n%s", body)
+	if !strings.Contains(body, `class="card wait"`) {
+		t.Fatalf("기다리는 카드가 도드라지지 않는다:\n%s", body)
+	}
+	if !strings.Contains(body, `>승인 대기</a>`) || strings.Contains(body, ` hidden>승인 대기</a>`) {
+		t.Fatalf("승인 대기 배지가 서 있지 않다:\n%s", body)
+	}
+	if !strings.Contains(body, "go test ./...") {
+		t.Errorf("무엇을 승인해 달라는지가 없다:\n%s", body)
+	}
+
+	// 그냥 돌아가는 카드에는 배지가 숨어 있다 — 스트림이 켜기 전까지는.
+	quiet := seedTask(t, st, p, "조용히 도는 이슈", "")
+	if err := st.UpdateTaskStatus(quiet.ID, store.TaskInProgress); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertRun(store.Run{ID: "run-8", State: store.StateRunning, Kind: "structured", TaskID: quiet.ID, Stage: store.StageExecute}); err != nil {
+		t.Fatal(err)
+	}
+	if body := get(h, "/projects/shop").Body.String(); !strings.Contains(body, ` hidden>승인 대기</a>`) {
+		t.Errorf("기다리지 않는 카드에 배지 자리가 없다:\n%s", body)
+	}
+}
+
+// ---- 보드는 살아 있다 ----
+
+func TestProjectBoardCardShowsWhatTheAgentIsDoing(t *testing.T) {
+	st, h := newServer(t)
+	p := seedProject(t, st, "shop", "/repos/shop")
+	task := seedTask(t, st, p, "돌아가는 이슈", "")
+	if err := st.UpdateTaskStatus(task.ID, store.TaskInProgress); err != nil {
+		t.Fatal(err)
+	}
+	seedRun(t, st, task, "run-1", store.StateRunning, "", "")
+	for _, ev := range []protocol.Envelope{
+		mustEvent(t, protocol.EvToolStarted, "run-1", 1, map[string]any{"tool_name": "Read", "input": map[string]any{"file_path": "/repo/README.md"}}),
+		mustEvent(t, protocol.EvToolStarted, "run-1", 2, map[string]any{"tool_name": "Bash", "input": map[string]any{"command": "go test ./..."}}),
+	} {
+		if _, _, err := st.ApplyEvent(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	body := get(h, "/projects/shop").Body.String()
+	// 카드는 마지막 한 걸음만 말한다 — 지금 무엇을 하는 중인지.
+	if !strings.Contains(body, "go test ./...") {
+		t.Errorf("카드가 지금 하는 일을 보여주지 않는다:\n%s", body)
+	}
+	if strings.Contains(body, "README.md") {
+		t.Error("지나간 도구 호출이 카드에 남아 있다 — 카드는 한 줄이다")
+	}
+	if !strings.Contains(body, `class="spinner`) {
+		t.Error("도는 아이콘이 없다 — 돌아가는 카드가 멈춘 것처럼 보인다")
+	}
+	if !strings.Contains(body, `data-task="1"`) {
+		t.Error("카드에 이슈 번호가 표시되지 않았다 — 실시간 갱신이 카드를 찾지 못한다")
+	}
+}
+
+func TestProjectBoardCardShowsWhyItStopped(t *testing.T) {
+	st, h := newServer(t)
+	p := seedProject(t, st, "shop", "/repos/shop")
+	stuck := seedTask(t, st, p, "판단이 필요한 이슈", "")
+	if err := st.UpdateTaskStatus(stuck.ID, store.TaskInProgress); err != nil {
+		t.Fatal(err)
+	}
+	seedRun(t, st, stuck, "run-1", store.StateNeedsAttention, "", "결제 모듈을 갈아엎을지 정해 주세요")
+	broken := seedTask(t, st, p, "깨진 이슈", "")
+	if err := st.UpdateTaskStatus(broken.ID, store.TaskInProgress); err != nil {
+		t.Fatal(err)
+	}
+	seedRun(t, st, broken, "run-2", store.StateFailed, "", "go build 실패")
+
+	body := get(h, "/projects/shop").Body.String()
+	for _, want := range []string{"판단 필요", "결제 모듈을 갈아엎을지 정해 주세요", "멈춤", "go build 실패"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("보드에 %q 가 없다:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, `class="spinner`) {
+		t.Error("멈춘 카드가 아직 돌고 있다")
+	}
+}
+
+func TestBoardStreamCarriesOnlyThisProjectsRuns(t *testing.T) {
+	st, hb, routes := newServerWithHub(t)
+	_, l, base := attachRunnerLink(t, hb, routes)
+
+	shop := seedProject(t, st, "shop", "/repos/shop")
+	mine := seedTask(t, st, shop, "우리 이슈", "")
+	seedRun(t, st, mine, "run-mine", store.StateRunning, "", "")
+	other := seedProject(t, st, "wms", "/repos/wms")
+	theirs := seedTask(t, st, other, "남의 이슈", "")
+	seedRun(t, st, theirs, "run-theirs", store.StateRunning, "", "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/projects/shop/stream", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 스트림은 열리자마자 머리말을 흘려보낸다 — 그래서 여기까지 오면 구독이
+	// 붙었다는 뜻이고, 뒤이어 내는 이벤트를 놓칠 일이 없다.
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if err := l.Publish("run-theirs", mustEvent(t, protocol.EvToolStarted, "run-theirs", 1,
+		map[string]any{"tool_name": "Bash", "input": map[string]any{"command": "남의 명령"}})); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Publish("run-mine", mustEvent(t, protocol.EvToolStarted, "run-mine", 1,
+		map[string]any{"tool_name": "Bash", "input": map[string]any{"command": "go test ./..."}})); err != nil {
+		t.Fatal(err)
+	}
+
+	var ev struct {
+		Task int    `json:"task"`
+		Line string `json:"line"`
+	}
+	line := readSSE(t, resp.Body)
+	if err := json.Unmarshal([]byte(line), &ev); err != nil {
+		t.Fatalf("스트림이 보낸 것을 읽을 수 없다 (%v): %q", err, line)
+	}
+	if ev.Task != mine.Number {
+		t.Errorf("task = %d, want %d", ev.Task, mine.Number)
+	}
+	if !strings.Contains(ev.Line, "go test ./...") {
+		t.Errorf("line = %q", ev.Line)
+	}
+	if strings.Contains(ev.Line, "남의 명령") {
+		t.Error("남의 프로젝트 이벤트가 이 보드로 새어 들어왔다")
+	}
+}
+
+// readSSE는 스트림에서 다음 data: 줄 하나를 읽는다. 스트림은 스스로 끝나지
+// 않으므로 기다리는 시간에 끝을 둔다.
+func readSSE(t *testing.T, r io.Reader) string {
+	t.Helper()
+	got := make(chan string, 1)
+	go func() {
+		sc := bufio.NewScanner(r)
+		for sc.Scan() {
+			if after, ok := strings.CutPrefix(sc.Text(), "data: "); ok {
+				got <- after
+				return
+			}
+		}
+	}()
+	select {
+	case line := <-got:
+		return line
+	case <-time.After(5 * time.Second):
+		t.Fatal("보드 스트림에서 아무것도 오지 않았다")
+		return ""
 	}
 }

@@ -499,6 +499,46 @@ func (s *Store) LatestRunByTask(projectID string) (map[string]Run, error) {
 	return out, rows.Err()
 }
 
+// LatestActivityByProject는 지금 돌고 있는 Run마다 사람이 볼 마지막 진행
+// 이벤트 하나를 돌려준다. 보드의 카드가 "지금 무엇을 하는 중인지" 한 줄로
+// 말하기 위한 것이다. 끝난 Run은 들어 있지 않다 — 열이 이미 결과를 말한다.
+func (s *Store) LatestActivityByProject(projectID string) (map[string]protocol.Envelope, error) {
+	rows, err := s.db.Query(`
+		SELECT run_id, payload FROM run_events
+		 WHERE type IN (?, ?, ?)
+		   AND run_id IN (SELECT id FROM runs
+		                   WHERE state IN (?, ?)
+		                     AND task_id IN (SELECT id FROM tasks WHERE project_id = ?))
+		 ORDER BY run_id, seq DESC`,
+		protocol.EvMessageDelta, protocol.EvToolStarted, protocol.EvToolFinished,
+		StateQueued, StateRunning, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("query latest activity: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]protocol.Envelope{}
+	for rows.Next() {
+		var (
+			runID   string
+			payload []byte
+		)
+		if err := rows.Scan(&runID, &payload); err != nil {
+			return nil, fmt.Errorf("scan activity: %w", err)
+		}
+		// run_id 안에서 seq 내림차순이므로 Run마다 처음 만난 것이 마지막 걸음이다.
+		if _, seen := out[runID]; seen {
+			continue
+		}
+		var env protocol.Envelope
+		if err := json.Unmarshal(payload, &env); err != nil {
+			return nil, fmt.Errorf("unmarshal activity: %w", err)
+		}
+		out[runID] = env
+	}
+	return out, rows.Err()
+}
+
 // ApplyEvent는 이벤트를 저장하고 ack 커서를 가능한 만큼 전진시킨다.
 // accepted는 이번 호출로 새로 저장됐는지를 뜻한다. 이미 있던 seq면 false다.
 //

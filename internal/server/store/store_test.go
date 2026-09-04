@@ -1215,3 +1215,53 @@ func TestLatestRunByTaskKeepsOnlyTheNewestPerTask(t *testing.T) {
 		t.Errorf("b의 최신 Run = %s, want run-b1", got.ID)
 	}
 }
+
+func TestLatestActivityByProjectKeepsNewestPerActiveRun(t *testing.T) {
+	s := openTemp(t)
+	p := seedProject(t, s, "shop")
+	live := seedTask(t, s, p, "돌아가는 이슈")
+	done := seedTask(t, s, p, "끝난 이슈")
+	for _, r := range []Run{
+		{ID: "run-live", State: StateRunning, Kind: "structured", TaskID: live.ID},
+		{ID: "run-done", State: StateSucceeded, Kind: "structured", TaskID: done.ID},
+	} {
+		if err := s.UpsertRun(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, env := range []protocol.Envelope{
+		toolEvent(t, "run-live", 1, "Read"),
+		toolEvent(t, "run-live", 2, "Bash"),
+		toolEvent(t, "run-done", 1, "Write"),
+	} {
+		if _, _, err := s.ApplyEvent(env); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.LatestActivityByProject(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 끝난 Run은 카드에 할 말이 없다 — 열이 이미 결과를 말한다.
+	if _, ok := got["run-done"]; ok {
+		t.Error("끝난 Run의 이벤트까지 실어 왔다")
+	}
+	env, ok := got["run-live"]
+	if !ok {
+		t.Fatalf("돌아가는 Run이 없다: %v", got)
+	}
+	if env.Seq != 2 {
+		t.Errorf("seq = %d, want 2 — 카드는 마지막 한 걸음만 말한다", env.Seq)
+	}
+}
+
+func toolEvent(t *testing.T, runID string, seq uint64, tool string) protocol.Envelope {
+	t.Helper()
+	env, err := protocol.NewEvent(protocol.EvToolStarted, runID, seq, map[string]any{"body": map[string]any{"tool_name": tool}})
+	if err != nil {
+		t.Fatalf("NewEvent: %v", err)
+	}
+	env.Seq = seq
+	return env
+}

@@ -152,6 +152,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /projects", sameOrigin(s.handleProjectCreate))
 	mux.HandleFunc("GET /projects/{key}", s.handleProject)
 	mux.HandleFunc("GET /projects/{key}/settings", s.handleSettings)
+	mux.HandleFunc("GET /projects/{key}/stream", s.handleBoardStream)
 	mux.HandleFunc("POST /projects/{key}/template", sameOrigin(s.handleTemplateUpdate))
 	mux.HandleFunc("POST /projects/{key}/issues", sameOrigin(s.handleIssueCreate))
 	mux.HandleFunc("GET /projects/{key}/issues/{n}", s.handleIssue)
@@ -263,6 +264,21 @@ type card struct {
 	// Waiting은 이 카드의 Run이 지금 사람의 승인을 기다린다는 뜻이다. 보드에서
 	// 유일하게 손이 필요한 카드이므로 눈에 띄게 그린다.
 	Waiting bool
+	// Live는 러너가 지금 이 이슈를 붙들고 있다는 뜻이다 — 아이콘이 돈다.
+	// 사람을 기다리는 동안은 돌지 않는다: 그때 움직이는 것은 아무것도 없다.
+	Live bool
+	// Line은 카드가 말하는 한 줄이다. 돌아가는 중이면 방금 한 일, 기다리는
+	// 중이면 무엇을 승인해 달라는지, 멈췄으면 왜 멈췄는지. SSE가 이 자리를
+	// 새로 고친다.
+	Line string
+}
+
+// stopLine은 멈춘 Run의 한 줄이다. 이유가 없으면 이름만 남는다.
+func stopLine(label, detail string) string {
+	if d := firstLine(detail, 90); d != "" {
+		return label + " · " + d
+	}
+	return label
 }
 
 // handleProject는 프로젝트를 칸반 보드로 그린다. 열 사이로 카드를 끌어 옮기는
@@ -284,11 +300,16 @@ func (s *Server) handleProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	waiting := map[string]bool{}
+	waiting := map[string]string{}
 	if pending, err := s.st.PendingApprovals(); err == nil {
 		for _, a := range pending {
-			waiting[a.RunID] = true
+			waiting[a.RunID] = a.Command
 		}
+	}
+	activity, err := s.st.LatestActivityByProject(p.ID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
 	}
 
 	cols := []column{
@@ -309,7 +330,24 @@ func (s *Server) handleProject(w http.ResponseWriter, r *http.Request) {
 		c := card{Task: task}
 		if run, ok := latest[task.ID]; ok {
 			c.Run = &run
-			c.Waiting = waiting[run.ID]
+			cmd, isWaiting := waiting[run.ID]
+			switch {
+			case isWaiting:
+				// 배지가 이미 "승인 대기"라고 말한다. 한 줄은 무엇을 승인해
+				// 달라는지만 말한다.
+				c.Waiting = true
+				c.Line = firstLine(cmd, 90)
+			case run.State == store.StateNeedsAttention:
+				// 에이전트가 스스로 멈추고 사람의 판단을 남겨 두었다(PRD §7.5).
+				c.Line = stopLine("판단 필요", run.Detail)
+			case run.State == store.StateFailed || run.State == store.StateOrphaned:
+				c.Line = stopLine("멈춤", run.Detail)
+			case run.State == store.StateRunning || run.State == store.StateQueued:
+				c.Live = true
+				if env, ok := activity[run.ID]; ok {
+					c.Line = activityLine(env)
+				}
+			}
 		}
 		cols[i].Cards = append(cols[i].Cards, c)
 	}
@@ -401,12 +439,13 @@ func (s *Server) handleIssueCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "제목은 비울 수 없습니다", http.StatusBadRequest)
 		return
 	}
-	task, err := s.st.CreateTask(store.Task{ProjectID: p.ID, Title: title, Body: r.FormValue("body")})
-	if err != nil {
+	if _, err := s.st.CreateTask(store.Task{ProjectID: p.ID, Title: title, Body: r.FormValue("body")}); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, issuePath(p.Key, task.Number), http.StatusSeeOther)
+	// 이슈를 만든 사람은 보드를 보고 있었다. 상세 화면으로 끌고 가지 않는다 —
+	// 새 카드는 보드에 이미 있고, 실행 버튼도 거기 있다.
+	http.Redirect(w, r, "/projects/"+p.Key, http.StatusSeeOther)
 }
 
 func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
@@ -850,6 +889,128 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+// ---- 보드의 실시간 갱신 ----
+
+// boardEvent는 보드가 카드 하나를 고쳐 그리는 데 필요한 전부다. SSE로 나간다.
+type boardEvent struct {
+	Task int    `json:"task"`
+	Line string `json:"line,omitempty"`
+	// State가 있으면 그 이슈는 열을 옮겼을 수 있다. 열을 정하는 것은 서버의
+	// 일이므로 보드는 다시 그리지 않고 다시 받아온다.
+	State string `json:"state,omitempty"`
+	// Waiting은 사람을 기다리기 시작했다는 뜻, Resumed는 그 기다림이 끝났다는 뜻.
+	Waiting bool `json:"waiting,omitempty"`
+	Resumed bool `json:"resumed,omitempty"`
+}
+
+// activityLine은 진행 이벤트 하나를 카드의 한 줄로 줄인다. Run 상세와 같은
+// 문장을 쓰되 카드에 들어갈 만큼만 자른다.
+func activityLine(env protocol.Envelope) string {
+	return firstLine(summarize(env).Summary, 90)
+}
+
+// boardView는 이벤트 하나를 카드 갱신으로 옮긴다. 보드가 신경 쓰지 않는
+// 이벤트(사용량, 산출물 따위)면 ok가 거짓이다.
+func boardView(env protocol.Envelope, task int) (boardEvent, bool) {
+	ev := boardEvent{Task: task}
+	switch env.Type {
+	case protocol.EvMessageDelta, protocol.EvToolStarted, protocol.EvToolFinished:
+		ev.Line = activityLine(env)
+		// 도구가 끝났다는 것은 그 도구의 승인도 끝났다는 뜻이다(Run 상세와 같다).
+		ev.Resumed = env.Type == protocol.EvToolFinished
+	case protocol.EvApprovalRequested:
+		view := summarize(env)
+		line := view.Input
+		if line == "" {
+			line = view.Summary
+		}
+		ev.Line, ev.Waiting = firstLine(line, 90), true
+	case protocol.EvRunStateChanged:
+		if ev.State = summarize(env).State; ev.State == "" {
+			return boardEvent{}, false
+		}
+	default:
+		return boardEvent{}, false
+	}
+	return ev, true
+}
+
+// handleBoardStream은 이 프로젝트의 Run에서 나오는 것만 보드로 흘려보낸다.
+// PRD §11.4.1은 실시간 화면을 Run 상세 하나로 두었지만, 보드에 카드가 여럿
+// 돌아가는 지금은 보드도 살아 있어야 한다 — 어느 카드가 지금 무엇을 하는지
+// 보려고 상세로 들어갔다 나오는 것이 일이 되어서는 안 된다.
+func (s *Server) handleBoardStream(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.loadProject(w, r)
+	if !ok {
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	events, unsubscribe := s.hub.Subscribe()
+	defer unsubscribe()
+
+	// 구독이 붙었다는 것을 곧바로 알린다. 첫 이벤트까지 머리말을 붙들면
+	// 연결이 섰는지 아무도 알 수 없다.
+	fmt.Fprint(w, ": ok\n\n")
+	flusher.Flush()
+
+	// run_id → 이슈 번호. 0은 "이 프로젝트의 Run이 아니다"라는 뜻으로 남긴다 —
+	// 남의 프로젝트가 쏟아내는 이벤트마다 원장을 두드리지 않기 위해서다.
+	number := map[string]int{}
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case env, ok := <-events:
+			if !ok {
+				return
+			}
+			if env.RunID == "" {
+				continue
+			}
+			n, seen := number[env.RunID]
+			if !seen {
+				n = s.taskNumber(p.ID, env.RunID)
+				number[env.RunID] = n
+			}
+			if n == 0 {
+				continue
+			}
+			view, ok := boardView(env, n)
+			if !ok {
+				continue
+			}
+			raw, err := json.Marshal(view)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(w, "data: %s\n\n", raw)
+			flusher.Flush()
+		}
+	}
+}
+
+// taskNumber는 Run이 이 프로젝트의 몇 번 이슈의 것인지를 찾는다. 아니면 0.
+func (s *Server) taskNumber(projectID, runID string) int {
+	run, err := s.st.GetRun(runID)
+	if err != nil || run.TaskID == "" {
+		return 0
+	}
+	task, err := s.st.GetTaskByID(run.TaskID)
+	if err != nil || task.ProjectID != projectID {
+		return 0
+	}
+	return task.Number
 }
 
 type approveRequest struct {
