@@ -53,6 +53,60 @@ func badgeClass(state string) string {
 	}
 }
 
+// dotClass는 상태 점의 색이다. 촘촘한 보드에서는 배지 대신 점이 상태를 나른다 —
+// 돌아가는 Run만 깜빡여서, 멈춘 것과 움직이는 것이 한눈에 갈린다.
+func dotClass(state string) string {
+	switch state {
+	case store.StateRunning:
+		return "bg-sky-500 animate-pulse"
+	case store.StateQueued:
+		return "bg-zinc-400"
+	case store.StateSucceeded:
+		return "bg-go"
+	case store.StateFailed, store.StateOrphaned:
+		return "bg-red-500"
+	case store.StateNeedsAttention, store.StateWaitingApproval:
+		return "bg-attention"
+	default:
+		return "bg-zinc-300 dark:bg-zinc-600"
+	}
+}
+
+// since는 사람이 읽는 상대 시각이다. 보드에서는 절대 시각이 필요 없다 —
+// "얼마나 오래 저러고 있나"만 알면 된다.
+func since(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "방금"
+	case d < time.Hour:
+		return fmt.Sprintf("%d분 전", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%d시간 전", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%d일 전", int(d.Hours()/24))
+	}
+}
+
+// checkMark는 PR 체크 요약(none/pending/success/failure)을 기호 하나로 줄인다.
+// 볼 것이 없으면 nil이라 템플릿의 with가 통째로 건너뛴다.
+type checkMark struct{ Mark, Class string }
+
+func prChecks(s string) *checkMark {
+	switch s {
+	case "success":
+		return &checkMark{"✓", "text-go"}
+	case "failure":
+		return &checkMark{"✕", "text-red-600 dark:text-red-400"}
+	case "pending":
+		return &checkMark{"◌", "text-muted"}
+	}
+	return nil
+}
+
 type Server struct {
 	st  *store.Store
 	hub *hub.Hub
@@ -70,7 +124,10 @@ type Server struct {
 func New(st *store.Store, h *hub.Hub) (*Server, error) {
 	var err error
 	page := func(name string) *template.Template {
-		t, perr := template.New("layout.html").Funcs(template.FuncMap{"badge": badgeClass, "seg": url.PathEscape}).
+		t, perr := template.New("layout.html").Funcs(template.FuncMap{
+			"badge": badgeClass, "seg": url.PathEscape, "dot": dotClass,
+			"since": since, "checks": prChecks, "upper": strings.ToUpper,
+		}).
 			ParseFS(templateFS, "templates/layout.html", "templates/"+name)
 		if perr != nil && err == nil {
 			err = fmt.Errorf("parse %s: %w", name, perr)
@@ -194,6 +251,7 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 type column struct {
 	Status string
 	Title  string
+	Dot    string
 	Cards  []card
 }
 
@@ -234,10 +292,10 @@ func (s *Server) handleProject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cols := []column{
-		{Status: store.TaskBacklog, Title: "대기"},
-		{Status: store.TaskInProgress, Title: "진행"},
-		{Status: store.TaskReview, Title: "리뷰"},
-		{Status: store.TaskDone, Title: "완료"},
+		{Status: store.TaskBacklog, Title: "대기", Dot: "bg-zinc-400"},
+		{Status: store.TaskInProgress, Title: "진행", Dot: "bg-sky-500"},
+		{Status: store.TaskReview, Title: "리뷰", Dot: "bg-attention"},
+		{Status: store.TaskDone, Title: "완료", Dot: "bg-go"},
 	}
 	index := map[string]int{}
 	for i, c := range cols {
