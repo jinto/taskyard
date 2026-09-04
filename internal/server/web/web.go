@@ -61,6 +61,7 @@ type Server struct {
 
 	projects *template.Template
 	project  *template.Template
+	settings *template.Template
 	issue    *template.Template
 	run      *template.Template
 	artifact *template.Template
@@ -80,6 +81,7 @@ func New(st *store.Store, h *hub.Hub) (*Server, error) {
 		st: st, hub: h, launcher: &launch.Launcher{Store: st, Commander: h},
 		projects: page("projects.html"),
 		project:  page("project.html"),
+		settings: page("settings.html"),
 		issue:    page("issue.html"),
 		run:      page("run.html"),
 		artifact: page("artifact.html"),
@@ -92,6 +94,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /{$}", s.handleProjects)
 	mux.HandleFunc("POST /projects", sameOrigin(s.handleProjectCreate))
 	mux.HandleFunc("GET /projects/{key}", s.handleProject)
+	mux.HandleFunc("GET /projects/{key}/settings", s.handleSettings)
 	mux.HandleFunc("POST /projects/{key}/template", sameOrigin(s.handleTemplateUpdate))
 	mux.HandleFunc("POST /projects/{key}/issues", sameOrigin(s.handleIssueCreate))
 	mux.HandleFunc("GET /projects/{key}/issues/{n}", s.handleIssue)
@@ -187,6 +190,26 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/projects/"+p.Key, http.StatusSeeOther)
 }
 
+// column은 보드의 세로줄 하나다. 열은 이슈 상태와 1:1이고 순서가 곧 흐름이다.
+type column struct {
+	Status string
+	Title  string
+	Cards  []card
+}
+
+// card는 이슈 하나와, 있다면 그 이슈의 가장 최근 Run이다. Run은 포인터다 —
+// 템플릿의 with가 "Run이 없는 이슈"를 구분할 수 있어야 하기 때문이다.
+type card struct {
+	Task store.Task
+	Run  *store.Run
+	// Waiting은 이 카드의 Run이 지금 사람의 승인을 기다린다는 뜻이다. 보드에서
+	// 유일하게 손이 필요한 카드이므로 눈에 띄게 그린다.
+	Waiting bool
+}
+
+// handleProject는 프로젝트를 칸반 보드로 그린다. 열 사이로 카드를 끌어 옮기는
+// 기능은 없다 — 이슈 상태는 사람이 정하는 것이 아니라 Run의 결과로 정해진다
+// (PRD §7.5). 사람이 여기서 하는 일은 대기 중인 이슈를 실행시키는 것뿐이다.
 func (s *Server) handleProject(w http.ResponseWriter, r *http.Request) {
 	p, ok := s.loadProject(w, r)
 	if !ok {
@@ -197,7 +220,53 @@ func (s *Server) handleProject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	s.render(w, s.project, map[string]any{"Title": p.Name, "Project": p, "Tasks": tasks})
+	latest, err := s.st.LatestRunByTask(p.ID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	waiting := map[string]bool{}
+	if pending, err := s.st.PendingApprovals(); err == nil {
+		for _, a := range pending {
+			waiting[a.RunID] = true
+		}
+	}
+
+	cols := []column{
+		{Status: store.TaskBacklog, Title: "대기"},
+		{Status: store.TaskInProgress, Title: "진행"},
+		{Status: store.TaskReview, Title: "리뷰"},
+		{Status: store.TaskDone, Title: "완료"},
+	}
+	index := map[string]int{}
+	for i, c := range cols {
+		index[c.Status] = i
+	}
+	for _, task := range tasks {
+		i, ok := index[task.Status]
+		if !ok {
+			i = 0 // 모르는 상태는 대기로 — 카드가 사라지는 것보다 낫다.
+		}
+		c := card{Task: task}
+		if run, ok := latest[task.ID]; ok {
+			c.Run = &run
+			c.Waiting = waiting[run.ID]
+		}
+		cols[i].Cards = append(cols[i].Cards, c)
+	}
+
+	s.render(w, s.project, map[string]any{
+		"Title": p.Name, "Project": p, "Columns": cols, "Backlog": store.TaskBacklog, "Wide": true,
+	})
+}
+
+func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.loadProject(w, r)
+	if !ok {
+		return
+	}
+	s.render(w, s.settings, map[string]any{"Title": p.Name + " 설정", "Project": p})
 }
 
 func (s *Server) handleTemplateUpdate(w http.ResponseWriter, r *http.Request) {
@@ -255,7 +324,7 @@ func (s *Server) handleTemplateUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/projects/"+p.Key, http.StatusSeeOther)
+	http.Redirect(w, r, "/projects/"+p.Key+"/settings", http.StatusSeeOther)
 }
 
 // ---- 이슈 ----

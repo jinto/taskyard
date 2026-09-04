@@ -50,12 +50,12 @@
 </head>
 <body class="min-h-screen bg-white font-sans text-[15px] leading-relaxed text-ink antialiased dark:bg-zinc-950 dark:text-zinc-100">
 <header class="border-b border-line dark:border-zinc-800">
-  <nav class="mx-auto flex h-12 max-w-3xl items-center gap-2 px-6 text-sm">
+  <nav class="mx-auto flex h-12 {{if .Wide}}max-w-7xl{{else}}max-w-3xl{{end}} items-center gap-2 px-6 text-sm">
     <a href="/" class="font-semibold tracking-tight">Taskyard</a>
     {{block "crumbs" .}}{{end}}
   </nav>
 </header>
-<main class="mx-auto max-w-3xl px-6 py-8">
+<main class="mx-auto {{if .Wide}}max-w-7xl{{else}}max-w-3xl{{end}} px-6 py-8">
 {{template "content" .}}
 </main>
 </body>

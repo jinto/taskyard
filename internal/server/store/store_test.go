@@ -1177,3 +1177,41 @@ func TestPendingApprovalIsTrackedAndCleared(t *testing.T) {
 		t.Fatalf("a settled run should have no pending approval: %+v", pending)
 	}
 }
+
+func TestLatestRunByTaskKeepsOnlyTheNewestPerTask(t *testing.T) {
+	s := openTemp(t)
+	p := seedProject(t, s, "shop")
+	a := seedTask(t, s, p, "a")
+	b := seedTask(t, s, p, "b")
+	seedTask(t, s, p, "아직 안 돌린 이슈")
+
+	for _, r := range []Run{
+		{ID: "run-a1", State: StateFailed, Kind: "structured", TaskID: a.ID, Stage: "analyze"},
+		{ID: "run-a2", State: StateRunning, Kind: "structured", TaskID: a.ID, Stage: "execute"},
+		{ID: "run-b1", State: StateSucceeded, Kind: "structured", TaskID: b.ID, Stage: "execute"},
+	} {
+		if err := s.UpsertRun(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 다른 프로젝트의 Run은 섞이지 않는다.
+	other := seedProject(t, s, "blog")
+	ot := seedTask(t, s, other, "남의 이슈")
+	if err := s.UpsertRun(Run{ID: "run-x", State: StateRunning, Kind: "structured", TaskID: ot.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	latest, err := s.LatestRunByTask(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(latest) != 2 {
+		t.Fatalf("latest = %d entries, want 2 (Run 없는 이슈는 없어야 한다)", len(latest))
+	}
+	if got := latest[a.ID]; got.ID != "run-a2" || got.State != StateRunning {
+		t.Errorf("a의 최신 Run = %+v, want run-a2 running", got)
+	}
+	if got := latest[b.ID]; got.ID != "run-b1" {
+		t.Errorf("b의 최신 Run = %s, want run-b1", got.ID)
+	}
+}

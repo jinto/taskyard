@@ -473,6 +473,32 @@ func (s *Store) RunsForTask(taskID string) ([]Run, error) {
 	return out, rows.Err()
 }
 
+// LatestRunByTask는 프로젝트의 이슈마다 가장 최근 Run 하나를 돌려준다.
+// 보드가 카드 N개마다 질의하지 않게 하기 위한 것이다. Run이 없는 이슈는
+// 아예 키가 없다 — 호출자는 있음/없음으로 구분한다.
+func (s *Store) LatestRunByTask(projectID string) (map[string]Run, error) {
+	rows, err := s.db.Query(`SELECT `+runColumns+` FROM runs
+	                          WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?)
+	                          ORDER BY created_at DESC, rowid DESC`, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("query latest runs: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]Run{}
+	for rows.Next() {
+		r, err := scanRun(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan run: %w", err)
+		}
+		// 정렬이 최신순이므로 이슈마다 처음 만난 것이 최신이다.
+		if _, seen := out[r.TaskID]; !seen {
+			out[r.TaskID] = r
+		}
+	}
+	return out, rows.Err()
+}
+
 // ApplyEvent는 이벤트를 저장하고 ack 커서를 가능한 만큼 전진시킨다.
 // accepted는 이번 호출로 새로 저장됐는지를 뜻한다. 이미 있던 seq면 false다.
 //
