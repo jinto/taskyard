@@ -136,7 +136,12 @@ func (s *Server) handleProjects(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	s.render(w, s.projects, map[string]any{"Title": "프로젝트", "Projects": projects})
+	pending, err := s.st.PendingApprovals()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	s.render(w, s.projects, map[string]any{"Title": "프로젝트", "Projects": projects, "Pending": pending})
 }
 
 func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
@@ -843,6 +848,10 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 
 	if body.Allow && body.Remember {
 		s.rememberRule(id, body.RequestID)
+	}
+	// 화면에서 즉시 지운다 — 러너의 tool_finished를 기다리지 않는다.
+	if err := s.st.ClearPendingApproval(id, body.RequestID); err != nil {
+		slog.Error("clear pending approval failed", "run_id", id, "err", err)
 	}
 
 	// Runner가 없으면 결정이 갈 곳이 없다. 성공으로 위장하지 않는다 —
