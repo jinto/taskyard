@@ -1189,7 +1189,7 @@ func TestApproveWithRememberAddsRuleToProject(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK && rec.Code != http.StatusAccepted {
+	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
 	got, _ := st.GetProject("shop")

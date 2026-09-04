@@ -54,6 +54,15 @@ func PreviousRunText(id, state, detail string) string {
 	return head + "\n" + detail
 }
 
+// DefaultAllowedTools는 새 프로젝트가 시작하는 허용 도구다. 빈 목록으로
+// 시작하면 모든 도구 호출이 사람을 기다려 실행이 사실상 멈춘다(2026-09-04 관측).
+// 되돌릴 수 없는 것(push, reset, rm, 네트워크)은 넣지 않는다 — 사람이 직접
+// 골라 넣는다.
+var DefaultAllowedTools = []string{
+	"Read", "Edit", "Write", "Glob", "Grep",
+	"Bash(ls:*)", "Bash(cat:*)", "Bash(git status:*)", "Bash(git log:*)", "Bash(git diff:*)", "Bash(git show:*)",
+}
+
 // DefaultAnalyzeTemplate은 1단계(분석·설계)의 기본 템플릿이다(PRD §7.2). 코드를
 // 바꾸지 않고 보고서만 남긴다. 프로젝트의 analyze_template이 비어 있으면 이것.
 const DefaultAnalyzeTemplate = `다음 이슈를 분석하고 설계하라. 코드를 바꾸지 말고 커밋도 하지 마라 — 이 단계의 산출물은 보고서 하나다.
@@ -73,6 +82,8 @@ const DefaultAnalyzeTemplate = `다음 이슈를 분석하고 설계하라. 코�
    - 위험: 데이터·호환성·성능에 미치는 영향
    - 크기: 한 번의 실행으로 끝낼 수 있는지. 아니면 어떻게 쪼갤지
 3. 보고서를 쓰면 정상 종료한다.
+
+명령은 하나씩 실행한다. 세미콜론이나 && 로 여러 명령을 묶으면 승인 규칙에 걸려 사람을 기다리게 된다.
 
 멈추고 보고해야 하는 경우 — 이유를 ` + "`.taskyard/attention.md`" + ` 파일에 쓴 뒤 정상 종료하라:
 - 이슈가 요구하는 것이 코드베이스와 모순되거나 제품 동작을 바꿔야 할 때
@@ -97,6 +108,8 @@ const DefaultExecuteTemplate = `다음 이슈를 해결하라.
 3. 테스트와 린트를 통과시킨다.
 4. 의미 단위로 커밋한다. 커밋 메시지에 이슈 번호를 넣는다.
 5. 변경 설명을 ` + "`.taskyard/summary.md`" + `에 쓴다 — 무엇을 왜 바꿨는지, 리뷰어가 먼저 볼 곳. 이 파일은 커밋하지 않는다(PR 본문이 된다).
+
+명령은 하나씩 실행한다. 세미콜론이나 && 로 여러 명령을 묶으면 승인 규칙에 걸려 사람을 기다리게 된다.
 
 멈추고 보고해야 하는 경우 — 계속 시도하지 말고, 이유를 ` + "`.taskyard/attention.md`" + ` 파일에 쓴 뒤 정상 종료하라. 사람이 읽고 다음 행동을 정한다:
 - 테스트나 CI가 반복 실패하고 원인을 모르겠을 때
