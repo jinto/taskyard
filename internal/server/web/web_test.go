@@ -1335,12 +1335,12 @@ func TestProjectBoardCardShowsLatestRun(t *testing.T) {
 	if err := st.UpdateTaskStatus(task.ID, store.TaskInProgress); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UpsertRun(store.Run{ID: "run-9", State: store.StateRunning, Kind: "structured", TaskID: task.ID, Stage: store.StageExecute}); err != nil {
+	if err := st.UpsertRun(store.Run{ID: "run-9", State: store.StateRunning, Kind: "structured", TaskID: task.ID, Stage: store.StageExecute, Branch: "taskyard/1"}); err != nil {
 		t.Fatal(err)
 	}
 
 	body := get(h, "/projects/shop").Body.String()
-	for _, want := range []string{"/runs/run-9", store.StateRunning, store.StageExecute} {
+	for _, want := range []string{"/runs/run-9", store.StateRunning, store.StageExecute, "taskyard/1", "방금"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("카드에 %q 가 없다:\n%s", want, body)
 		}
