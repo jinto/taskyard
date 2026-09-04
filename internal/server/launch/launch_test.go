@@ -268,7 +268,10 @@ func TestChainPendingRacesWithManualStart(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		wg.Add(2)
 		go func() { defer wg.Done(); l.ChainPending() }()
-		go func() { defer wg.Done(); _, _ = l.Start(p, task, launch.Options{Stage: store.StageExecute, ReportRunID: a.ID}) }()
+		go func() {
+			defer wg.Done()
+			_, _ = l.Start(p, task, launch.Options{Stage: store.StageExecute, ReportRunID: a.ID})
+		}()
 	}
 	wg.Wait()
 	runs, _ := st.RunsForTask(task.ID)
