@@ -1143,3 +1143,93 @@ func TestRetryInheritsStageAndReport(t *testing.T) {
 		t.Fatalf("retry run = %+v", runs[0])
 	}
 }
+
+func TestSuggestRuleFromApproval(t *testing.T) {
+	cases := []struct {
+		tool, command, want string
+	}{
+		{"Bash", "go test ./...", "Bash(go test:*)"},
+		{"Bash", "git commit -m x", "Bash(git commit:*)"},
+		{"Bash", "ls -la", "Bash(ls:*)"},
+		{"Bash", "gofmt -l .", "Bash(gofmt:*)"},
+		{"Bash", "go test ./... && go vet ./...", ""}, // 묶은 명령은 규칙으로 못 만든다
+		{"Bash", "", ""},
+		{"Edit", "", "Edit"},
+		{"mcp__x__y", "", "mcp__x__y"},
+		{"", "", ""},
+	}
+	for _, tc := range cases {
+		var input map[string]any
+		if tc.command != "" {
+			input = map[string]any{"command": tc.command}
+		}
+		if got := web.SuggestRule(tc.tool, input); got != tc.want {
+			t.Errorf("SuggestRule(%q, %q) = %q, want %q", tc.tool, tc.command, got, tc.want)
+		}
+	}
+}
+
+func TestApproveWithRememberAddsRuleToProject(t *testing.T) {
+	st, hb, h := newServerWithHub(t)
+	_ = attachRunner(t, hb, h)
+	p, err := st.CreateProject(store.Project{Key: "shop", Name: "s", RepoPath: "/repos/shop", DefaultBranch: "main",
+		ExecuteTemplate: "{{issue}}", AllowedTools: []string{"Read"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := seedTask(t, st, p, "제목", "b")
+	seedRun(t, st, task, "run-1", store.StateRunning, "", "")
+	if _, _, err := st.ApplyEvent(mustEvent(t, protocol.EvApprovalRequested, "run-1", 1, map[string]any{
+		"request_id": "r1", "tool_use_id": "t1", "tool_name": "Bash", "input": map[string]any{"command": "go test ./..."},
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/runs/run-1/approve", strings.NewReader(`{"request_id":"r1","allow":true,"remember":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK && rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	got, _ := st.GetProject("shop")
+	if len(got.AllowedTools) != 2 || got.AllowedTools[1] != "Bash(go test:*)" {
+		t.Fatalf("AllowedTools = %q; want the remembered rule appended", got.AllowedTools)
+	}
+
+	// 같은 규칙을 두 번 기억해도 늘어나지 않는다.
+	req2 := httptest.NewRequest(http.MethodPost, "/runs/run-1/approve", strings.NewReader(`{"request_id":"r1","allow":true,"remember":true}`))
+	req2.Header.Set("Content-Type", "application/json")
+	h.ServeHTTP(httptest.NewRecorder(), req2)
+	got, _ = st.GetProject("shop")
+	if len(got.AllowedTools) != 2 {
+		t.Fatalf("duplicate rule was added again: %q", got.AllowedTools)
+	}
+}
+
+func TestRunPageOffersRememberOnApproval(t *testing.T) {
+	st, h := newServer(t)
+	_, task := seedRetryProject(t, st)
+	seedRun(t, st, task, "run-1", store.StateRunning, "", "")
+	if _, _, err := st.ApplyEvent(mustEvent(t, protocol.EvApprovalRequested, "run-1", 1, map[string]any{
+		"request_id": "r1", "tool_name": "Bash", "input": map[string]any{"command": "go test ./..."},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	body := get(h, "/runs/run-1").Body.String()
+	if !strings.Contains(body, "Bash(go test:*)") {
+		t.Fatalf("run page does not surface the rule to remember:\n%s", body)
+	}
+}
+
+func TestCreateProjectStartsWithDefaultAllowedTools(t *testing.T) {
+	st, h := newServer(t)
+	rec := postForm(h, "/projects", url.Values{"key": {"shop"}, "name": {"s"}, "repo_path": {"/repos/shop"}, "default_branch": {"main"}})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	p, _ := st.GetProject("shop")
+	if len(p.AllowedTools) == 0 {
+		t.Fatal("a new project should start with a working allow list")
+	}
+}
