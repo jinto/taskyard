@@ -21,11 +21,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/jinto/taskyard/internal/agents/adapter/claudecode"
 	"github.com/jinto/taskyard/internal/protocol"
 	"github.com/jinto/taskyard/internal/server/hub"
+	"github.com/jinto/taskyard/internal/server/launch"
 	"github.com/jinto/taskyard/internal/server/pipeline"
 	"github.com/jinto/taskyard/internal/server/store"
 )
@@ -57,16 +56,19 @@ type Server struct {
 	st  *store.Store
 	hub *hub.Hub
 
+	launcher *launch.Launcher
+
 	projects *template.Template
 	project  *template.Template
 	issue    *template.Template
 	run      *template.Template
+	artifact *template.Template
 }
 
 func New(st *store.Store, h *hub.Hub) (*Server, error) {
 	var err error
 	page := func(name string) *template.Template {
-		t, perr := template.New("layout.html").Funcs(template.FuncMap{"badge": badgeClass}).
+		t, perr := template.New("layout.html").Funcs(template.FuncMap{"badge": badgeClass, "seg": url.PathEscape}).
 			ParseFS(templateFS, "templates/layout.html", "templates/"+name)
 		if perr != nil && err == nil {
 			err = fmt.Errorf("parse %s: %w", name, perr)
@@ -74,11 +76,12 @@ func New(st *store.Store, h *hub.Hub) (*Server, error) {
 		return t
 	}
 	s := &Server{
-		st: st, hub: h,
+		st: st, hub: h, launcher: &launch.Launcher{Store: st, Commander: h},
 		projects: page("projects.html"),
 		project:  page("project.html"),
 		issue:    page("issue.html"),
 		run:      page("run.html"),
+		artifact: page("artifact.html"),
 	}
 	return s, err
 }
@@ -93,6 +96,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /projects/{key}/issues/{n}", s.handleIssue)
 	mux.HandleFunc("POST /projects/{key}/issues/{n}/run", sameOrigin(s.handleIssueRun))
 	mux.HandleFunc("GET /runs/{id}", s.handleRun)
+	mux.HandleFunc("GET /runs/{id}/artifacts/{name}", s.handleArtifact)
 	mux.HandleFunc("GET /runs/{id}/stream", s.handleStream)
 	mux.HandleFunc("POST /runs/{id}/approve", sameOrigin(s.handleApprove))
 	mux.HandleFunc("POST /runs/{id}/cancel", sameOrigin(s.handleCancel))
@@ -140,13 +144,15 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := store.Project{
-		Key:             r.FormValue("key"),
-		Name:            r.FormValue("name"),
-		RepoPath:        r.FormValue("repo_path"),
-		DefaultBranch:   r.FormValue("default_branch"),
-		ExecuteTemplate: pipeline.DefaultExecuteTemplate,
-		CreatePR:        r.FormValue("create_pr") != "",
-		CleanupMerged:   r.FormValue("cleanup_merged") != "",
+		Key:              r.FormValue("key"),
+		Name:             r.FormValue("name"),
+		RepoPath:         r.FormValue("repo_path"),
+		DefaultBranch:    r.FormValue("default_branch"),
+		ExecuteTemplate:  pipeline.DefaultExecuteTemplate,
+		CreatePR:         r.FormValue("create_pr") != "",
+		CleanupMerged:    r.FormValue("cleanup_merged") != "",
+		AnalyzeEnabled:   true,
+		AnalyzeSkipBelow: 200,
 	}
 	switch {
 	case !keyPattern.MatchString(p.Key):
@@ -209,12 +215,24 @@ func (s *Server) handleTemplateUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "허용 도구 형식이 잘못됐습니다: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	// 체크박스는 안 보내면 false — 폼이 항상 두 필드를 다루므로 그대로 저장한다.
+	skipBelow := 0
+	if v := strings.TrimSpace(r.FormValue("analyze_skip_below")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			http.Error(w, "분석 생략 기준은 0 이상의 정수여야 합니다", http.StatusBadRequest)
+			return
+		}
+		skipBelow = n
+	}
+	// 체크박스는 안 보내면 false — 폼이 항상 그 필드들을 다루므로 그대로 저장한다.
 	if err := s.st.UpdateProjectSettings(p.Key, store.ProjectSettings{
-		ExecuteTemplate: r.FormValue("execute_template"),
-		AllowedTools:    tools,
-		CreatePR:        r.FormValue("create_pr") != "",
-		CleanupMerged:   r.FormValue("cleanup_merged") != "",
+		ExecuteTemplate:  r.FormValue("execute_template"),
+		AllowedTools:     tools,
+		CreatePR:         r.FormValue("create_pr") != "",
+		CleanupMerged:    r.FormValue("cleanup_merged") != "",
+		AnalyzeTemplate:  r.FormValue("analyze_template"),
+		AnalyzeEnabled:   r.FormValue("analyze_enabled") != "",
+		AnalyzeSkipBelow: skipBelow,
 	}); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -258,9 +276,15 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 	}
 	// 화면의 행동은 최신 Run 하나를 기준으로 한다: 활성이면 [취소], 정착이면
 	// 재시도 폼(과 needs_attention이면 [취소]도), 없으면 [실행].
+	artifacts := map[string][]store.Artifact{}
+	for _, run := range runs {
+		if list, err := s.st.Artifacts(run.ID); err == nil && len(list) > 0 {
+			artifacts[run.ID] = list
+		}
+	}
 	data := map[string]any{
 		"Title": fmt.Sprintf("#%d %s", task.Number, task.Title), "Project": p, "Task": task, "Runs": runs,
-		"HasLatest": len(runs) > 0, "Done": task.Status == store.TaskDone,
+		"HasLatest": len(runs) > 0, "Done": task.Status == store.TaskDone, "Artifacts": artifacts,
 	}
 	if len(runs) > 0 {
 		latest := runs[0]
@@ -293,92 +317,33 @@ func (s *Server) handleIssueRun(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.launch(w, r, p, task, launch{})
-}
-
-// launch는 새 Run 하나를 시작하는 데 필요한 것이다. previous가 있으면 재시도다.
-type launch struct {
-	previous       store.Run
-	feedback       string
-	workspaceRunID string // 비어 있으면 새 Run 자신
-	resumeSession  string
-}
-
-func (s *Server) launch(w http.ResponseWriter, r *http.Request, p store.Project, task store.Task, l launch) {
-	runs, err := s.st.RunsForTask(task.ID)
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	for _, existing := range runs {
-		if !store.IsSettled(existing.State) {
-			http.Error(w, "이미 실행 중인 Run이 있습니다: "+existing.ID, http.StatusConflict)
-			return
+	o := launch.Options{Stage: launch.ChooseStage(p, task, r.FormValue("stage"))}
+	if o.Stage == store.StageExecute {
+		// "바로 실행"은 이슈의 가장 최근 성공한 1단계 보고서를 쓴다(없으면 없이).
+		if a, ok, _ := s.st.LatestSucceededRun(task.ID, store.StageAnalyze); ok {
+			o.ReportRunID = a.ID
 		}
 	}
+	s.start(w, r, p, task, o)
+}
 
-	runID := "run-" + uuid.NewString()
-	wsID := l.workspaceRunID
-	if wsID == "" {
-		wsID = runID
-	}
-
-	prompt := pipeline.Render(p.ExecuteTemplate, map[string]string{
-		"issue":        pipeline.IssueText(task.Number, task.Title, task.Body),
-		"previous_run": pipeline.PreviousRunText(l.previous.ID, l.previous.State, l.previous.Detail),
-		"feedback":     l.feedback,
-	})
-
-	// PR은 러너가 만든다(GH-05). 제목은 이슈 제목, 본문은 에이전트의 변경
-	// 설명이 없을 때의 대체 — 이슈 번호·Run·이슈 본문. 러너는 이슈를 모른다.
-	var pr *protocol.PRSpec
-	if p.CreatePR {
-		pr = &protocol.PRSpec{
-			Title: task.Title,
-			Body:  fmt.Sprintf("Taskyard 이슈 #%d · Run %s\n\n%s", task.Number, runID, task.Body),
-		}
-	}
-	cmd, err := protocol.NewCommand(protocol.CmdRunStart, runID, protocol.RunStartBody{
-		Prompt:          prompt,
-		RepoPath:        p.RepoPath,
-		BaseBranch:      p.DefaultBranch,
-		WorkspaceRunID:  wsID,
-		ResumeSessionID: l.resumeSession,
-		AllowedTools:    p.AllowedTools,
-		PR:              pr,
-		CleanupMerged:   p.CleanupMerged,
-	})
-	if err != nil {
+// start는 Launcher.Start를 HTTP로 옮긴다: 오류를 상태 코드로, 성공을 Run 화면으로.
+func (s *Server) start(w http.ResponseWriter, r *http.Request, p store.Project, task store.Task, o launch.Options) {
+	run, err := s.launcher.Start(p, task, o)
+	switch {
+	case errors.Is(err, launch.ErrRunActive):
+		http.Error(w, "이미 실행 중인 Run이 있습니다", http.StatusConflict)
+	case errors.Is(err, launch.ErrRunnerUnavailable):
+		http.Error(w, "runner is not connected", http.StatusServiceUnavailable)
+	case err != nil:
 		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+	default:
+		http.Redirect(w, r, "/runs/"+run.ID, http.StatusSeeOther)
 	}
-
-	run := store.Run{
-		ID: runID, State: store.StateQueued, Kind: "structured", TaskID: task.ID, Stage: "execute",
-		PreviousRunID: l.previous.ID, Feedback: l.feedback, WorkspaceRunID: wsID,
-	}
-	if err := s.st.UpsertRun(run); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	// 여기서부터 실패하면 방금 만든 Run을 failed로 정리하고 이슈 상태를 되돌린다 —
-	// queued로 영영 남겨 사용자가 실행 중이라고 믿게 하지 않는다.
-	abort := func(status int, msg string) {
-		run.State = store.StateFailed
-		_ = s.st.UpsertRun(run)
-		_ = s.st.UpdateTaskStatus(task.ID, task.Status)
-		http.Error(w, msg, status)
-	}
-	if err := s.st.UpdateTaskStatus(task.ID, store.TaskInProgress); err != nil {
-		abort(http.StatusInternalServerError, "internal error")
-		return
-	}
-	if err := s.hub.SendCommand(cmd); err != nil {
-		slog.Warn("run.start could not be delivered", "run_id", runID, "task_id", task.ID, "err", err)
-		abort(http.StatusServiceUnavailable, "runner is not connected")
-		return
-	}
-	http.Redirect(w, r, "/runs/"+runID, http.StatusSeeOther)
 }
 
 // handleCancel은 Run을 취소한다(PRD §7.6). 활성이면 러너에게 run.cancel을
@@ -460,20 +425,21 @@ func (s *Server) handleRetry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	l := launch{previous: prev, feedback: r.FormValue("feedback")}
+	// 재시도는 이전 Run의 단계와 보고서 계보를 잇는다.
+	o := launch.Options{Stage: prev.Stage, Previous: prev, Feedback: r.FormValue("feedback"), ReportRunID: prev.ReportRunID}
 	if mode == "continue" {
 		if prev.ProviderSessionID == "" {
 			http.Error(w, "이어갈 세션이 없습니다 — 처음부터 재시도를 고르세요", http.StatusConflict)
 			return
 		}
-		l.resumeSession = prev.ProviderSessionID
+		o.ResumeSession = prev.ProviderSessionID
 		// worktree 주인은 체인의 첫 Run이다.
-		l.workspaceRunID = prev.WorkspaceRunID
-		if l.workspaceRunID == "" {
-			l.workspaceRunID = prev.ID
+		o.WorkspaceRunID = prev.WorkspaceRunID
+		if o.WorkspaceRunID == "" {
+			o.WorkspaceRunID = prev.ID
 		}
 	}
-	s.launch(w, r, p, task, l)
+	s.start(w, r, p, task, o)
 }
 
 // backTo는 Run이 속한 이슈 페이지, 이슈가 없으면 Run 페이지다.
@@ -671,6 +637,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	artifacts, _ := s.st.Artifacts(id)
 	views := make([]eventView, 0, len(stored))
 	var usage string
 	for _, env := range stored {
@@ -695,7 +662,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.render(w, s.run, map[string]any{
-		"Title": id, "Run": run, "Events": views, "Back": back, "IssueLabel": issueLabel, "Usage": usage,
+		"Title": id, "Run": run, "Events": views, "Back": back, "IssueLabel": issueLabel, "Usage": usage, "Artifacts": artifacts,
 	})
 }
 
@@ -776,4 +743,18 @@ func (s *Server) render(w http.ResponseWriter, tmpl *template.Template, data any
 	if err := tmpl.ExecuteTemplate(w, "layout", data); err != nil {
 		slog.Error("render failed", "err", err)
 	}
+}
+
+// handleArtifact는 산출물 하나를 그대로 보인다(<pre>). 렌더링은 다음 항목.
+func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
+	a, err := s.st.Artifact(r.PathValue("id"), r.PathValue("name"))
+	if errors.Is(err, store.ErrArtifactNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	s.render(w, s.artifact, map[string]any{"Title": a.Name, "Artifact": a})
 }

@@ -105,3 +105,19 @@ func TestDefaultTemplateAsksForSummaryNotPR(t *testing.T) {
 		t.Error("DefaultExecuteTemplate lacks the summary file instruction")
 	}
 }
+
+func TestDefaultTemplatesForStages(t *testing.T) {
+	if !strings.Contains(DefaultExecuteTemplate, "{{stage1_report}}") {
+		t.Error("DefaultExecuteTemplate lacks {{stage1_report}}")
+	}
+	for _, want := range []string{"analysis.md", "{{issue}}", "{{memory}}", ".taskyard/attention.md", "커밋도 하지 마라"} {
+		if !strings.Contains(DefaultAnalyzeTemplate, want) {
+			t.Errorf("DefaultAnalyzeTemplate lacks %q", want)
+		}
+	}
+	for _, forbidden := range []string{"gh ", "git commit"} {
+		if strings.Contains(DefaultAnalyzeTemplate, forbidden) {
+			t.Errorf("DefaultAnalyzeTemplate must not instruct %q", forbidden)
+		}
+	}
+}

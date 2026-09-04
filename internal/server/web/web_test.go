@@ -1001,3 +1001,145 @@ func TestRunPageShowsToolInputForApprovalAndToolStart(t *testing.T) {
 		t.Errorf("run page lacks usage header:\n%s", body)
 	}
 }
+
+// ---- 산출물과 1단계 (계획 2026-09-04-phase1-stages) ----
+
+func TestUpdateSettingsSavesAnalyzeFields(t *testing.T) {
+	st, h := newServer(t)
+	seedProject(t, st, "shop", "/repos/shop")
+	rec := postForm(h, "/projects/shop/template", url.Values{
+		"execute_template": {"t"}, "analyze_template": {"분석 {{issue}}"}, "analyze_skip_below": {"120"},
+		// analyze_enabled 체크 안 함 → false
+	})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	p, _ := st.GetProject("shop")
+	if p.AnalyzeTemplate != "분석 {{issue}}" || p.AnalyzeEnabled || p.AnalyzeSkipBelow != 120 {
+		t.Fatalf("analyze settings not saved: %+v", p)
+	}
+	body := get(h, "/projects/shop").Body.String()
+	for _, want := range []string{`name="analyze_template"`, `name="analyze_enabled"`, `name="analyze_skip_below"`, "분석 {{issue}}"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("project page lacks %q", want)
+		}
+	}
+}
+
+func TestRunIssueStageChoice(t *testing.T) {
+	long := strings.Repeat("가", 300)
+	cases := []struct {
+		name, body, choice string
+		wantAnalyze        bool
+	}{
+		{"auto long body analyzes", long, "", true},
+		{"auto short body executes", "짧다", "", false},
+		{"explicit analyze", "짧다", "analyze", true},
+		{"explicit execute", long, "execute", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st, hb, h := newServerWithHub(t)
+			got := attachRunner(t, hb, h)
+			p, err := st.CreateProject(store.Project{Key: "shop", Name: "s", RepoPath: "/repos/shop", DefaultBranch: "main",
+				ExecuteTemplate: "실행 {{issue}}", AnalyzeTemplate: "분석 {{issue}}", AnalyzeEnabled: true, AnalyzeSkipBelow: 200, CreatePR: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			seedTask(t, st, p, "제목", tc.body)
+			form := url.Values{}
+			if tc.choice != "" {
+				form.Set("stage", tc.choice)
+			}
+			if rec := postForm(h, "/projects/shop/issues/1/run", form); rec.Code != http.StatusSeeOther {
+				t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+			}
+			_, body := decodeStart(t, got, protocol.CmdRunStart)
+			if tc.wantAnalyze {
+				if !strings.HasPrefix(body.Prompt, "분석 ") || body.PR != nil {
+					t.Fatalf("want analyze run.start, got prompt=%q pr=%v", body.Prompt, body.PR)
+				}
+				runs, _ := st.RunsForTask(func() string { task, _ := st.GetTask(p.ID, 1); return task.ID }())
+				if runs[0].Stage != store.StageAnalyze {
+					t.Fatalf("run stage = %q", runs[0].Stage)
+				}
+			} else if !strings.HasPrefix(body.Prompt, "실행 ") || body.PR == nil {
+				t.Fatalf("want execute run.start, got prompt=%q pr=%v", body.Prompt, body.PR)
+			}
+		})
+	}
+}
+
+func TestArtifactPageAndIssueListing(t *testing.T) {
+	st, h := newServer(t)
+	p, task := seedRetryProject(t, st)
+	seedRun(t, st, task, "run-1", store.StateRunning, "", "")
+	for _, e := range []protocol.Envelope{
+		mustEvent(t, protocol.EvArtifactAdded, "run-1", 1, map[string]any{"name": "analysis.md", "content": "# 분석 <script>alert(1)</script>", "truncated": true}),
+		mustEvent(t, protocol.EvRunStateChanged, "run-1", 2, map[string]any{"state": "succeeded"}),
+	} {
+		if _, _, err := st.ApplyEvent(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page := get(h, "/runs/run-1/artifacts/analysis.md")
+	if page.Code != http.StatusOK {
+		t.Fatalf("status = %d", page.Code)
+	}
+	body := page.Body.String()
+	if !strings.Contains(body, "# 분석 &lt;script&gt;") || strings.Contains(body, "<script>alert") {
+		t.Fatalf("artifact content not escaped:\n%s", body)
+	}
+	if !strings.Contains(body, "잘렸") {
+		t.Error("truncated artifact should say so")
+	}
+	if get(h, "/runs/run-1/artifacts/nope.md").Code != http.StatusNotFound {
+		t.Error("unknown artifact should be 404")
+	}
+	issue := get(h, "/projects/"+p.Key+"/issues/1").Body.String()
+	if !strings.Contains(issue, `href="/runs/run-1/artifacts/analysis.md"`) {
+		t.Fatalf("issue page lacks artifact link:\n%s", issue)
+	}
+	// 이름에 ?·#·공백이 있어도 링크가 그 파일을 가리킨다.
+	if _, _, err := st.ApplyEvent(mustEvent(t, protocol.EvArtifactAdded, "run-1", 3, map[string]any{"name": "note s#1?.md", "content": "odd"})); err != nil {
+		t.Fatal(err)
+	}
+	issue = get(h, "/projects/"+p.Key+"/issues/1").Body.String()
+	if !strings.Contains(issue, `href="/runs/run-1/artifacts/note%20s%231%3F.md"`) {
+		t.Fatalf("odd artifact name not escaped in link:\n%s", issue)
+	}
+	if got := get(h, "/runs/run-1/artifacts/note%20s%231%3F.md"); got.Code != http.StatusOK || !strings.Contains(got.Body.String(), "odd") {
+		t.Fatalf("escaped link does not resolve: %d", got.Code)
+	}
+	run := get(h, "/runs/run-1").Body.String()
+	if !strings.Contains(run, `href="/runs/run-1/artifacts/analysis.md"`) {
+		t.Fatal("run page lacks artifact link")
+	}
+}
+
+func TestRetryInheritsStageAndReport(t *testing.T) {
+	st, hb, h := newServerWithHub(t)
+	got := attachRunner(t, hb, h)
+	p, err := st.CreateProject(store.Project{Key: "shop", Name: "s", RepoPath: "/repos/shop", DefaultBranch: "main",
+		ExecuteTemplate: "실행 {{issue}}\n보고서:\n{{stage1_report}}", AnalyzeTemplate: "분석 {{issue}}", AnalyzeEnabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := seedTask(t, st, p, "제목", "b")
+	// 성공한 1단계와 그 보고서, 그리고 실패한 2단계(보고서 계보 있음).
+	_ = st.UpsertRun(store.Run{ID: "a1", State: store.StateSucceeded, Kind: "structured", TaskID: task.ID, Stage: store.StageAnalyze})
+	_, _, _ = st.ApplyEvent(mustEvent(t, protocol.EvArtifactAdded, "a1", 1, map[string]any{"name": "analysis.md", "content": "설계 A"}))
+	_ = st.UpsertRun(store.Run{ID: "e1", State: store.StateFailed, Kind: "structured", TaskID: task.ID, Stage: store.StageExecute, ReportRunID: "a1", CreatedAt: time.Now().Add(time.Second)})
+
+	if rec := postForm(h, "/runs/e1/retry", url.Values{"mode": {"fresh"}}); rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	_, body := decodeStart(t, got, protocol.CmdRunStart)
+	if !strings.HasPrefix(body.Prompt, "실행 ") || !strings.Contains(body.Prompt, "보고서:\n설계 A") {
+		t.Fatalf("execute retry lost the report lineage: %q", body.Prompt)
+	}
+	runs, _ := st.RunsForTask(task.ID)
+	if runs[0].Stage != store.StageExecute || runs[0].ReportRunID != "a1" {
+		t.Fatalf("retry run = %+v", runs[0])
+	}
+}

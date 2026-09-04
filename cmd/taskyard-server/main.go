@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/jinto/taskyard/internal/buildinfo"
 	"github.com/jinto/taskyard/internal/server/hub"
+	"github.com/jinto/taskyard/internal/server/launch"
 	"github.com/jinto/taskyard/internal/server/store"
 	"github.com/jinto/taskyard/internal/server/web"
 )
@@ -44,6 +46,12 @@ func main() {
 	defer st.Close()
 
 	h := hub.New(st, *token)
+
+	// 1단계 성공 뒤의 자동 이어 실행. hub의 정착 신호·서버 시작·러너 접속에서
+	// 같은 조정을 돈다(계획 2026-09-04-phase1-stages).
+	launcher := &launch.Launcher{Store: st, Commander: h}
+	h.OnConnect = launcher.ChainPending
+	go launcher.Run(context.Background(), h)
 
 	ui, err := web.New(st, h)
 	if err != nil {

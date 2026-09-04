@@ -20,6 +20,8 @@ import (
 	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
 
+	"github.com/jinto/taskyard/internal/server/pipeline"
+
 	"github.com/jinto/taskyard/internal/protocol"
 	"github.com/jinto/taskyard/internal/sqlitex"
 )
@@ -45,6 +47,12 @@ const (
 	TaskReview     = "review"
 	// TaskDone은 PR merge가 확인된 이슈다(PRD §7.6). 나가는 길은 [실행]·재시도뿐.
 	TaskDone = "done"
+)
+
+// Run의 단계(PRD §7.2). 1단계는 보고서만 남기고, 2단계가 구현한다.
+const (
+	StageAnalyze = "analyze"
+	StageExecute = "execute"
 )
 
 // terminalStates는 끝난 Run 상태다. settledStates는 거기에 needs_attention을
@@ -97,7 +105,17 @@ CREATE TABLE IF NOT EXISTS runs (
   pr_number           INTEGER NOT NULL DEFAULT 0,
   pr_state            TEXT    NOT NULL DEFAULT '',
   pr_checks           TEXT    NOT NULL DEFAULT '',
-  pr_review           TEXT    NOT NULL DEFAULT ''
+  pr_review           TEXT    NOT NULL DEFAULT '',
+  report_run_id       TEXT    NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+  run_id     TEXT    NOT NULL,
+  name       TEXT    NOT NULL,
+  content    TEXT    NOT NULL,
+  truncated  INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (run_id, name)
 );
 
 CREATE TABLE IF NOT EXISTS run_events (
@@ -118,7 +136,10 @@ CREATE TABLE IF NOT EXISTS projects (
   created_at       INTEGER NOT NULL,
   allowed_tools    TEXT    NOT NULL DEFAULT '',
   create_pr        INTEGER NOT NULL DEFAULT 1,
-  cleanup_merged   INTEGER NOT NULL DEFAULT 1
+  cleanup_merged   INTEGER NOT NULL DEFAULT 1,
+  analyze_template TEXT    NOT NULL DEFAULT '',
+  analyze_enabled  INTEGER NOT NULL DEFAULT 1,
+  analyze_skip_below INTEGER NOT NULL DEFAULT 200
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -148,6 +169,7 @@ var runsMigrations = []sqlitex.Column{
 	{Name: "pr_state", DDL: "TEXT NOT NULL DEFAULT ''"},
 	{Name: "pr_checks", DDL: "TEXT NOT NULL DEFAULT ''"},
 	{Name: "pr_review", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "report_run_id", DDL: "TEXT NOT NULL DEFAULT ''"},
 }
 
 // projectsMigrations는 PR #3 이후 projects 테이블에 추가된 컬럼이다.
@@ -156,11 +178,19 @@ var projectsMigrations = []sqlitex.Column{
 	// 옛 행의 기본값은 PRD 기본 — PR 만들기 켬(§7.2), merge 후 삭제(§8.7.1).
 	{Name: "create_pr", DDL: "INTEGER NOT NULL DEFAULT 1"},
 	{Name: "cleanup_merged", DDL: "INTEGER NOT NULL DEFAULT 1"},
+	// 1단계: 옛 행은 켬, 200자 미만 생략, 템플릿은 비어 있으면 읽을 때 기본값.
+	{Name: "analyze_template", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "analyze_enabled", DDL: "INTEGER NOT NULL DEFAULT 1"},
+	{Name: "analyze_skip_below", DDL: "INTEGER NOT NULL DEFAULT 200"},
 }
 
 var (
 	// ErrRunNotFound는 알 수 없는 Run을 조회했을 때 반환한다.
 	ErrRunNotFound = errors.New("run not found")
+	// ErrArtifactNotFound는 Run에 그 이름의 산출물이 없을 때.
+	ErrArtifactNotFound = errors.New("artifact not found")
+	// ErrRunActive는 이슈에 정착하지 않은 Run이 있어 새 Run을 만들 수 없을 때.
+	ErrRunActive = errors.New("a run is still active for this task")
 	// ErrNotCancellable은 서버가 직접 취소할 수 없는 상태의 Run이다 — 활성이면
 	// 러너에게 물어야 하고, 종결이면 취소할 것이 없다.
 	ErrNotCancellable = errors.New("run is not cancellable from the server")
@@ -203,6 +233,18 @@ type Run struct {
 	PRState  string
 	PRChecks string
 	PRReview string
+	// ReportRunID는 2단계 Run이 {{stage1_report}}로 쓴 1단계 Run이다. 비어 있으면
+	// 보고서 없이 시작했다.
+	ReportRunID string
+}
+
+// Artifact는 에이전트가 .taskyard/artifacts/ 에 남긴 파일 하나다(ST-06).
+type Artifact struct {
+	RunID     string
+	Name      string
+	Content   string
+	Truncated bool
+	CreatedAt time.Time
 }
 
 // Project는 저장소 하나와 이슈 보드, 실행 템플릿을 가진 단위다(PRD §6.1).
@@ -223,14 +265,23 @@ type Project struct {
 	// 저장소는 끈다. CleanupMerged: merge 확인 후 worktree를 지운다(GH-10).
 	CreatePR      bool
 	CleanupMerged bool
+	// 1단계(분석·설계, PRD §7.2). AnalyzeTemplate은 저장이 비어 있으면 읽을 때
+	// 기본 템플릿으로 채워진다 — 옛 프로젝트도 1단계를 얻는다. AnalyzeSkipBelow는
+	// 이슈 본문의 rune 수가 이보다 작으면 1단계를 건너뛰는 기준(0이면 안 건너뜀).
+	AnalyzeTemplate  string
+	AnalyzeEnabled   bool
+	AnalyzeSkipBelow int
 }
 
 // ProjectSettings는 설정 폼이 한 번에 저장하는 필드들이다.
 type ProjectSettings struct {
-	ExecuteTemplate string
-	AllowedTools    []string
-	CreatePR        bool
-	CleanupMerged   bool
+	ExecuteTemplate  string
+	AllowedTools     []string
+	CreatePR         bool
+	CleanupMerged    bool
+	AnalyzeTemplate  string
+	AnalyzeEnabled   bool
+	AnalyzeSkipBelow int
 }
 
 func joinTools(tools []string) string { return strings.Join(tools, "\n") }
@@ -293,8 +344,8 @@ func (s *Store) UpsertRun(r Run) error {
 	}
 	_, err := s.db.Exec(
 		`INSERT INTO runs (id, state, kind, provider_session_id, branch, worktree_path, reconcile_state, task_id, stage, created_at,
-		                   detail, previous_run_id, workspace_run_id, feedback)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		                   detail, previous_run_id, workspace_run_id, feedback, report_run_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   state               = excluded.state,
 		   kind                = excluded.kind,
@@ -307,10 +358,11 @@ func (s *Store) UpsertRun(r Run) error {
 		   detail              = excluded.detail,
 		   previous_run_id     = excluded.previous_run_id,
 		   workspace_run_id    = excluded.workspace_run_id,
-		   feedback            = excluded.feedback`,
+		   feedback            = excluded.feedback,
+		   report_run_id       = excluded.report_run_id`,
 		r.ID, r.State, r.Kind, r.ProviderSessionID, r.Branch, r.WorktreePath, r.ReconcileState,
 		r.TaskID, r.Stage, created.UnixNano(),
-		r.Detail, r.PreviousRunID, r.WorkspaceRunID, r.Feedback,
+		r.Detail, r.PreviousRunID, r.WorkspaceRunID, r.Feedback, r.ReportRunID,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert run: %w", err)
@@ -318,8 +370,49 @@ func (s *Store) UpsertRun(r Run) error {
 	return nil
 }
 
+// CreateRunIfIdle은 이슈에 정착하지 않은 Run이 없을 때만 새 Run을 만든다 —
+// 검사와 삽입이 한 트랜잭션이라(연결이 하나라 직렬) 이어 실행 goroutine과
+// 사람의 [실행]이 겹쳐도 하나만 생긴다. 있으면 ErrRunActive.
+func (s *Store) CreateRunIfIdle(r Run) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT state FROM runs WHERE task_id = ?`, r.TaskID)
+	if err != nil {
+		return fmt.Errorf("query task runs: %w", err)
+	}
+	for rows.Next() {
+		var state string
+		if err := rows.Scan(&state); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan run state: %w", err)
+		}
+		if !IsSettled(state) {
+			rows.Close()
+			return ErrRunActive
+		}
+	}
+	rows.Close()
+
+	created := r.CreatedAt
+	if created.IsZero() {
+		created = time.Now()
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO runs (id, state, kind, task_id, stage, created_at, previous_run_id, workspace_run_id, feedback, report_run_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.State, r.Kind, r.TaskID, r.Stage, created.UnixNano(), r.PreviousRunID, r.WorkspaceRunID, r.Feedback, r.ReportRunID,
+	); err != nil {
+		return fmt.Errorf("insert run: %w", err)
+	}
+	return tx.Commit()
+}
+
 const runColumns = `id, state, kind, provider_session_id, branch, worktree_path, last_acked_seq, reconcile_state, task_id, stage, created_at,
-                    detail, previous_run_id, workspace_run_id, feedback, summary, pr_url, pr_number, pr_state, pr_checks, pr_review`
+                    detail, previous_run_id, workspace_run_id, feedback, summary, pr_url, pr_number, pr_state, pr_checks, pr_review, report_run_id`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
@@ -331,7 +424,7 @@ func scanRun(sc rowScanner) (Run, error) {
 	err := sc.Scan(&r.ID, &r.State, &r.Kind, &r.ProviderSessionID, &r.Branch, &r.WorktreePath,
 		&r.LastAckedSeq, &r.ReconcileState, &r.TaskID, &r.Stage, &created,
 		&r.Detail, &r.PreviousRunID, &r.WorkspaceRunID, &r.Feedback,
-		&r.Summary, &r.PRURL, &r.PRNumber, &r.PRState, &r.PRChecks, &r.PRReview)
+		&r.Summary, &r.PRURL, &r.PRNumber, &r.PRState, &r.PRChecks, &r.PRReview, &r.ReportRunID)
 	if err != nil {
 		return Run{}, err
 	}
@@ -409,8 +502,9 @@ func (s *Store) ApplyEvent(env protocol.Envelope) (bool, uint64, error) {
 		acked   uint64
 		current string
 		taskID  string
+		stage   string
 	)
-	err = tx.QueryRow(`SELECT last_acked_seq, state, task_id FROM runs WHERE id = ?`, env.RunID).Scan(&acked, &current, &taskID)
+	err = tx.QueryRow(`SELECT last_acked_seq, state, task_id, stage FROM runs WHERE id = ?`, env.RunID).Scan(&acked, &current, &taskID, &stage)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, 0, ErrRunNotFound
 	}
@@ -440,11 +534,15 @@ func (s *Store) ApplyEvent(env protocol.Envelope) (bool, uint64, error) {
 	if affected > 0 {
 		switch env.Type {
 		case protocol.EvRunStateChanged:
-			if err := applyStateChange(tx, env, current, taskID); err != nil {
+			if err := applyStateChange(tx, env, current, stage, taskID); err != nil {
 				return false, 0, err
 			}
 		case protocol.EvPRUpdated:
 			if err := applyPRUpdate(tx, env, taskID); err != nil {
+				return false, 0, err
+			}
+		case protocol.EvArtifactAdded:
+			if err := applyArtifact(tx, env); err != nil {
 				return false, 0, err
 			}
 		}
@@ -461,7 +559,7 @@ func (s *Store) ApplyEvent(env protocol.Envelope) (bool, uint64, error) {
 //
 // 이슈 상태 전이(계획의 행렬): succeeded → review, cancelled → backlog,
 // failed·needs_attention → 그대로.
-func applyStateChange(tx *sql.Tx, env protocol.Envelope, current, taskID string) error {
+func applyStateChange(tx *sql.Tx, env protocol.Envelope, current, stage, taskID string) error {
 	var outer struct {
 		Body struct {
 			State     string `json:"state"`
@@ -493,7 +591,26 @@ func applyStateChange(tx *sql.Tx, env protocol.Envelope, current, taskID string)
 			return fmt.Errorf("update run session: %w", err)
 		}
 	}
-	return moveTaskFor(tx, next, taskID)
+	return moveTaskFor(tx, next, stage, taskID)
+}
+
+// applyArtifact는 artifact.added를 artifacts에 저장한다. 같은 (run, name)의
+// 재전송은 무시한다 — 첫 내용이 정본이다.
+func applyArtifact(tx *sql.Tx, env protocol.Envelope) error {
+	var outer struct {
+		Body protocol.ArtifactBody `json:"body"`
+	}
+	if err := json.Unmarshal(env.Body, &outer); err != nil || outer.Body.Name == "" {
+		return nil
+	}
+	a := outer.Body
+	if _, err := tx.Exec(
+		`INSERT OR IGNORE INTO artifacts (run_id, name, content, truncated, created_at) VALUES (?, ?, ?, ?, ?)`,
+		env.RunID, a.Name, a.Content, a.Truncated, time.Now().UnixNano(),
+	); err != nil {
+		return fmt.Errorf("insert artifact: %w", err)
+	}
+	return nil
 }
 
 // applyPRUpdate는 pr.updated를 runs의 PR 필드에 반영하고, MERGED이면 이슈를
@@ -533,13 +650,17 @@ func applyPRUpdate(tx *sql.Tx, env protocol.Envelope, taskID string) error {
 
 // moveTaskFor는 Run 상태에 따른 이슈 상태 전이다. done은 건드리지 않는다 —
 // 옛 Run의 늦은 succeeded가 merge된 이슈를 review로 되돌리면 안 된다.
-func moveTaskFor(tx *sql.Tx, runState, taskID string) error {
+// 1단계의 succeeded는 review가 아니다 — 2단계가 이어진다(in_progress 유지).
+func moveTaskFor(tx *sql.Tx, runState, stage, taskID string) error {
 	if taskID == "" {
 		return nil
 	}
 	var status string
 	switch runState {
 	case StateSucceeded:
+		if stage == StageAnalyze {
+			return nil
+		}
 		status = TaskReview
 	case StateCancelled:
 		status = TaskBacklog
@@ -577,7 +698,7 @@ func (s *Store) CancelSettledRun(runID string) error {
 	if _, err := tx.Exec(`UPDATE runs SET state = ? WHERE id = ?`, StateCancelled, runID); err != nil {
 		return fmt.Errorf("cancel run: %w", err)
 	}
-	if err := moveTaskFor(tx, StateCancelled, taskID); err != nil {
+	if err := moveTaskFor(tx, StateCancelled, "", taskID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -631,7 +752,8 @@ func (s *Store) Events(runID string, afterSeq uint64, limit int) ([]protocol.Env
 
 // ---- Project ----
 
-const projectColumns = `id, key, name, repo_path, default_branch, execute_template, created_at, allowed_tools, create_pr, cleanup_merged`
+const projectColumns = `id, key, name, repo_path, default_branch, execute_template, created_at, allowed_tools, create_pr, cleanup_merged,
+                        analyze_template, analyze_enabled, analyze_skip_below`
 
 func scanProject(sc rowScanner) (Project, error) {
 	var (
@@ -639,8 +761,13 @@ func scanProject(sc rowScanner) (Project, error) {
 		created int64
 		tools   string
 	)
-	if err := sc.Scan(&p.ID, &p.Key, &p.Name, &p.RepoPath, &p.DefaultBranch, &p.ExecuteTemplate, &created, &tools, &p.CreatePR, &p.CleanupMerged); err != nil {
+	if err := sc.Scan(&p.ID, &p.Key, &p.Name, &p.RepoPath, &p.DefaultBranch, &p.ExecuteTemplate, &created, &tools, &p.CreatePR, &p.CleanupMerged,
+		&p.AnalyzeTemplate, &p.AnalyzeEnabled, &p.AnalyzeSkipBelow); err != nil {
 		return Project{}, err
+	}
+	// 비어 있으면 기본 템플릿 — 옛 프로젝트도 1단계를 얻고, 기본이 바뀌면 따라간다.
+	if p.AnalyzeTemplate == "" {
+		p.AnalyzeTemplate = pipeline.DefaultAnalyzeTemplate
 	}
 	p.CreatedAt = time.Unix(0, created)
 	p.AllowedTools = splitTools(tools)
@@ -674,9 +801,9 @@ func (s *Store) CreateProject(p Project) (Project, error) {
 	}
 
 	if _, err := tx.Exec(
-		`INSERT INTO projects (`+projectColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO projects (`+projectColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ID, p.Key, p.Name, p.RepoPath, p.DefaultBranch, p.ExecuteTemplate, p.CreatedAt.UnixNano(), joinTools(p.AllowedTools),
-		p.CreatePR, p.CleanupMerged,
+		p.CreatePR, p.CleanupMerged, p.AnalyzeTemplate, p.AnalyzeEnabled, p.AnalyzeSkipBelow,
 	); err != nil {
 		return Project{}, fmt.Errorf("insert project: %w", err)
 	}
@@ -732,8 +859,10 @@ func (s *Store) ListProjects() ([]Project, error) {
 // 호출자(웹 폼)의 몫이다.
 func (s *Store) UpdateProjectSettings(key string, st ProjectSettings) error {
 	res, err := s.db.Exec(
-		`UPDATE projects SET execute_template = ?, allowed_tools = ?, create_pr = ?, cleanup_merged = ? WHERE key = ?`,
-		st.ExecuteTemplate, joinTools(st.AllowedTools), st.CreatePR, st.CleanupMerged, key)
+		`UPDATE projects SET execute_template = ?, allowed_tools = ?, create_pr = ?, cleanup_merged = ?,
+		                     analyze_template = ?, analyze_enabled = ?, analyze_skip_below = ? WHERE key = ?`,
+		st.ExecuteTemplate, joinTools(st.AllowedTools), st.CreatePR, st.CleanupMerged,
+		st.AnalyzeTemplate, st.AnalyzeEnabled, st.AnalyzeSkipBelow, key)
 	if err != nil {
 		return fmt.Errorf("update project settings: %w", err)
 	}
@@ -842,6 +971,114 @@ func (s *Store) UpdateTaskStatus(taskID, status string) error {
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrTaskNotFound
+	}
+	return nil
+}
+
+// ---- 산출물과 단계 ----
+
+const artifactColumns = `run_id, name, content, truncated, created_at`
+
+func scanArtifact(sc rowScanner) (Artifact, error) {
+	var (
+		a       Artifact
+		created int64
+	)
+	if err := sc.Scan(&a.RunID, &a.Name, &a.Content, &a.Truncated, &created); err != nil {
+		return Artifact{}, err
+	}
+	a.CreatedAt = time.Unix(0, created)
+	return a, nil
+}
+
+// Artifacts는 Run의 산출물을 이름순으로 돌려준다.
+func (s *Store) Artifacts(runID string) ([]Artifact, error) {
+	rows, err := s.db.Query(`SELECT `+artifactColumns+` FROM artifacts WHERE run_id = ? ORDER BY name`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("query artifacts: %w", err)
+	}
+	defer rows.Close()
+	var out []Artifact
+	for rows.Next() {
+		a, err := scanArtifact(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan artifact: %w", err)
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) Artifact(runID, name string) (Artifact, error) {
+	a, err := scanArtifact(s.db.QueryRow(`SELECT `+artifactColumns+` FROM artifacts WHERE run_id = ? AND name = ?`, runID, name))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Artifact{}, ErrArtifactNotFound
+	}
+	if err != nil {
+		return Artifact{}, fmt.Errorf("get artifact: %w", err)
+	}
+	return a, nil
+}
+
+// LatestSucceededRun은 이슈의 가장 최근 succeeded Run을 단계별로 찾는다.
+func (s *Store) LatestSucceededRun(taskID, stage string) (Run, bool, error) {
+	r, err := scanRun(s.db.QueryRow(
+		`SELECT `+runColumns+` FROM runs WHERE task_id = ? AND stage = ? AND state = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+		taskID, stage, StateSucceeded))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Run{}, false, nil
+	}
+	if err != nil {
+		return Run{}, false, fmt.Errorf("latest succeeded run: %w", err)
+	}
+	return r, true, nil
+}
+
+// AwaitingExecute는 1단계가 성공했고 그 뒤에 아무 Run도 없는 이슈다.
+type AwaitingExecute struct {
+	Task       Task
+	AnalyzeRun Run
+}
+
+// TasksAwaitingExecute는 이어 실행의 대상이다: 이슈의 가장 최근 Run이
+// stage=analyze·succeeded인 것. 언제 몇 번 불러도 같은 답이다 — 2단계 Run이
+// 생기면 "가장 최근"이 바뀌어 빠진다.
+func (s *Store) TasksAwaitingExecute() ([]AwaitingExecute, error) {
+	rows, err := s.db.Query(`
+		SELECT ` + runColumns + ` FROM runs r
+		WHERE r.stage = '` + StageAnalyze + `' AND r.state = '` + StateSucceeded + `'
+		  AND r.id = (SELECT id FROM runs WHERE task_id = r.task_id ORDER BY created_at DESC, rowid DESC LIMIT 1)`)
+	if err != nil {
+		return nil, fmt.Errorf("query awaiting execute: %w", err)
+	}
+	defer rows.Close()
+	var runs []Run
+	for rows.Next() {
+		r, err := scanRun(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan run: %w", err)
+		}
+		runs = append(runs, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var out []AwaitingExecute
+	for _, r := range runs {
+		task, err := s.GetTaskByID(r.TaskID)
+		if err != nil {
+			continue
+		}
+		out = append(out, AwaitingExecute{Task: task, AnalyzeRun: r})
+	}
+	return out, nil
+}
+
+// UpdateTaskStatusIf는 현재 상태가 from일 때만 to로 바꾼다. 실행 시작의 보상
+// (in_progress 로 올린 것을 되돌리기)이 그 사이 들어온 다른 전이를 덮지 않게.
+func (s *Store) UpdateTaskStatusIf(taskID, from, to string) error {
+	if _, err := s.db.Exec(`UPDATE tasks SET status = ? WHERE id = ? AND status = ?`, to, taskID, from); err != nil {
+		return fmt.Errorf("update task status if: %w", err)
 	}
 	return nil
 }

@@ -46,7 +46,18 @@ const (
 	// EvPRUpdated는 러너가 PR을 만들거나 상태 변화를 감지했을 때 보낸다(GH-06).
 	// body는 PRUpdatedBody. 같은 값이면 다시 보내지 않는다.
 	EvPRUpdated = "pr.updated"
+	// EvArtifactAdded는 에이전트가 .taskyard/artifacts/ 에 남긴 파일 하나다(ST-06).
+	// body는 ArtifactBody. 종결 이벤트보다 먼저 온다.
+	EvArtifactAdded = "artifact.added"
 )
+
+// ArtifactBody는 artifact.added의 본문이다. Name은 base name, Content는 파일
+// 내용(러너가 256KiB에서 자르면 Truncated).
+type ArtifactBody struct {
+	Name      string `json:"name"`
+	Content   string `json:"content"`
+	Truncated bool   `json:"truncated,omitempty"`
+}
 
 // Envelope은 모든 메시지의 공통 껍데기다.
 type Envelope struct {

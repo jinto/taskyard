@@ -36,12 +36,24 @@ type Hub struct {
 
 	subMu sync.Mutex
 	subs  map[chan protocol.Envelope]struct{}
+
+	// settled는 accepted된 run.state_changed마다 non-blocking으로 보내는
+	// 신호다(크기 1, 합쳐짐). 이어 실행(launch)이 기다린다. readLoop는 ack를
+	// 처리하므로 여기서 store 쓰기나 명령 전송을 하면 안 된다.
+	settled chan struct{}
+	// OnConnect는 러너가 접속한 직후 goroutine으로 불린다. 놓친 이어 실행을
+	// 다시 시도하는 자리.
+	OnConnect func()
 }
+
+// Settled는 정착 신호 채널이다.
+func (h *Hub) Settled() <-chan struct{} { return h.settled }
 
 func New(st *store.Store, pairingToken string) *Hub {
 	return &Hub{
 		st:           st,
 		pairingToken: pairingToken,
+		settled:      make(chan struct{}, 1),
 		subs:         map[chan protocol.Envelope]struct{}{},
 	}
 }
@@ -169,6 +181,9 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	h.conn = conn
 	h.mu.Unlock()
 	slog.Info("runner connected", "runner", hello.RunnerID)
+	if h.OnConnect != nil {
+		go h.OnConnect()
+	}
 
 	defer func() {
 		h.mu.Lock()
@@ -243,6 +258,12 @@ func (h *Hub) readLoop(ctx context.Context, conn *websocket.Conn) {
 			continue
 		case accepted:
 			h.fanout(env)
+			if env.Type == protocol.EvRunStateChanged {
+				select {
+				case h.settled <- struct{}{}:
+				default: // 이미 신호가 대기 중이다 — 합쳐진다
+				}
+			}
 		}
 
 		if err := h.writeEnvelope(ctx, conn, protocol.Envelope{

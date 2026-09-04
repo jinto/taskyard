@@ -12,9 +12,11 @@
 {{if .Done}}
   <p class="hint">완료 — PR이 merge됐습니다. 다시 열려면 아래에서 재시도하세요.</p>
 {{else if or (not .HasLatest) .LatestSettled}}
-  <form method="post" action="/projects/{{.Project.Key}}/issues/{{.Task.Number}}/run" class="flex items-center gap-3">
+  <form method="post" action="/projects/{{.Project.Key}}/issues/{{.Task.Number}}/run" class="flex flex-wrap items-center gap-x-4 gap-y-2">
     <button type="submit" class="btn btn-primary">실행</button>
-    <span class="hint">프로젝트의 실행 템플릿으로 에이전트를 새 세션에서 띄웁니다{{if .HasLatest}} (이전 실행 맥락 없이){{end}}.</span>
+    <label class="check"><input type="radio" name="stage" value="auto" checked> <span>자동 <span class="hint">(설정 기준: 본문 {{.Project.AnalyzeSkipBelow}}자 미만이면 분석 생략)</span></span></label>
+    <label class="check"><input type="radio" name="stage" value="analyze"> <span>분석 먼저</span></label>
+    <label class="check"><input type="radio" name="stage" value="execute"> <span>바로 실행</span></label>
   </form>
 {{end}}
 
@@ -68,8 +70,9 @@
       <span class="badge {{badge .State}}">{{.State}}</span>
       {{if .PRURL}}<a href="{{.PRURL}}" class="text-sm text-go hover:underline">PR #{{.PRNumber}}</a> <span class="badge {{badge .PRState}}">{{.PRState}}</span>{{end}}
     </div>
-    <div class="hint mt-1 font-mono text-xs">{{.CreatedAt.Format "2006-01-02 15:04:05"}}{{if .Stage}} <span class="mx-1">·</span> {{.Stage}}{{end}}{{if .Branch}} <span class="mx-1">·</span> {{.Branch}}{{end}}{{if .PreviousRunID}} <span class="mx-1">·</span> ← {{.PreviousRunID}}{{end}}</div>
+    <div class="hint mt-1 font-mono text-xs">{{.CreatedAt.Format "2006-01-02 15:04:05"}}{{if .Stage}} <span class="mx-1">·</span> {{.Stage}}{{end}}{{if .Branch}} <span class="mx-1">·</span> {{.Branch}}{{end}}{{if .PreviousRunID}} <span class="mx-1">·</span> ← {{.PreviousRunID}}{{end}}{{if .ReportRunID}} <span class="mx-1">·</span> 보고서 {{.ReportRunID}}{{end}}</div>
     {{if .Detail}}<div class="hint mt-1 line-clamp-2">{{.Detail}}</div>{{end}}
+    {{with index $.Artifacts .ID}}<div class="mt-1 flex flex-wrap gap-2 text-sm">{{range .}}<a href="/runs/{{.RunID}}/artifacts/{{seg .Name}}" class="text-go hover:underline">{{.Name}}</a>{{end}}</div>{{end}}
   </div>
 {{else}}
   <p class="hint">아직 실행이 없습니다.</p>

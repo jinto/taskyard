@@ -35,6 +35,12 @@ bin/taskyard-runner --pairing-token secret \
 잦으면 프로젝트 설정의 "승인 없이 허용할 도구"에 `Edit`, `Bash(go test:*)`처럼
 한 줄에 하나씩 적습니다(`--allowedTools`로 넘어갑니다).
 
+이슈 본문이 길면(기본 200자 이상) 먼저 **1단계(분석·설계)** 가 돌아 코드를 바꾸지 않고
+`.taskyard/artifacts/analysis.md`에 보고서를 남깁니다. 성공하면 서버가 2단계(실행)를
+자동으로 이어 열고 보고서를 프롬프트에 넣습니다. [실행] 옆에서 "분석 먼저"·"바로 실행"으로
+이슈마다 덮어쓸 수 있고, 프로젝트 설정에서 1단계 템플릿·on/off·생략 기준을 바꿉니다.
+에이전트가 `.taskyard/artifacts/`에 남긴 파일은 산출물로 이슈에 붙어 웹에서 읽습니다.
+
 실행이 성공하면 러너가 브랜치를 `origin`에 push하고 `gh`로 PR을 엽니다(사용자의
 `gh auth login`을 그대로 씁니다). 본문은 에이전트가 `.taskyard/summary.md`에 남긴
 변경 설명입니다. 러너가 PR 상태를 주기적으로 보고(`--pr-poll`, 기본 1분), merge가

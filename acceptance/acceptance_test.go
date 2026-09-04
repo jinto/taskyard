@@ -23,6 +23,7 @@ import (
 	"github.com/jinto/taskyard/internal/runner/link"
 	"github.com/jinto/taskyard/internal/runner/spool"
 	"github.com/jinto/taskyard/internal/server/hub"
+	"github.com/jinto/taskyard/internal/server/launch"
 	"github.com/jinto/taskyard/internal/server/store"
 	"github.com/jinto/taskyard/internal/server/web"
 )
@@ -39,6 +40,9 @@ type stack struct {
 	git   *gitops.Manager
 	wsURL string
 	cmds  chan protocol.Envelope // 러너가 받은 명령의 사본. 트리거 테스트가 본다
+	// launcher는 main처럼 이어 실행을 돌린다. 테스트가 go s.launcher.Run(ctx, s.hub)
+	// 로 띄운다 — 띄우지 않으면 재시작 회복 시나리오처럼 손으로 ChainPending.
+	launcher *launch.Launcher
 }
 
 func git(t *testing.T, dir string, args ...string) {
@@ -169,7 +173,8 @@ func buildStack(t *testing.T, dbDir, script string, o stackOpts) *stack {
 		t.Fatal(err)
 	}
 
-	return &stack{st: st, hub: h, srv: srv, sp: sp, link: l, life: lm, git: gm, wsURL: wsURL, cmds: cmds}
+	return &stack{st: st, hub: h, srv: srv, sp: sp, link: l, life: lm, git: gm, wsURL: wsURL, cmds: cmds,
+		launcher: &launch.Launcher{Store: st, Commander: h}}
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -1066,5 +1071,149 @@ func TestIssueRunWithoutPRKeepsSummary(t *testing.T) {
 	}
 	if run, _ := s.st.GetRun(runID); run.PRURL != "" {
 		t.Fatalf("unexpected PR fields: %+v", run)
+	}
+}
+
+// ---- 산출물과 1단계 (계획 2026-09-04-phase1-stages) ----
+
+// stagedAgentScript는 프롬프트에 analysis.md 가 있으면 1단계처럼 보고서만 쓰고,
+// 아니면 2단계처럼 커밋한다. 2단계 프롬프트에 보고서가 들어왔는지는 run.start
+// 로 본다.
+const stagedAgentScript = `#!/bin/sh
+if printf '%s' "$*" | grep -q 'analysis.md'; then
+  mkdir -p .taskyard/artifacts
+  printf '# 설계\n작게 고친다\n' > .taskyard/artifacts/analysis.md
+else
+  echo agent-work >> README.md
+  git add README.md
+  git -c user.name=t -c user.email=t@t commit -q -m 'agent: add line'
+fi
+cat FIXTURE
+`
+
+const attentionAnalyzeScript = "#!/bin/sh\nmkdir -p .taskyard; printf '이슈가 모호하다\\n' > .taskyard/attention.md\ncat FIXTURE\n"
+
+// chain이 참이면 main처럼 이어 실행을 배선한다 — 러너가 붙기 전에, 그래야
+// 접속 훅이 경합 없이 잡힌다.
+func newStageStack(t *testing.T, script string, chain bool) (*stack, http.Handler, string) {
+	t.Helper()
+	dir := t.TempDir()
+	s := buildStack(t, dir, script, stackOpts{})
+	uiServer, err := web.New(s.st, s.hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if chain {
+		s.hub.OnConnect = s.launcher.ChainPending
+		go s.launcher.Run(ctx, s.hub)
+	}
+	go s.link.Run(ctx)
+	waitFor(t, "runner connection", s.hub.Connected)
+	return s, uiServer.Routes(), filepath.Join(dir, "repo")
+}
+
+func createIssueWithBody(t *testing.T, ui http.Handler, repo, body string) {
+	t.Helper()
+	form := url.Values{"key": {"shop"}, "name": {"쇼핑몰"}, "repo_path": {repo}, "default_branch": {"main"}}
+	if rec := postForm(ui, "/projects", form); rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST /projects status = %d, body=%s", rec.Code, rec.Body)
+	}
+	if rec := postForm(ui, "/projects/shop/issues", url.Values{"title": {"README에 한 줄 추가"}, "body": {body}}); rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST issue status = %d", rec.Code)
+	}
+}
+
+// TestLongIssueAnalyzesThenChainsExecute: 긴 이슈 → 1단계(PR 없음) → 보고서 산출물
+// → 이슈 in_progress 유지 → 서버가 2단계를 자동으로 열고 보고서를 프롬프트에 →
+// succeeded → review.
+func TestLongIssueAnalyzesThenChainsExecute(t *testing.T) {
+	s, ui, repo := newStageStack(t, stagedAgentScript, true)
+
+	createIssueWithBody(t, ui, repo, strings.Repeat("자세한 요구사항. ", 40))
+	runID := runIDFrom(t, postForm(ui, "/projects/shop/issues/1/run", nil))
+	first := startFor(t, s, runID)
+	if first.PR != nil || !strings.Contains(first.Prompt, "analysis.md") {
+		t.Fatalf("first run.start should be the analyze stage: pr=%v prompt=%q", first.PR, first.Prompt[:80])
+	}
+	waitRunState(t, s, runID, store.StateSucceeded)
+	if task := taskOf(t, s); task.Status != store.TaskInProgress {
+		t.Fatalf("task after analyze = %s, want in_progress", task.Status)
+	}
+	arts, _ := s.st.Artifacts(runID)
+	if len(arts) != 1 || arts[0].Name != "analysis.md" {
+		t.Fatalf("artifacts = %+v", arts)
+	}
+
+	// 2단계가 자동으로 열렸고 보고서가 프롬프트에 들어 있다.
+	var second protocol.RunStartBody
+	var secondID string
+	waitFor(t, "chained execute run", func() bool {
+		runs, _ := s.st.RunsForTask(taskOf(t, s).ID)
+		if len(runs) < 2 || runs[0].Stage != store.StageExecute {
+			return false
+		}
+		secondID = runs[0].ID
+		return runs[0].ReportRunID == runID
+	})
+	second = startFor(t, s, secondID)
+	if !strings.Contains(second.Prompt, "1단계 보고서(있으면):\n# 설계\n작게 고친다") {
+		t.Fatalf("execute run.start lacks the report: %q", second.Prompt)
+	}
+	waitRunState(t, s, secondID, store.StateSucceeded)
+	waitFor(t, "task review", func() bool { return taskOf(t, s).Status == store.TaskReview })
+	if runs, _ := s.st.RunsForTask(taskOf(t, s).ID); len(runs) != 2 {
+		t.Fatalf("chain must open exactly one execute run, got %d", len(runs))
+	}
+}
+
+// TestShortIssueSkipsAnalysis: 본문이 기준(200자) 미만이면 바로 2단계.
+func TestShortIssueSkipsAnalysis(t *testing.T) {
+	s, ui, repo := newStageStack(t, stagedAgentScript, false)
+	createIssueWithBody(t, ui, repo, "한 줄 추가")
+	runID := runIDFrom(t, postForm(ui, "/projects/shop/issues/1/run", nil))
+	if body := startFor(t, s, runID); strings.Contains(body.Prompt, "analysis.md") {
+		t.Fatal("short issue should go straight to execute")
+	}
+	waitRunState(t, s, runID, store.StateSucceeded)
+	waitFor(t, "task review", func() bool { return taskOf(t, s).Status == store.TaskReview })
+}
+
+// TestAnalyzeAttentionDoesNotChain: 1단계가 멈추고 보고하면 2단계는 열리지 않는다.
+func TestAnalyzeAttentionDoesNotChain(t *testing.T) {
+	s, ui, repo := newStageStack(t, attentionAnalyzeScript, true)
+
+	createIssueWithBody(t, ui, repo, strings.Repeat("자세한 요구사항. ", 40))
+	runID := runIDFrom(t, postForm(ui, "/projects/shop/issues/1/run", nil))
+	waitRunState(t, s, runID, store.StateNeedsAttention)
+	time.Sleep(300 * time.Millisecond)
+	if runs, _ := s.st.RunsForTask(taskOf(t, s).ID); len(runs) != 1 {
+		t.Fatalf("needs_attention must not chain: %+v", runs)
+	}
+	if task := taskOf(t, s); task.Status != store.TaskInProgress {
+		t.Fatalf("task = %s", task.Status)
+	}
+}
+
+// TestChainRecoversWithoutTheSignal: 1단계 성공을 아무도 듣지 못했어도(서버 재시작),
+// 새 Launcher의 ChainPending이 2단계를 연다.
+func TestChainRecoversWithoutTheSignal(t *testing.T) {
+	s, ui, repo := newStageStack(t, stagedAgentScript, false) // 이어 실행 배선 없음
+	createIssueWithBody(t, ui, repo, strings.Repeat("자세한 요구사항. ", 40))
+	runID := runIDFrom(t, postForm(ui, "/projects/shop/issues/1/run", nil))
+	waitRunState(t, s, runID, store.StateSucceeded)
+	if runs, _ := s.st.RunsForTask(taskOf(t, s).ID); len(runs) != 1 {
+		t.Fatalf("nothing should chain without a launcher: %+v", runs)
+	}
+	fresh := &launch.Launcher{Store: s.st, Commander: s.hub}
+	fresh.ChainPending()
+	runs, _ := s.st.RunsForTask(taskOf(t, s).ID)
+	if len(runs) != 2 || runs[0].Stage != store.StageExecute || runs[0].ReportRunID != runID {
+		t.Fatalf("recovery did not chain: %+v", runs)
+	}
+	fresh.ChainPending()
+	if runs, _ := s.st.RunsForTask(taskOf(t, s).ID); len(runs) != 2 {
+		t.Fatal("second ChainPending must be a no-op")
 	}
 }
