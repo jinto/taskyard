@@ -6,8 +6,8 @@
     <p class="hint truncate font-mono text-[11px]">{{.Project.RepoPath}} <span class="mx-1">·</span> {{.Project.DefaultBranch}}</p>
   </div>
   <div class="flex shrink-0 items-center gap-2">
-    <!-- 새 이슈는 보드를 밀어내지 않는다. details로 열고 닫으므로 JS가 없다
-         (PRD §11.4.1 — 실시간 상태를 가지는 화면은 Run 상세뿐이다). -->
+    <!-- 새 이슈는 보드를 밀어내지 않는다. details로 열고 닫으므로 JS가 없다.
+         만들고 나면 이 보드로 돌아온다 — 연달아 여러 개를 적어 넣기 위해서다. -->
     <details class="relative">
       <summary class="btn btn-primary cursor-pointer list-none [&::-webkit-details-marker]:hidden">+ 새 이슈</summary>
       <form method="post" action="/projects/{{.Project.Key}}/issues"
@@ -29,14 +29,17 @@
     <h2 class="col-head"><span class="dot {{.Dot}}"></span>{{.Title}} <span class="ml-auto font-normal text-muted">{{len .Cards}}</span></h2>
     <div class="cards">
     {{range .Cards}}
-      <article class="card{{if .Waiting}} bg-attention-soft hover:bg-attention-soft dark:bg-attention/15 dark:hover:bg-attention/20{{end}}">
+      <article data-task="{{.Task.Number}}" class="card{{if .Waiting}} wait{{end}}">
         <div class="flex items-start gap-1.5">
-          <span class="dot mt-1.5 {{with .Run}}{{dot .State}}{{else}}bg-zinc-300 dark:bg-zinc-600{{end}}"></span>
+          {{if .Live}}<span class="spinner mt-1"></span>
+          {{else}}<span class="dot mt-1.5 {{with .Run}}{{dot .State}}{{else}}bg-zinc-300 dark:bg-zinc-600{{end}}"></span>{{end}}
           <a href="/projects/{{$.Project.Key}}/issues/{{.Task.Number}}" class="card-title">{{.Task.Title}}</a>
         </div>
         <div class="meta pl-3">
           <span class="font-mono">{{upper $.Project.Key}}-{{.Task.Number}}</span>
-          {{if .Waiting}}<span class="rounded bg-attention px-1 font-medium text-white">승인 대기</span>{{end}}
+          <!-- 배지는 Run이 있는 카드마다 자리를 잡고 숨어 있다. 기다림이 시작되고
+               끝나는 것을 스트림이 이 자리에서 켜고 끈다. -->
+          {{if .Run}}<a href="/runs/{{.Run.ID}}" class="badge-wait rounded bg-attention px-1 font-medium text-white"{{if not .Waiting}} hidden{{end}}>승인 대기</a>{{end}}
           {{with .Run}}
             <!-- 열이 이미 결과를 말한다. 성공은 되풀이하지 않고, 그 밖의 상태만 적는다. -->
             <a href="/runs/{{.ID}}" class="hover:underline">{{.Stage}}</a>
@@ -53,6 +56,7 @@
             </form>
           {{end}}
         </div>
+        {{if or .Live .Line}}<p class="line">{{.Line}}</p>{{end}}
       </article>
     {{else}}
       <p class="px-3 py-2 text-[11px] text-muted">없음</p>
@@ -61,4 +65,33 @@
   </section>
 {{end}}
 </div>
+
+<!-- 두 번째 JS 아일랜드. 보드는 카드마다 지금 무엇이 벌어지는지를 말해야
+     하고, 그것은 새로고침으로는 알 수 없다. 서버가 이 프로젝트의 이벤트만
+     골라 보내고, 여기서는 카드의 한 줄만 갈아 끼운다 — 열을 다시 나누는 일은
+     서버의 몫이므로 상태가 바뀌면 보드를 통째로 받아온다. -->
+<script>
+(function () {
+  const key = {{.Project.Key}};
+  const source = new EventSource("/projects/" + encodeURIComponent(key) + "/stream");
+
+  source.onmessage = function (msg) {
+    const ev = JSON.parse(msg.data);
+    if (ev.state) {
+      // 새 이슈를 쓰는 중이라면 적던 것을 날리지 않는다. 다음 상태 변화에 따라간다.
+      if (!document.querySelector("details[open]")) location.reload();
+      return;
+    }
+    const card = document.querySelector('[data-task="' + ev.task + '"]');
+    if (!card) return;
+    const line = card.querySelector(".line");
+    if (line && ev.line) line.textContent = ev.line;
+    if (ev.waiting || ev.resumed) {
+      card.classList.toggle("wait", !!ev.waiting);
+      const badge = card.querySelector(".badge-wait");
+      if (badge) badge.hidden = !ev.waiting;
+    }
+  };
+})();
+</script>
 {{end}}

@@ -542,7 +542,8 @@ func createProjectAndIssue(t *testing.T, ui http.Handler, repo string) {
 	rec = postForm(ui, "/projects/shop/issues", url.Values{
 		"title": {"README에 한 줄 추가"}, "body": {"agent-work라는 줄을 덧붙인다"},
 	})
-	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/projects/shop/issues/1" {
+	// 이슈를 만들면 보드로 돌아온다 — 만든 사람이 보고 있던 화면이다.
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/projects/shop" {
 		t.Fatalf("POST issue status = %d location = %q", rec.Code, rec.Header().Get("Location"))
 	}
 }
