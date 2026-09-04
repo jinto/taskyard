@@ -157,6 +157,28 @@ func TestStartExecuteFillsStage1ReportFromReportRun(t *testing.T) {
 	}
 }
 
+func TestStartExecuteAppendsReportWhenTemplateLacksToken(t *testing.T) {
+	st, cmd, l := newLauncher(t)
+	p, task := seed(t, st, "본문", true, 0)
+	// 이 PR 이전의 실행 템플릿 — 토큰 없음.
+	if err := st.UpdateProjectSettings(p.Key, store.ProjectSettings{ExecuteTemplate: "옛 실행 {{issue}}", AnalyzeTemplate: p.AnalyzeTemplate, AnalyzeEnabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	p, _ = st.GetProject(p.Key)
+	_ = st.UpsertRun(store.Run{ID: "a1", State: store.StateSucceeded, Kind: "structured", TaskID: task.ID, Stage: store.StageAnalyze})
+	env, _ := protocol.NewEvent(protocol.EvArtifactAdded, "a1", 1, map[string]any{"body": protocol.ArtifactBody{Name: "analysis.md", Content: "설계 A"}})
+	env.Seq = 1
+	_, _, _ = st.ApplyEvent(env)
+
+	if _, err := l.Start(p, task, launch.Options{Stage: store.StageExecute, ReportRunID: "a1"}); err != nil {
+		t.Fatal(err)
+	}
+	prompt := cmd.starts(t)[0].Prompt
+	if !strings.HasPrefix(prompt, "옛 실행 ") || !strings.HasSuffix(prompt, "1단계 보고서:\n설계 A\n") {
+		t.Fatalf("report not appended to a token-less template: %q", prompt)
+	}
+}
+
 func stateEvent(t *testing.T, runID string, seq uint64, state string) protocol.Envelope {
 	t.Helper()
 	env, err := protocol.NewEvent(protocol.EvRunStateChanged, runID, seq, map[string]any{"body": map[string]any{"state": state}})

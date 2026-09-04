@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -138,6 +139,12 @@ func (l *Launcher) command(p store.Project, task store.Task, run store.Run, o Op
 		"previous_run":  pipeline.PreviousRunText(o.Previous.ID, o.Previous.State, o.Previous.Detail),
 		"feedback":      o.Feedback,
 	})
+	// 이 PR 이전에 만든 프로젝트의 실행 템플릿에는 {{stage1_report}}가 없다.
+	// 그러면 1단계가 세션 하나를 쓰고 보고서는 조용히 버려진다 — 토큰이 없으면
+	// 보고서를 프롬프트 끝에 덧붙인다.
+	if report != "" && run.Stage == store.StageExecute && !strings.Contains(tmpl, "{{stage1_report}}") {
+		prompt += "\n\n1단계 보고서:\n" + report + "\n"
+	}
 
 	// PR은 2단계만. 제목은 이슈 제목, 본문은 에이전트의 변경 설명이 없을 때의
 	// 대체 — 이슈 번호·Run·이슈 본문. 러너는 이슈를 모른다(GH-05).
