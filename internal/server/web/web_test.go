@@ -3,6 +3,7 @@ package web_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1267,5 +1268,31 @@ func TestUpdateSettingsChangesRepoPathAndBranch(t *testing.T) {
 	body := get(h, "/projects/shop").Body.String()
 	if !strings.Contains(body, `name="repo_path"`) || !strings.Contains(body, `name="default_branch"`) {
 		t.Fatal("project page lacks the repository fields")
+	}
+}
+
+func TestIndexListsPendingApprovals(t *testing.T) {
+	st, h := newServer(t)
+	p, task := seedRetryProject(t, st)
+	seedRun(t, st, task, "run-1", store.StateRunning, "", "")
+	if _, _, err := st.ApplyEvent(mustEvent(t, protocol.EvApprovalRequested, "run-1", 1, map[string]any{
+		"request_id": "r1", "tool_use_id": "t1", "tool_name": "Bash", "input": map[string]any{"command": "go test ./..."},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	body := get(h, "/").Body.String()
+	for _, want := range []string{"승인", "go test ./...", `href="/runs/run-1"`, "#" + fmt.Sprint(task.Number)} {
+		if !strings.Contains(body, want) {
+			t.Errorf("index lacks %q:\n%s", want, body)
+		}
+	}
+	_ = p
+
+	// 승인하면 사라진다.
+	req := httptest.NewRequest(http.MethodPost, "/runs/run-1/approve", strings.NewReader(`{"request_id":"r1","allow":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if body := get(h, "/").Body.String(); strings.Contains(body, "go test ./...") {
+		t.Fatal("index still shows the approval after it was answered")
 	}
 }
