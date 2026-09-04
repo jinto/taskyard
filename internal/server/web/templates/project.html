@@ -1,42 +1,49 @@
 {{define "crumbs"}}<span class="text-muted">/</span><span>{{.Project.Name}}</span>{{end}}
 {{define "content"}}
-<h1 class="text-2xl font-semibold tracking-tight">{{.Project.Name}}</h1>
-<p class="hint mt-1 font-mono text-xs">{{.Project.RepoPath}} <span class="mx-1">·</span> {{.Project.DefaultBranch}}</p>
-
-<h2 class="section">이슈</h2>
-{{range .Tasks}}
-  <div class="row flex items-baseline gap-3">
-    <span class="w-10 shrink-0 font-mono text-xs text-muted">#{{.Number}}</span>
-    <a href="/projects/{{$.Project.Key}}/issues/{{.Number}}" class="grow font-medium hover:underline">{{.Title}}</a>
-    <span class="badge {{badge .Status}}">{{.Status}}</span>
+<div class="flex flex-wrap items-baseline justify-between gap-3">
+  <div>
+    <h1 class="text-2xl font-semibold tracking-tight">{{.Project.Name}}</h1>
+    <p class="hint mt-1 font-mono text-xs">{{.Project.RepoPath}} <span class="mx-1">·</span> {{.Project.DefaultBranch}}</p>
   </div>
-{{else}}
-  <p class="hint">아직 이슈가 없습니다. 아래에서 첫 이슈를 만드세요.</p>
+  <a href="/projects/{{.Project.Key}}/settings" class="btn">설정</a>
+</div>
+
+<!-- 상태는 Run의 결과로 정해진다(PRD §7.5). 그래서 카드를 끌어 옮기지 않는다 —
+     이 보드는 읽고 실행하는 곳이지, 상태를 손으로 바꾸는 곳이 아니다. -->
+<div class="mt-6 grid items-start gap-3 md:grid-cols-4">
+{{range .Columns}}
+  <section class="rounded-lg bg-zinc-50 p-2 dark:bg-zinc-900/60">
+    <h2 class="flex items-baseline gap-2 px-2 py-1.5 text-sm font-semibold">{{.Title}} <span class="font-normal text-muted">{{len .Cards}}</span></h2>
+    <div class="space-y-2">
+    {{range .Cards}}
+      <article class="rounded border border-line bg-white p-3 dark:border-zinc-800 dark:bg-zinc-900">
+        <a href="/projects/{{$.Project.Key}}/issues/{{.Task.Number}}" class="block text-sm font-medium leading-snug hover:underline">{{.Task.Title}}</a>
+        <div class="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted">
+          <span class="font-mono">#{{.Task.Number}}</span>
+          {{with .Run}}
+            <a href="/runs/{{.ID}}" class="badge {{badge .State}}">{{.State}}</a>
+            <span class="font-mono">{{.Stage}}</span>
+            {{if .PRURL}}<a href="{{.PRURL}}" class="text-go hover:underline">PR #{{.PRNumber}}</a>{{end}}
+          {{end}}
+        </div>
+        {{if eq .Task.Status $.Backlog}}
+        <form method="post" action="/projects/{{$.Project.Key}}/issues/{{.Task.Number}}/run" class="mt-2">
+          <button type="submit" class="btn btn-primary px-2 py-1 text-xs">실행</button>
+        </form>
+        {{end}}
+      </article>
+    {{else}}
+      <p class="hint px-2 pb-2 text-xs">없음</p>
+    {{end}}
+    </div>
+  </section>
 {{end}}
+</div>
 
 <h2 class="section">새 이슈</h2>
 <form method="post" action="/projects/{{.Project.Key}}/issues" class="max-w-xl space-y-4">
   <label class="field"><span>제목</span><input type="text" name="title" placeholder="로그인 이메일 대소문자 무시" required></label>
   <label class="field"><span>본문</span><textarea name="body" rows="4" class="!font-sans !text-[15px]" placeholder="무엇이 문제이고 어떻게 되어야 하는지"></textarea></label>
   <button type="submit" class="btn btn-primary">이슈 만들기</button>
-</form>
-
-<h2 class="section">실행 설정</h2>
-<form method="post" action="/projects/{{.Project.Key}}/template" class="max-w-xl space-y-4">
-  <label class="field"><span>저장소 경로</span><input type="text" name="repo_path" value="{{.Project.RepoPath}}" required></label>
-  <p class="hint -mt-2">러너 머신의 절대 경로이며, 러너의 <code>--allow-repo</code> 목록에 있어야 합니다.</p>
-  <label class="field"><span>기본 브랜치</span><input type="text" name="default_branch" value="{{.Project.DefaultBranch}}" placeholder="main"></label>
-  <label class="field"><span>실행 템플릿</span><textarea name="execute_template" rows="14">{{.Project.ExecuteTemplate}}</textarea></label>
-  <p class="hint -mt-2"><code>{{"{{issue}}"}}</code>는 이슈 번호·제목·본문, <code>{{"{{memory}}"}}</code>는 저장소의 <code>.taskyard/memory.md</code>, <code>{{"{{previous_run}}"}}</code>과 <code>{{"{{feedback}}"}}</code>은 재시도 정보로 치환됩니다.</p>
-  <label class="field"><span>승인 없이 허용할 도구 (한 줄에 하나)</span><textarea name="allowed_tools" rows="4" placeholder="Edit&#10;Bash(go test:*)">{{range .Project.AllowedTools}}{{.}}
-{{end}}</textarea></label>
-  <p class="hint -mt-2">여기 없는 도구 호출은 승인을 묻습니다. 예: <code>Edit</code>, <code>Write</code>, <code>Bash(go test:*)</code>, <code>Bash(git commit:*)</code>.</p>
-  <label class="field"><span>1단계(분석·설계) 템플릿</span><textarea name="analyze_template" rows="12">{{.Project.AnalyzeTemplate}}</textarea></label>
-  <p class="hint -mt-2">1단계는 코드를 바꾸지 않고 <code>.taskyard/artifacts/analysis.md</code>에 보고서를 씁니다. 성공하면 2단계가 자동으로 이어지고, 보고서는 <code>{{"{{stage1_report}}"}}</code>로 들어갑니다.</p>
-  <label class="check"><input type="checkbox" name="analyze_enabled"{{if .Project.AnalyzeEnabled}} checked{{end}}> <span>1단계 켬<br><span class="hint">끄면 [실행]이 바로 2단계로 갑니다.</span></span></label>
-  <label class="field"><span>본문이 이 글자 수 미만이면 1단계 생략 (0이면 생략 없음)</span><input type="number" name="analyze_skip_below" min="0" value="{{.Project.AnalyzeSkipBelow}}"></label>
-  <label class="check"><input type="checkbox" name="create_pr"{{if .Project.CreatePR}} checked{{end}}> <span>PR 만들기<br><span class="hint">실행이 성공하면 러너가 <code>origin</code>에 push하고 PR을 엽니다. 원격이 없는 저장소는 끄세요.</span></span></label>
-  <label class="check"><input type="checkbox" name="cleanup_merged"{{if .Project.CleanupMerged}} checked{{end}}> <span>merge 후 worktree 삭제<br><span class="hint">미커밋·미push가 없을 때만 지웁니다.</span></span></label>
-  <button type="submit" class="btn btn-primary">설정 저장</button>
 </form>
 {{end}}
