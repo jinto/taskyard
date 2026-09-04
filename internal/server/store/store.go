@@ -106,7 +106,10 @@ CREATE TABLE IF NOT EXISTS runs (
   pr_state            TEXT    NOT NULL DEFAULT '',
   pr_checks           TEXT    NOT NULL DEFAULT '',
   pr_review           TEXT    NOT NULL DEFAULT '',
-  report_run_id       TEXT    NOT NULL DEFAULT ''
+  report_run_id       TEXT    NOT NULL DEFAULT '',
+  pending_request_id  TEXT    NOT NULL DEFAULT '',
+  pending_tool_use_id TEXT    NOT NULL DEFAULT '',
+  pending_approval    TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS artifacts (
@@ -170,6 +173,9 @@ var runsMigrations = []sqlitex.Column{
 	{Name: "pr_checks", DDL: "TEXT NOT NULL DEFAULT ''"},
 	{Name: "pr_review", DDL: "TEXT NOT NULL DEFAULT ''"},
 	{Name: "report_run_id", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "pending_request_id", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "pending_tool_use_id", DDL: "TEXT NOT NULL DEFAULT ''"},
+	{Name: "pending_approval", DDL: "TEXT NOT NULL DEFAULT ''"},
 }
 
 // projectsMigrations는 PR #3 이후 projects 테이블에 추가된 컬럼이다.
@@ -547,6 +553,14 @@ func (s *Store) ApplyEvent(env protocol.Envelope) (bool, uint64, error) {
 			if err := applyArtifact(tx, env); err != nil {
 				return false, 0, err
 			}
+		case protocol.EvApprovalRequested:
+			if err := applyApprovalRequested(tx, env); err != nil {
+				return false, 0, err
+			}
+		case protocol.EvToolFinished:
+			if err := clearPendingForTool(tx, env); err != nil {
+				return false, 0, err
+			}
 		}
 	}
 
@@ -597,10 +611,72 @@ func applyStateChange(tx *sql.Tx, env protocol.Envelope, current, stage, taskID 
 			return fmt.Errorf("update run session: %w", err)
 		}
 	}
+	if IsSettled(next) {
+		if err := clearPending(tx, env.RunID); err != nil {
+			return err
+		}
+	}
 	if outer.Body.BeforeStart && next == StateFailed {
 		return moveTaskFor(tx, StateCancelled, stage, taskID) // cancelled와 같은 자리 — backlog
 	}
 	return moveTaskFor(tx, next, stage, taskID)
+}
+
+// applyApprovalRequested는 대기 중인 승인을 runs에 표시한다. 첫 화면이 이걸
+// 보고 "어디서 무엇이 사람을 기다리는지"를 알린다 — 사람이 Run 화면을 열어 두고
+// 있지 않으면 승인은 약 5~6분 뒤 실패한다(관측 11번).
+func applyApprovalRequested(tx *sql.Tx, env protocol.Envelope) error {
+	var outer struct {
+		Body struct {
+			RequestID string         `json:"request_id"`
+			ToolUseID string         `json:"tool_use_id"`
+			ToolName  string         `json:"tool_name"`
+			Input     map[string]any `json:"input"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal(env.Body, &outer); err != nil || outer.Body.RequestID == "" {
+		return nil
+	}
+	summary, _ := outer.Body.Input["command"].(string)
+	if summary == "" {
+		summary = outer.Body.ToolName
+	}
+	if _, err := tx.Exec(
+		`UPDATE runs SET pending_request_id = ?, pending_tool_use_id = ?, pending_approval = ? WHERE id = ?`,
+		outer.Body.RequestID, outer.Body.ToolUseID, summary, env.RunID,
+	); err != nil {
+		return fmt.Errorf("mark pending approval: %w", err)
+	}
+	return nil
+}
+
+// clearPendingForTool은 그 도구 호출이 끝나면 대기 표시를 지운다. 승인·거절만이
+// 아니라 타임아웃도 여기로 온다 — 어느 쪽이든 사람이 더 할 일은 없다.
+func clearPendingForTool(tx *sql.Tx, env protocol.Envelope) error {
+	var outer struct {
+		Body struct {
+			ToolUseID string `json:"tool_use_id"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal(env.Body, &outer); err != nil || outer.Body.ToolUseID == "" {
+		return nil
+	}
+	if _, err := tx.Exec(
+		`UPDATE runs SET pending_request_id = '', pending_tool_use_id = '', pending_approval = ''
+		 WHERE id = ? AND pending_tool_use_id = ?`, env.RunID, outer.Body.ToolUseID,
+	); err != nil {
+		return fmt.Errorf("clear pending approval: %w", err)
+	}
+	return nil
+}
+
+func clearPending(tx *sql.Tx, runID string) error {
+	if _, err := tx.Exec(
+		`UPDATE runs SET pending_request_id = '', pending_tool_use_id = '', pending_approval = '' WHERE id = ?`, runID,
+	); err != nil {
+		return fmt.Errorf("clear pending approval: %w", err)
+	}
+	return nil
 }
 
 // applyArtifact는 artifact.added를 artifacts에 저장한다. 같은 (run, name)의
@@ -1089,6 +1165,52 @@ func (s *Store) TasksAwaitingExecute() ([]AwaitingExecute, error) {
 func (s *Store) UpdateTaskStatusIf(taskID, from, to string) error {
 	if _, err := s.db.Exec(`UPDATE tasks SET status = ? WHERE id = ? AND status = ?`, to, taskID, from); err != nil {
 		return fmt.Errorf("update task status if: %w", err)
+	}
+	return nil
+}
+
+// PendingApproval은 사람을 기다리는 승인 하나다. 첫 화면이 보여 준다.
+type PendingApproval struct {
+	RunID      string
+	Command    string
+	ProjectKey string
+	TaskNumber int
+	TaskTitle  string
+}
+
+// PendingApprovals는 지금 사람을 기다리는 승인 전부다. Run이 끝나거나 그 도구
+// 호출이 끝나면 목록에서 빠진다.
+func (s *Store) PendingApprovals() ([]PendingApproval, error) {
+	rows, err := s.db.Query(`
+		SELECT r.id, r.pending_approval, p.key, t.number, t.title
+		FROM runs r
+		JOIN tasks t ON t.id = r.task_id
+		JOIN projects p ON p.id = t.project_id
+		WHERE r.pending_request_id != ''
+		ORDER BY r.created_at`)
+	if err != nil {
+		return nil, fmt.Errorf("query pending approvals: %w", err)
+	}
+	defer rows.Close()
+	var out []PendingApproval
+	for rows.Next() {
+		var a PendingApproval
+		if err := rows.Scan(&a.RunID, &a.Command, &a.ProjectKey, &a.TaskNumber, &a.TaskTitle); err != nil {
+			return nil, fmt.Errorf("scan pending approval: %w", err)
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// ClearPendingApproval은 서버가 결정을 보냈을 때 부른다 — 러너의 tool_finished를
+// 기다리지 않고 화면에서 즉시 사라지게.
+func (s *Store) ClearPendingApproval(runID, requestID string) error {
+	if _, err := s.db.Exec(
+		`UPDATE runs SET pending_request_id = '', pending_tool_use_id = '', pending_approval = ''
+		 WHERE id = ? AND pending_request_id = ?`, runID, requestID,
+	); err != nil {
+		return fmt.Errorf("clear pending approval: %w", err)
 	}
 	return nil
 }

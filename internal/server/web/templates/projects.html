@@ -2,6 +2,19 @@
 <h1 class="text-2xl font-semibold tracking-tight">프로젝트</h1>
 <p class="hint mt-1">저장소 하나에 이슈 보드와 실행 설정을 붙인 단위입니다.</p>
 
+{{if .Pending}}
+<div class="mt-6 rounded-lg border-2 border-attention bg-attention-soft p-4 dark:bg-attention/15">
+  <div class="text-sm font-semibold text-attention">승인을 기다리는 실행 {{len .Pending}}건</div>
+  <p class="hint mt-1">몇 분 안에 답하지 않으면 그 도구 호출은 실패로 끝납니다.</p>
+  {{range .Pending}}
+    <div class="mt-2 flex flex-wrap items-baseline gap-2 text-sm">
+      <a href="/runs/{{.RunID}}" class="font-medium text-go hover:underline">#{{.TaskNumber}} {{.TaskTitle}}</a>
+      <code class="font-mono text-xs">{{.Command}}</code>
+    </div>
+  {{end}}
+</div>
+{{end}}
+
 <h2 class="section">프로젝트 목록</h2>
 {{range .Projects}}
   <div class="row flex items-baseline justify-between gap-4">

@@ -1112,3 +1112,68 @@ func TestFailedBeforeStartReturnsTaskToBacklog(t *testing.T) {
 		t.Fatalf("task after a mid-run failure = %s, want in_progress kept", got.Status)
 	}
 }
+
+func TestPendingApprovalIsTrackedAndCleared(t *testing.T) {
+	s := openTemp(t)
+	p, task := seedRunningTask(t, s)
+
+	approval := func(seq uint64, reqID, useID, command string) protocol.Envelope {
+		env, err := protocol.NewEvent(protocol.EvApprovalRequested, "run-1", seq, map[string]any{
+			"body": map[string]any{"request_id": reqID, "tool_use_id": useID, "tool_name": "Bash", "input": map[string]any{"command": command}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		env.Seq = seq
+		return env
+	}
+	finished := func(seq uint64, useID string) protocol.Envelope {
+		env, err := protocol.NewEvent(protocol.EvToolFinished, "run-1", seq, map[string]any{
+			"body": map[string]any{"tool_use_id": useID, "is_error": false},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		env.Seq = seq
+		return env
+	}
+
+	if _, _, err := s.ApplyEvent(approval(1, "r1", "t1", "go test ./...")); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := s.PendingApprovals()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].RunID != "run-1" || pending[0].Command != "go test ./..." ||
+		pending[0].ProjectKey != p.Key || pending[0].TaskNumber != task.Number {
+		t.Fatalf("PendingApprovals = %+v", pending)
+	}
+
+	// 그 도구 호출이 끝나면(승인이든 거절이든 타임아웃이든) 대기가 아니다.
+	if _, _, err := s.ApplyEvent(finished(2, "t1")); err != nil {
+		t.Fatal(err)
+	}
+	if pending, _ = s.PendingApprovals(); len(pending) != 0 {
+		t.Fatalf("finished tool should clear the pending approval: %+v", pending)
+	}
+
+	// 다른 도구 호출의 완료는 지우지 않는다.
+	if _, _, err := s.ApplyEvent(approval(3, "r2", "t2", "git push")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.ApplyEvent(finished(4, "다른-id")); err != nil {
+		t.Fatal(err)
+	}
+	if pending, _ = s.PendingApprovals(); len(pending) != 1 {
+		t.Fatalf("an unrelated tool_finished cleared it: %+v", pending)
+	}
+
+	// Run이 끝나면 대기도 끝난다.
+	if _, _, err := s.ApplyEvent(stateEvent(t, "run-1", 5, StateFailed)); err != nil {
+		t.Fatal(err)
+	}
+	if pending, _ = s.PendingApprovals(); len(pending) != 0 {
+		t.Fatalf("a settled run should have no pending approval: %+v", pending)
+	}
+}
