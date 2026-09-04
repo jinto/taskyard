@@ -196,7 +196,7 @@ func TestProjectPageListsIssuesNewestFirst(t *testing.T) {
 	if second > first {
 		t.Errorf("issues are not newest first")
 	}
-	for _, want := range []string{"/projects/shop/issues/1", "/projects/shop/issues/2", `action="/projects/shop/issues"`, `action="/projects/shop/template"`, "{{issue}}"} {
+	for _, want := range []string{"/projects/shop/issues/1", "/projects/shop/issues/2", `action="/projects/shop/issues"`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("project page lacks %q:\n%s", want, body)
 		}
@@ -226,7 +226,7 @@ func TestUpdateSettingsSavesAllowedTools(t *testing.T) {
 		t.Fatalf("template = %q", p.ExecuteTemplate)
 	}
 
-	body := get(h, "/projects/shop").Body.String()
+	body := get(h, "/projects/shop/settings").Body.String()
 	if !strings.Contains(body, `name="allowed_tools"`) || !strings.Contains(body, "Bash(go test:*)") {
 		t.Fatalf("project page does not show allowed tools:\n%s", body)
 	}
@@ -873,7 +873,7 @@ func TestUpdateSettingsSavesPolicies(t *testing.T) {
 	if p.CreatePR || p.CleanupMerged {
 		t.Fatalf("unchecked boxes must save false: %+v", p)
 	}
-	body := get(h, "/projects/shop").Body.String()
+	body := get(h, "/projects/shop/settings").Body.String()
 	if !strings.Contains(body, `name="create_pr"`) || !strings.Contains(body, `name="cleanup_merged"`) {
 		t.Fatalf("project page lacks policy checkboxes:\n%s", body)
 	}
@@ -1019,7 +1019,7 @@ func TestUpdateSettingsSavesAnalyzeFields(t *testing.T) {
 	if p.AnalyzeTemplate != "분석 {{issue}}" || p.AnalyzeEnabled || p.AnalyzeSkipBelow != 120 {
 		t.Fatalf("analyze settings not saved: %+v", p)
 	}
-	body := get(h, "/projects/shop").Body.String()
+	body := get(h, "/projects/shop/settings").Body.String()
 	for _, want := range []string{`name="analyze_template"`, `name="analyze_enabled"`, `name="analyze_skip_below"`, "분석 {{issue}}"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("project page lacks %q", want)
@@ -1265,7 +1265,7 @@ func TestUpdateSettingsChangesRepoPathAndBranch(t *testing.T) {
 	if p, _ = st.GetProject("shop"); p.DefaultBranch != "main" {
 		t.Fatalf("empty branch should fall back to main, got %q", p.DefaultBranch)
 	}
-	body := get(h, "/projects/shop").Body.String()
+	body := get(h, "/projects/shop/settings").Body.String()
 	if !strings.Contains(body, `name="repo_path"`) || !strings.Contains(body, `name="default_branch"`) {
 		t.Fatal("project page lacks the repository fields")
 	}
@@ -1294,5 +1294,100 @@ func TestIndexListsPendingApprovals(t *testing.T) {
 	h.ServeHTTP(httptest.NewRecorder(), req)
 	if body := get(h, "/").Body.String(); strings.Contains(body, "go test ./...") {
 		t.Fatal("index still shows the approval after it was answered")
+	}
+}
+
+// ---- 칸반 보드 (linear/jira 식 화면) ----
+
+func TestProjectBoardPutsEachIssueInItsStatusColumn(t *testing.T) {
+	st, h := newServer(t)
+	p := seedProject(t, st, "shop", "/repos/shop")
+	for _, tc := range []struct{ title, status string }{
+		{"대기 이슈", store.TaskBacklog},
+		{"진행 이슈", store.TaskInProgress},
+		{"리뷰 이슈", store.TaskReview},
+		{"완료 이슈", store.TaskDone},
+	} {
+		task := seedTask(t, st, p, tc.title, "")
+		if err := st.UpdateTaskStatus(task.ID, tc.status); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	body := get(h, "/projects/shop").Body.String()
+	// 칸반은 순서가 곧 뜻이다: 왼쪽에서 오른쪽으로 대기 → 진행 → 리뷰 → 완료.
+	// 각 이슈는 자기 열 머리글 뒤, 다음 열 머리글 앞에 있어야 한다.
+	order := []string{"대기", "대기 이슈", "진행", "진행 이슈", "리뷰", "리뷰 이슈", "완료", "완료 이슈"}
+	at := -1
+	for _, want := range order {
+		i := strings.Index(body[at+1:], want)
+		if i < 0 {
+			t.Fatalf("보드에 %q 가 순서대로 없다:\n%s", want, body)
+		}
+		at += 1 + i
+	}
+}
+
+func TestProjectBoardCardShowsLatestRun(t *testing.T) {
+	st, h := newServer(t)
+	p := seedProject(t, st, "shop", "/repos/shop")
+	task := seedTask(t, st, p, "돌아가는 이슈", "")
+	if err := st.UpdateTaskStatus(task.ID, store.TaskInProgress); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertRun(store.Run{ID: "run-9", State: store.StateRunning, Kind: "structured", TaskID: task.ID, Stage: store.StageExecute}); err != nil {
+		t.Fatal(err)
+	}
+
+	body := get(h, "/projects/shop").Body.String()
+	for _, want := range []string{"/runs/run-9", store.StateRunning, store.StageExecute} {
+		if !strings.Contains(body, want) {
+			t.Errorf("카드에 %q 가 없다:\n%s", want, body)
+		}
+	}
+}
+
+func TestProjectBoardBacklogCardStartsARun(t *testing.T) {
+	st, hb, h := newServerWithHub(t)
+	got := attachRunner(t, hb, h)
+	p := seedProject(t, st, "shop", "/repos/shop")
+	seedTask(t, st, p, "아직 대기", "")
+
+	body := get(h, "/projects/shop").Body.String()
+	if !strings.Contains(body, `action="/projects/shop/issues/1/run"`) {
+		t.Fatalf("대기 카드에 실행 폼이 없다:\n%s", body)
+	}
+	if rec := postForm(h, "/projects/shop/issues/1/run", nil); rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	decodeStart(t, got, protocol.CmdRunStart)
+}
+
+func TestSettingsMovesOffTheBoard(t *testing.T) {
+	st, h := newServer(t)
+	seedProject(t, st, "shop", "/repos/shop")
+
+	board := get(h, "/projects/shop")
+	if strings.Contains(board.Body.String(), `name="execute_template"`) {
+		t.Error("보드에 설정 폼이 남아 있다 — 보드는 일감만 보여준다")
+	}
+	if !strings.Contains(board.Body.String(), "/projects/shop/settings") {
+		t.Error("보드에 설정으로 가는 링크가 없다")
+	}
+
+	rec := get(h, "/projects/shop/settings")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	for _, want := range []string{`action="/projects/shop/template"`, `name="execute_template"`, "{{issue}}"} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("설정 화면에 %q 가 없다", want)
+		}
+	}
+
+	// 저장하면 설정 화면으로 돌아온다 — 방금 고친 값을 확인할 수 있어야 한다.
+	saved := postForm(h, "/projects/shop/template", url.Values{"execute_template": {"t"}, "repo_path": {"/repos/shop"}})
+	if loc := saved.Header().Get("Location"); loc != "/projects/shop/settings" {
+		t.Errorf("Location = %q, want /projects/shop/settings", loc)
 	}
 }
