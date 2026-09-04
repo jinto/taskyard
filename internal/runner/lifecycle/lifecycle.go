@@ -505,6 +505,7 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, spec r
 	finish := func(state, detail string, salvageFirst bool) {
 		summary := takeSummary(spec.ws.Path)
 		attention, hasAttention := takeAttention(spec.ws.Path)
+		artifacts := takeArtifacts(spec.ws.Path)
 		if salvageFirst {
 			m.salvage(runID, spec.workspaceRunID, spec.git)
 		}
@@ -529,6 +530,7 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, spec r
 		if state != "succeeded" && state != "needs_attention" {
 			slog.Error("run failed", "run_id", runID, "state", state, "detail", detail)
 		}
+		m.emitArtifacts(runID, artifacts)
 		m.emitTerminal(runID, state, detail, session.SessionID, summary)
 	}
 
