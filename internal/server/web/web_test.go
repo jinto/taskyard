@@ -213,7 +213,7 @@ func TestUpdateSettingsSavesAllowedTools(t *testing.T) {
 
 	rec := postForm(h, "/projects/shop/template", url.Values{
 		"execute_template": {"t {{issue}}"}, "repo_path": {"/repos/shop"},
-		"allowed_tools":    {"Edit\r\n\r\n  Bash(go test:*)  \r\n"},
+		"allowed_tools": {"Edit\r\n\r\n  Bash(go test:*)  \r\n"},
 	})
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
@@ -238,7 +238,7 @@ func TestUpdateSettingsRejectsMalformedAllowedTools(t *testing.T) {
 
 	rec := postForm(h, "/projects/shop/template", url.Values{
 		"execute_template": {"t"}, "repo_path": {"/repos/shop"},
-		"allowed_tools":    {"Edit\n--dangerously-skip-permissions"},
+		"allowed_tools": {"Edit\n--dangerously-skip-permissions"},
 	})
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
