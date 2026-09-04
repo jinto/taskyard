@@ -62,6 +62,7 @@ func TestArtifactsIgnoreSubdirsSymlinksAndCapSize(t *testing.T) {
 		"mkdir -p .taskyard/artifacts/sub",
 		"echo deep > .taskyard/artifacts/sub/deep.txt",
 		"ln -s " + secret + " .taskyard/artifacts/link.txt",
+		"ln -s " + filepath.Dir(secret) + " .taskyard/artifacts/linkdir",
 		"head -c 307200 /dev/zero | tr '\\0' x > .taskyard/artifacts/big.txt",
 		"for i in $(seq -w 1 17); do echo $i > .taskyard/artifacts/f$i.txt; done",
 	}
@@ -86,6 +87,12 @@ func TestArtifactsIgnoreSubdirsSymlinksAndCapSize(t *testing.T) {
 	}
 	if _, ok := names["link.txt"]; ok {
 		t.Fatal("escaping symlink was collected")
+	}
+	if _, ok := names["linkdir"]; ok {
+		t.Fatal("symlinked directory was collected")
+	}
+	if _, err := os.Lstat(filepath.Dir(secret)); err != nil {
+		t.Fatal("removing the artifacts dir must not follow the symlinked directory")
 	}
 	big, ok := names["big.txt"]
 	if !ok || !big.Truncated || len(big.Content) != 256*1024 {

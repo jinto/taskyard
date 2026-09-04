@@ -102,10 +102,12 @@ func (l *Launcher) Start(p store.Project, task store.Task, o Options) (*store.Ru
 		return nil, err
 	}
 
+	// 보상: 이 시작이 올린 in_progress 만 되돌린다 — 그 사이 다른 전이(옛 PR의
+	// merge 등)가 들어왔으면 그것이 맞다.
 	abort := func(cause error) error {
 		run.State = store.StateFailed
 		_ = l.Store.UpsertRun(run)
-		_ = l.Store.UpdateTaskStatus(task.ID, task.Status)
+		_ = l.Store.UpdateTaskStatusIf(task.ID, store.TaskInProgress, task.Status)
 		return cause
 	}
 	if err := l.Store.UpdateTaskStatus(task.ID, store.TaskInProgress); err != nil {

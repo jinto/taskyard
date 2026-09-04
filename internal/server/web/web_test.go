@@ -1100,6 +1100,17 @@ func TestArtifactPageAndIssueListing(t *testing.T) {
 	if !strings.Contains(issue, `href="/runs/run-1/artifacts/analysis.md"`) {
 		t.Fatalf("issue page lacks artifact link:\n%s", issue)
 	}
+	// 이름에 ?·#·공백이 있어도 링크가 그 파일을 가리킨다.
+	if _, _, err := st.ApplyEvent(mustEvent(t, protocol.EvArtifactAdded, "run-1", 3, map[string]any{"name": "note s#1?.md", "content": "odd"})); err != nil {
+		t.Fatal(err)
+	}
+	issue = get(h, "/projects/"+p.Key+"/issues/1").Body.String()
+	if !strings.Contains(issue, `href="/runs/run-1/artifacts/note%20s%231%3F.md"`) {
+		t.Fatalf("odd artifact name not escaped in link:\n%s", issue)
+	}
+	if got := get(h, "/runs/run-1/artifacts/note%20s%231%3F.md"); got.Code != http.StatusOK || !strings.Contains(got.Body.String(), "odd") {
+		t.Fatalf("escaped link does not resolve: %d", got.Code)
+	}
 	run := get(h, "/runs/run-1").Body.String()
 	if !strings.Contains(run, `href="/runs/run-1/artifacts/analysis.md"`) {
 		t.Fatal("run page lacks artifact link")

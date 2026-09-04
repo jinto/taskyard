@@ -68,7 +68,7 @@ type Server struct {
 func New(st *store.Store, h *hub.Hub) (*Server, error) {
 	var err error
 	page := func(name string) *template.Template {
-		t, perr := template.New("layout.html").Funcs(template.FuncMap{"badge": badgeClass}).
+		t, perr := template.New("layout.html").Funcs(template.FuncMap{"badge": badgeClass, "seg": url.PathEscape}).
 			ParseFS(templateFS, "templates/layout.html", "templates/"+name)
 		if perr != nil && err == nil {
 			err = fmt.Errorf("parse %s: %w", name, perr)

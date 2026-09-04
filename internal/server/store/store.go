@@ -1073,3 +1073,12 @@ func (s *Store) TasksAwaitingExecute() ([]AwaitingExecute, error) {
 	}
 	return out, nil
 }
+
+// UpdateTaskStatusIf는 현재 상태가 from일 때만 to로 바꾼다. 실행 시작의 보상
+// (in_progress 로 올린 것을 되돌리기)이 그 사이 들어온 다른 전이를 덮지 않게.
+func (s *Store) UpdateTaskStatusIf(taskID, from, to string) error {
+	if _, err := s.db.Exec(`UPDATE tasks SET status = ? WHERE id = ? AND status = ?`, to, taskID, from); err != nil {
+		return fmt.Errorf("update task status if: %w", err)
+	}
+	return nil
+}

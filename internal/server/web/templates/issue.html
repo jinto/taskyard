@@ -72,7 +72,7 @@
     </div>
     <div class="hint mt-1 font-mono text-xs">{{.CreatedAt.Format "2006-01-02 15:04:05"}}{{if .Stage}} <span class="mx-1">·</span> {{.Stage}}{{end}}{{if .Branch}} <span class="mx-1">·</span> {{.Branch}}{{end}}{{if .PreviousRunID}} <span class="mx-1">·</span> ← {{.PreviousRunID}}{{end}}{{if .ReportRunID}} <span class="mx-1">·</span> 보고서 {{.ReportRunID}}{{end}}</div>
     {{if .Detail}}<div class="hint mt-1 line-clamp-2">{{.Detail}}</div>{{end}}
-    {{with index $.Artifacts .ID}}<div class="mt-1 flex flex-wrap gap-2 text-sm">{{range .}}<a href="/runs/{{.RunID}}/artifacts/{{.Name}}" class="text-go hover:underline">{{.Name}}</a>{{end}}</div>{{end}}
+    {{with index $.Artifacts .ID}}<div class="mt-1 flex flex-wrap gap-2 text-sm">{{range .}}<a href="/runs/{{.RunID}}/artifacts/{{seg .Name}}" class="text-go hover:underline">{{.Name}}</a>{{end}}</div>{{end}}
   </div>
 {{else}}
   <p class="hint">아직 실행이 없습니다.</p>
