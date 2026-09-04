@@ -23,6 +23,9 @@
 
 <h2 class="section">실행 설정</h2>
 <form method="post" action="/projects/{{.Project.Key}}/template" class="max-w-xl space-y-4">
+  <label class="field"><span>저장소 경로</span><input type="text" name="repo_path" value="{{.Project.RepoPath}}" required></label>
+  <p class="hint -mt-2">러너 머신의 절대 경로이며, 러너의 <code>--allow-repo</code> 목록에 있어야 합니다.</p>
+  <label class="field"><span>기본 브랜치</span><input type="text" name="default_branch" value="{{.Project.DefaultBranch}}" placeholder="main"></label>
   <label class="field"><span>실행 템플릿</span><textarea name="execute_template" rows="14">{{.Project.ExecuteTemplate}}</textarea></label>
   <p class="hint -mt-2"><code>{{"{{issue}}"}}</code>는 이슈 번호·제목·본문, <code>{{"{{memory}}"}}</code>는 저장소의 <code>.taskyard/memory.md</code>, <code>{{"{{previous_run}}"}}</code>과 <code>{{"{{feedback}}"}}</code>은 재시도 정보로 치환됩니다.</p>
   <label class="field"><span>승인 없이 허용할 도구 (한 줄에 하나)</span><textarea name="allowed_tools" rows="4" placeholder="Edit&#10;Bash(go test:*)">{{range .Project.AllowedTools}}{{.}}

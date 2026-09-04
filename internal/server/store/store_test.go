@@ -1077,3 +1077,38 @@ func TestTasksAwaitingExecute(t *testing.T) {
 		t.Fatalf("TasksAwaitingExecute = %+v; want only task one with t1-a", got)
 	}
 }
+
+func TestFailedBeforeStartReturnsTaskToBacklog(t *testing.T) {
+	s := openTemp(t)
+	_, task := seedRunningTask(t, s)
+
+	// 에이전트가 시작조차 못 한 실패(허용되지 않은 저장소 등)는 이슈를
+	// backlog로 되돌린다 — 작업대에 아무것도 없으니 재시도가 아니라 다시 시작이다.
+	env, err := protocol.NewEvent(protocol.EvRunStateChanged, "run-1", 1, map[string]any{
+		"body": map[string]any{"state": StateFailed, "detail": "repository not allowed", "before_start": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.Seq = 1
+	if _, _, err := s.ApplyEvent(env); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetTaskByID(task.ID); got.Status != TaskBacklog {
+		t.Fatalf("task = %s, want backlog", got.Status)
+	}
+
+	// 시작한 뒤의 실패는 그대로 둔다 — worktree에 작업이 남아 재시도할 수 있다.
+	if err := s.UpdateTaskStatus(task.ID, TaskInProgress); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertRun(Run{ID: "run-2", State: StateRunning, Kind: "structured", TaskID: task.ID, Stage: StageExecute}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.ApplyEvent(stateEventWith(t, "run-2", 1, StateFailed, "agent exited: 1", "")); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetTaskByID(task.ID); got.Status != TaskInProgress {
+		t.Fatalf("task after a mid-run failure = %s, want in_progress kept", got.Status)
+	}
+}

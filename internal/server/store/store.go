@@ -275,6 +275,8 @@ type Project struct {
 
 // ProjectSettings는 설정 폼이 한 번에 저장하는 필드들이다.
 type ProjectSettings struct {
+	RepoPath         string
+	DefaultBranch    string
 	ExecuteTemplate  string
 	AllowedTools     []string
 	CreatePR         bool
@@ -566,6 +568,10 @@ func applyStateChange(tx *sql.Tx, env protocol.Envelope, current, stage, taskID 
 			Detail    string `json:"detail"`
 			SessionID string `json:"session_id"`
 			Summary   string `json:"summary"`
+			// BeforeStart는 에이전트가 시작조차 못 한 실패다(허용되지 않은
+			// 저장소, 러너 바쁨 등). 작업대에 아무것도 없으므로 이슈는
+			// backlog로 돌아간다 — 재시도가 아니라 다시 시작이다.
+			BeforeStart bool `json:"before_start"`
 		} `json:"body"`
 	}
 	if err := json.Unmarshal(env.Body, &outer); err != nil || outer.Body.State == "" {
@@ -590,6 +596,9 @@ func applyStateChange(tx *sql.Tx, env protocol.Envelope, current, stage, taskID 
 		if _, err := tx.Exec(`UPDATE runs SET provider_session_id = ? WHERE id = ?`, outer.Body.SessionID, env.RunID); err != nil {
 			return fmt.Errorf("update run session: %w", err)
 		}
+	}
+	if outer.Body.BeforeStart && next == StateFailed {
+		return moveTaskFor(tx, StateCancelled, stage, taskID) // cancelled와 같은 자리 — backlog
 	}
 	return moveTaskFor(tx, next, stage, taskID)
 }
@@ -859,9 +868,10 @@ func (s *Store) ListProjects() ([]Project, error) {
 // 호출자(웹 폼)의 몫이다.
 func (s *Store) UpdateProjectSettings(key string, st ProjectSettings) error {
 	res, err := s.db.Exec(
-		`UPDATE projects SET execute_template = ?, allowed_tools = ?, create_pr = ?, cleanup_merged = ?,
+		`UPDATE projects SET repo_path = ?, default_branch = ?, execute_template = ?, allowed_tools = ?,
+		                     create_pr = ?, cleanup_merged = ?,
 		                     analyze_template = ?, analyze_enabled = ?, analyze_skip_below = ? WHERE key = ?`,
-		st.ExecuteTemplate, joinTools(st.AllowedTools), st.CreatePR, st.CleanupMerged,
+		st.RepoPath, st.DefaultBranch, st.ExecuteTemplate, joinTools(st.AllowedTools), st.CreatePR, st.CleanupMerged,
 		st.AnalyzeTemplate, st.AnalyzeEnabled, st.AnalyzeSkipBelow, key)
 	if err != nil {
 		return fmt.Errorf("update project settings: %w", err)

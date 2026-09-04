@@ -1252,3 +1252,55 @@ func TestApprovalRequestBecomesAnEventAndDecisionFlowsBack(t *testing.T) {
 		t.Fatalf("blocked tools/call did not resolve to an allow result: %s", rpcResp.Result.Content[0].Text)
 	}
 }
+
+// TestRepoNotAllowedMarksFailureBeforeStart: 에이전트가 시작도 못 한 실패는
+// 종결 이벤트에 before_start를 실어 서버가 이슈를 backlog로 되돌리게 한다.
+func TestRepoNotAllowedMarksFailureBeforeStart(t *testing.T) {
+	col := &collector{}
+	h := newHarness(t, col)
+	env := startCommand(t, "run-1", protocol.RunStartBody{Prompt: "p", RepoPath: "/nope"})
+	if err := h.m.HandleCommand(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+	// 시작 전 실패는 running 없이 종결 하나만 낸다.
+	waitFor(t, "the terminal state event", func() bool { return col.count(protocol.EvRunStateChanged) >= 1 })
+
+	last := lastState(t, col, "run-1")
+	if last.state != "failed" {
+		t.Fatalf("state = %+v", last)
+	}
+	if !beforeStartFlag(t, col, "run-1") {
+		t.Fatal("a failure before the agent started must carry before_start")
+	}
+}
+
+func TestAgentFailureIsNotMarkedBeforeStart(t *testing.T) {
+	col := &collector{}
+	h := newHarness(t, col, withBinary(dirtyThenFail(t)))
+	if err := h.m.HandleCommand(context.Background(), h.start(t, "run-1", "do it")); err != nil {
+		t.Fatal(err)
+	}
+	waitTerminal(t, col)
+	if beforeStartFlag(t, col, "run-1") {
+		t.Fatal("a failure after the agent ran must not carry before_start")
+	}
+}
+
+func beforeStartFlag(t *testing.T, col *collector, runID string) bool {
+	t.Helper()
+	for _, e := range col.snapshot() {
+		if e.RunID != runID || e.Type != protocol.EvRunStateChanged {
+			continue
+		}
+		var wrapper struct {
+			Body map[string]any `json:"body"`
+		}
+		if err := json.Unmarshal(e.Body, &wrapper); err != nil {
+			t.Fatal(err)
+		}
+		if v, ok := wrapper.Body["before_start"].(bool); ok && v {
+			return true
+		}
+	}
+	return false
+}
