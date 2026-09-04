@@ -359,3 +359,40 @@ func readTestEnvelope(t *testing.T, ctx context.Context, conn *websocket.Conn) p
 	}
 	return env
 }
+
+// TestSettledSignalDoesNotBlockReadLoop: 아무도 Settled()를 읽지 않아도 이벤트는
+// 전부 ack된다(신호는 크기 1, non-blocking). 읽으면 신호가 와 있다. 접속 훅도
+// 불린다.
+func TestSettledSignalDoesNotBlockReadLoop(t *testing.T) {
+	r := newRig(t, nil)
+	connected := make(chan struct{}, 1)
+	r.hub.OnConnect = func() { connected <- struct{}{} }
+	if err := r.st.UpsertRun(store.Run{ID: "run-1", State: store.StateRunning, Kind: "structured"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.link.Run(ctx)
+	waitFor(t, "runner connection", r.hub.Connected)
+	select {
+	case <-connected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnConnect was not called")
+	}
+
+	for i := 0; i < 10; i++ {
+		env, _ := protocol.NewEvent(protocol.EvRunStateChanged, "run-1", 0, map[string]any{"body": map[string]any{"state": "running"}})
+		if err := r.link.Publish("run-1", env); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, "10 events acked with nobody reading Settled()", func() bool {
+		run, err := r.st.GetRun("run-1")
+		return err == nil && run.LastAckedSeq == 10
+	})
+	select {
+	case <-r.hub.Settled():
+	default:
+		t.Fatal("Settled() should have a pending signal")
+	}
+}
