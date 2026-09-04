@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -118,6 +119,35 @@ func TestDefaultTemplatesForStages(t *testing.T) {
 	for _, forbidden := range []string{"gh ", "git commit"} {
 		if strings.Contains(DefaultAnalyzeTemplate, forbidden) {
 			t.Errorf("DefaultAnalyzeTemplate must not instruct %q", forbidden)
+		}
+	}
+}
+
+func TestDefaultAllowedToolsAreSafeAndValid(t *testing.T) {
+	if len(DefaultAllowedTools) == 0 {
+		t.Fatal("new projects should start with a working allow list, not an empty one")
+	}
+	for _, want := range []string{"Read", "Edit", "Write"} {
+		if !slices.Contains(DefaultAllowedTools, want) {
+			t.Errorf("DefaultAllowedTools lacks %q", want)
+		}
+	}
+	// 되돌릴 수 없는 것은 기본으로 허용하지 않는다 — 사람이 직접 넣게 둔다.
+	for _, tool := range DefaultAllowedTools {
+		for _, forbidden := range []string{"git push", "git reset", "rm", "gh ", "curl", "Bash(git:*)", "Bash(*)"} {
+			if strings.Contains(tool, forbidden) {
+				t.Errorf("DefaultAllowedTools must not pre-approve %q (found in %q)", forbidden, tool)
+			}
+		}
+	}
+}
+
+func TestTemplatesTellAgentNotToChainCommands(t *testing.T) {
+	// 승인 규칙은 명령 문자열의 접두사로 맞춘다. 여러 명령을 ;나 &&로 묶으면
+	// 어떤 규칙에도 안 맞아 사람을 기다리게 된다(2026-09-04 관측).
+	for name, tmpl := range map[string]string{"execute": DefaultExecuteTemplate, "analyze": DefaultAnalyzeTemplate} {
+		if !strings.Contains(tmpl, "하나씩") {
+			t.Errorf("%s template does not tell the agent to run commands one at a time", name)
 		}
 	}
 }

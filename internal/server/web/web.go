@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -149,6 +150,7 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 		RepoPath:         r.FormValue("repo_path"),
 		DefaultBranch:    r.FormValue("default_branch"),
 		ExecuteTemplate:  pipeline.DefaultExecuteTemplate,
+		AllowedTools:     pipeline.DefaultAllowedTools,
 		CreatePR:         r.FormValue("create_pr") != "",
 		CleanupMerged:    r.FormValue("cleanup_merged") != "",
 		AnalyzeEnabled:   true,
@@ -512,6 +514,8 @@ type eventView struct {
 	// 없이 갱신하기 위해 서버가 배지 스타일까지 정해 보낸다.
 	State string `json:"state,omitempty"`
 	Badge string `json:"badge,omitempty"`
+	// Rule은 승인 요청에서 만든 "앞으로 허용" 규칙이다. 만들 수 없으면 빈 값.
+	Rule string `json:"rule,omitempty"`
 }
 
 // firstLine은 여러 줄 텍스트에서 비어 있지 않은 첫 줄을 max 글자까지 돌려준다.
@@ -602,6 +606,8 @@ func summarize(env protocol.Envelope) eventView {
 		view.RequestID, _ = outer.Body["request_id"].(string)
 		view.ToolUseID, _ = outer.Body["tool_use_id"].(string)
 		view.Input = describeInput(outer.Body["input"])
+		input, _ := outer.Body["input"].(map[string]any)
+		view.Rule = SuggestRule(name, input)
 		view.Summary = "승인 요청: " + name
 		if view.Input != "" {
 			view.Summary += ": " + view.Input
@@ -707,6 +713,101 @@ type approveRequest struct {
 	RequestID string `json:"request_id"`
 	Allow     bool   `json:"allow"`
 	Message   string `json:"message"`
+	// Remember가 참이면 이 도구 호출에 해당하는 규칙을 프로젝트 허용 목록에
+	// 넣는다 — 다음 Run부터 묻지 않는다. 진행 중인 Run은 시작할 때 받은
+	// 목록으로 돌므로 이번 실행에서는 계속 묻는다.
+	Remember bool `json:"remember"`
+}
+
+// multiWordCommands는 첫 낱말만으로는 너무 넓은 명령이다. "git" 하나를 허용하면
+// push·reset까지 허용된다 — 두 낱말까지 규칙에 넣는다.
+var multiWordCommands = map[string]bool{
+	"git": true, "go": true, "gh": true, "npm": true, "pnpm": true, "yarn": true,
+	"cargo": true, "docker": true, "kubectl": true, "uv": true, "make": true, "brew": true,
+}
+
+// SuggestRule은 승인 요청 하나에서 "앞으로 허용" 규칙을 만든다. Bash는 명령의
+// 첫 낱말(멀티플렉서면 둘째까지), 나머지는 도구 이름 그대로. 규칙으로 만들 수
+// 없으면 빈 문자열 — 여러 명령을 묶은 것이 대표적이다(어떤 접두사 규칙에도
+// 맞지 않으므로 허용해 봐야 소용이 없다).
+func SuggestRule(toolName string, input map[string]any) string {
+	if toolName == "" {
+		return ""
+	}
+	if toolName != "Bash" {
+		if claudecode.CheckAllowedTools([]string{toolName}) != nil {
+			return ""
+		}
+		return toolName
+	}
+	command, _ := input["command"].(string)
+	if strings.ContainsAny(command, ";&|\n") {
+		return ""
+	}
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return ""
+	}
+	prefix := fields[0]
+	if multiWordCommands[prefix] && len(fields) > 1 {
+		prefix += " " + fields[1]
+	}
+	rule := "Bash(" + prefix + ":*)"
+	if claudecode.CheckAllowedTools([]string{rule}) != nil {
+		return ""
+	}
+	return rule
+}
+
+// rememberRule은 승인된 도구의 규칙을 프로젝트 허용 목록에 더한다. 이미 있으면
+// 아무것도 하지 않는다.
+func (s *Server) rememberRule(runID, requestID string) {
+	run, err := s.st.GetRun(runID)
+	if err != nil || run.TaskID == "" {
+		return
+	}
+	events, err := s.st.Events(runID, 0, 500)
+	if err != nil {
+		return
+	}
+	rule := ""
+	for _, env := range events {
+		if env.Type != protocol.EvApprovalRequested {
+			continue
+		}
+		var outer struct {
+			Body map[string]any `json:"body"`
+		}
+		if json.Unmarshal(env.Body, &outer) != nil {
+			continue
+		}
+		if id, _ := outer.Body["request_id"].(string); id != requestID {
+			continue
+		}
+		name, _ := outer.Body["tool_name"].(string)
+		input, _ := outer.Body["input"].(map[string]any)
+		rule = SuggestRule(name, input)
+	}
+	if rule == "" {
+		return
+	}
+	task, err := s.st.GetTaskByID(run.TaskID)
+	if err != nil {
+		return
+	}
+	p, err := s.st.GetProjectByID(task.ProjectID)
+	if err != nil || slices.Contains(p.AllowedTools, rule) {
+		return
+	}
+	if err := s.st.UpdateProjectSettings(p.Key, store.ProjectSettings{
+		ExecuteTemplate: p.ExecuteTemplate, AllowedTools: append(p.AllowedTools, rule),
+		CreatePR: p.CreatePR, CleanupMerged: p.CleanupMerged,
+		AnalyzeTemplate: p.AnalyzeTemplate, AnalyzeEnabled: p.AnalyzeEnabled, AnalyzeSkipBelow: p.AnalyzeSkipBelow,
+	}); err != nil {
+		slog.Error("remember rule failed", "project", p.Key, "rule", rule, "err", err)
+		return
+	}
+	slog.Info("remembered approval rule", "project", p.Key, "rule", rule)
 }
 
 func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
@@ -726,6 +827,10 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
+	}
+
+	if body.Allow && body.Remember {
+		s.rememberRule(id, body.RequestID)
 	}
 
 	// Runner가 없으면 결정이 갈 곳이 없다. 성공으로 위장하지 않는다 —

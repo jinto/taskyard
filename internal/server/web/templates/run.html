@@ -13,15 +13,17 @@
   <div class="text-sm font-semibold text-attention">승인이 필요합니다</div>
   <div class="mt-1 whitespace-pre-wrap font-mono text-sm" id="approval-text"></div>
   <div class="hint mt-1 font-mono text-xs" id="approval-tool-use-id"></div>
-  <div class="mt-3 flex gap-2">
+  <div class="mt-3 flex flex-wrap gap-2">
     <button onclick="decide(true)" class="btn btn-attention">승인</button>
+    <button onclick="decide(true, true)" class="btn" id="approval-remember" hidden></button>
     <button onclick="decide(false)" class="btn">거절</button>
   </div>
+  <p class="hint mt-2" id="approval-remember-hint" hidden>앞으로 허용하면 프로젝트 설정에 규칙이 들어갑니다. 다음 실행부터 묻지 않습니다.</p>
 </div>
 
 <div id="events" class="mt-6 max-h-[65vh] overflow-y-auto rounded border border-line font-mono text-[13px] dark:border-zinc-800">
 {{range .Events}}
-  <div class="flex gap-3 border-b border-line px-3 py-1.5 dark:border-zinc-800"><span class="w-40 shrink-0 text-muted">{{.Type}}</span><span class="min-w-0 whitespace-pre-wrap break-words">{{.Summary}}</span></div>
+  <div class="flex gap-3 border-b border-line px-3 py-1.5 dark:border-zinc-800"><span class="w-40 shrink-0 text-muted">{{.Type}}</span><span class="min-w-0 whitespace-pre-wrap break-words">{{.Summary}}{{if .Rule}} <span class="hint">— 앞으로 허용: {{.Rule}}</span>{{end}}</span></div>
 {{end}}
 </div>
 
@@ -34,6 +36,9 @@
   const text = document.getElementById("approval-text");
   const toolUseIDLabel = document.getElementById("approval-tool-use-id");
   let pendingRequestID = null;
+  let pendingRule = null;
+  const rememberBtn = document.getElementById("approval-remember");
+  const rememberHint = document.getElementById("approval-remember-hint");
 
   const source = new EventSource("/runs/" + runID + "/stream");
 
@@ -60,21 +65,26 @@
     }
     if (ev.type === "approval_requested") {
       pendingRequestID = ev.request_id;
+      pendingRule = ev.rule || null;
       text.textContent = ev.input || ev.summary;
       toolUseIDLabel.textContent = ev.tool_use_id ? "도구 호출 ID: " + ev.tool_use_id : "";
+      rememberBtn.textContent = pendingRule ? "승인하고 앞으로 " + pendingRule + " 허용" : "";
+      rememberBtn.hidden = !pendingRule;
+      rememberHint.hidden = !pendingRule;
       panel.hidden = false;
     }
   };
 
-  window.decide = function (allow) {
+  window.decide = function (allow, remember) {
     if (!pendingRequestID) return;
     fetch("/runs/" + runID + "/approve", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ request_id: pendingRequestID, allow: allow })
+      body: JSON.stringify({ request_id: pendingRequestID, allow: allow, remember: !!remember })
     });
     panel.hidden = true;
     pendingRequestID = null;
+    pendingRule = null;
   };
 })();
 </script>
