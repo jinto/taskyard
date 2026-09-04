@@ -393,7 +393,7 @@ func (m *Manager) failBeforeStart(env protocol.Envelope, body protocol.RunStartB
 		RepoPath:       repoPath,
 		WorkspaceRunID: wsID,
 	})
-	m.emitTerminal(env.RunID, "failed", cause.Error(), "", "")
+	m.emitFailedBeforeStart(env.RunID, cause.Error())
 	return nil
 }
 
@@ -416,6 +416,11 @@ func (m *Manager) execute(ctx context.Context, cancel context.CancelFunc, spec r
 			slog.Error("run failed", "run_id", runID, "err", err)
 		}
 		_ = m.cfg.Spool.SaveRun(spec.record(state))
+		if state == "failed" {
+			// 프로세스를 띄우지도 못했다. 취소는 사람의 행동이니 그대로 둔다.
+			m.emitFailedBeforeStart(runID, detail)
+			return
+		}
 		m.emitTerminal(runID, state, detail, "", "")
 	}
 
@@ -646,6 +651,13 @@ func (m *Manager) emitState(runID, state, detail string) {
 // emitTerminal은 종결·정착 상태를 알린다. session_id를 함께 실어 Server가
 // 이어서 재시도에 쓸 세션을 알게 한다. 비어 있으면 싣지 않는다 — Server는
 // 알던 세션을 빈 값으로 지우지 않는다.
+// emitFailedBeforeStart는 에이전트가 시작조차 못 한 실패다. 서버는 이 표시를
+// 보고 이슈를 backlog로 되돌린다 — worktree에 아무것도 없으므로 재시도할 것이
+// 없다.
+func (m *Manager) emitFailedBeforeStart(runID, detail string) {
+	m.publishState(runID, map[string]any{"state": "failed", "detail": detail, "before_start": true})
+}
+
 func (m *Manager) emitTerminal(runID, state, detail, sessionID, summary string) {
 	body := map[string]any{"state": state, "detail": detail}
 	if sessionID != "" {

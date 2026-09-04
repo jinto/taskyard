@@ -211,7 +211,7 @@ func TestUpdateSettingsSavesAllowedTools(t *testing.T) {
 	seedProject(t, st, "shop", "/repos/shop")
 
 	rec := postForm(h, "/projects/shop/template", url.Values{
-		"execute_template": {"t {{issue}}"},
+		"execute_template": {"t {{issue}}"}, "repo_path": {"/repos/shop"},
 		"allowed_tools":    {"Edit\r\n\r\n  Bash(go test:*)  \r\n"},
 	})
 	if rec.Code != http.StatusSeeOther {
@@ -236,7 +236,7 @@ func TestUpdateSettingsRejectsMalformedAllowedTools(t *testing.T) {
 	seedProject(t, st, "shop", "/repos/shop")
 
 	rec := postForm(h, "/projects/shop/template", url.Values{
-		"execute_template": {"t"},
+		"execute_template": {"t"}, "repo_path": {"/repos/shop"},
 		"allowed_tools":    {"Edit\n--dangerously-skip-permissions"},
 	})
 	if rec.Code != http.StatusBadRequest {
@@ -270,7 +270,7 @@ func TestUpdateTemplateFromProjectPage(t *testing.T) {
 	st, h := newServer(t)
 	seedProject(t, st, "shop", "/repos/shop")
 
-	rec := postForm(h, "/projects/shop/template", url.Values{"execute_template": {"새 템플릿 {{issue}}"}})
+	rec := postForm(h, "/projects/shop/template", url.Values{"execute_template": {"새 템플릿 {{issue}}"}, "repo_path": {"/repos/shop"}})
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("status = %d, want 303", rec.Code)
 	}
@@ -854,7 +854,7 @@ func TestUpdateSettingsSavesPolicies(t *testing.T) {
 
 	// 체크박스 둘 다 켬.
 	rec := postForm(h, "/projects/shop/template", url.Values{
-		"execute_template": {"t"}, "create_pr": {"on"}, "cleanup_merged": {"on"},
+		"execute_template": {"t"}, "repo_path": {"/repos/shop"}, "create_pr": {"on"}, "cleanup_merged": {"on"},
 	})
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
@@ -864,7 +864,7 @@ func TestUpdateSettingsSavesPolicies(t *testing.T) {
 		t.Fatalf("policies not saved: %+v", p)
 	}
 	// 체크박스는 안 보내면 false다.
-	rec = postForm(h, "/projects/shop/template", url.Values{"execute_template": {"t"}})
+	rec = postForm(h, "/projects/shop/template", url.Values{"execute_template": {"t"}, "repo_path": {"/repos/shop"}})
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("status = %d", rec.Code)
 	}
@@ -1008,7 +1008,7 @@ func TestUpdateSettingsSavesAnalyzeFields(t *testing.T) {
 	st, h := newServer(t)
 	seedProject(t, st, "shop", "/repos/shop")
 	rec := postForm(h, "/projects/shop/template", url.Values{
-		"execute_template": {"t"}, "analyze_template": {"분석 {{issue}}"}, "analyze_skip_below": {"120"},
+		"execute_template": {"t"}, "repo_path": {"/repos/shop"}, "analyze_template": {"분석 {{issue}}"}, "analyze_skip_below": {"120"},
 		// analyze_enabled 체크 안 함 → false
 	})
 	if rec.Code != http.StatusSeeOther {

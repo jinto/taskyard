@@ -217,6 +217,15 @@ func (s *Server) handleTemplateUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "허용 도구 형식이 잘못됐습니다: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	repoPath := strings.TrimSpace(r.FormValue("repo_path"))
+	if !filepath.IsAbs(repoPath) {
+		http.Error(w, "저장소 경로는 러너 머신의 절대 경로여야 합니다", http.StatusBadRequest)
+		return
+	}
+	branch := strings.TrimSpace(r.FormValue("default_branch"))
+	if branch == "" {
+		branch = "main"
+	}
 	skipBelow := 0
 	if v := strings.TrimSpace(r.FormValue("analyze_skip_below")); v != "" {
 		n, err := strconv.Atoi(v)
@@ -228,6 +237,8 @@ func (s *Server) handleTemplateUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	// 체크박스는 안 보내면 false — 폼이 항상 그 필드들을 다루므로 그대로 저장한다.
 	if err := s.st.UpdateProjectSettings(p.Key, store.ProjectSettings{
+		RepoPath:         repoPath,
+		DefaultBranch:    branch,
 		ExecuteTemplate:  r.FormValue("execute_template"),
 		AllowedTools:     tools,
 		CreatePR:         r.FormValue("create_pr") != "",
@@ -800,6 +811,7 @@ func (s *Server) rememberRule(runID, requestID string) {
 		return
 	}
 	if err := s.st.UpdateProjectSettings(p.Key, store.ProjectSettings{
+		RepoPath: p.RepoPath, DefaultBranch: p.DefaultBranch,
 		ExecuteTemplate: p.ExecuteTemplate, AllowedTools: append(p.AllowedTools, rule),
 		CreatePR: p.CreatePR, CleanupMerged: p.CleanupMerged,
 		AnalyzeTemplate: p.AnalyzeTemplate, AnalyzeEnabled: p.AnalyzeEnabled, AnalyzeSkipBelow: p.AnalyzeSkipBelow,

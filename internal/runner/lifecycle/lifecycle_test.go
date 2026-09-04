@@ -1262,7 +1262,8 @@ func TestRepoNotAllowedMarksFailureBeforeStart(t *testing.T) {
 	if err := h.m.HandleCommand(context.Background(), env); err != nil {
 		t.Fatal(err)
 	}
-	waitTerminal(t, col)
+	// 시작 전 실패는 running 없이 종결 하나만 낸다.
+	waitFor(t, "the terminal state event", func() bool { return col.count(protocol.EvRunStateChanged) >= 1 })
 
 	last := lastState(t, col, "run-1")
 	if last.state != "failed" {
