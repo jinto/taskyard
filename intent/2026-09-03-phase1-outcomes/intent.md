@@ -1,7 +1,8 @@
 # Intent: Phase 1 — 종료 방식 5종과 재시도
 
 - Date: 2026-09-03
-- Status: retroactive — spec.md/plan.md에서 2026-10-20 재구성
+- Status: done — PR #4 merge 853be30 (2026-09-03); 취소·멈추고 보고·재시도 인수 테스트 56bb9d8
+- Origin: retroactive — spec.md/plan.md에서 2026-10-20 재구성
 - Next: plan.md
 
 ## Problem

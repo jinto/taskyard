@@ -1,7 +1,8 @@
 # Intent: Taskyard Phase 0 수직 스파이크
 
 - Date: 2026-08-21
-- Status: retroactive — spec.md/plan.md에서 2026-10-20 재구성
+- Status: done — PR #1 merge 60a060c (2026-09-02); "Phase 0 완료 판정 통과" ce08f26
+- Origin: retroactive — spec.md/plan.md에서 2026-10-20 재구성
 - Next: plan.md
 
 ## Problem

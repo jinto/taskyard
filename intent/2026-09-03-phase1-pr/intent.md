@@ -1,7 +1,8 @@
 # Intent: Phase 1 — PR 생성·추적과 merge 후 정리
 
 - Date: 2026-09-03
-- Status: retroactive — spec.md/plan.md에서 2026-10-20 재구성
+- Status: done — PR #7 merge 32affb9 (2026-09-03); PR 생성→merge→done→worktree 정리 인수 테스트 3161799
+- Origin: retroactive — spec.md/plan.md에서 2026-10-20 재구성
 - Next: plan.md
 
 ## Problem
