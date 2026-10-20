@@ -2,7 +2,7 @@
 
 > 이 문서는 Phase 0 실행 중 발견됐으나 의도적으로 미룬 것들의 기록이다.
 > 12개 Task 리뷰 + 최종 전체 브랜치 리뷰에서 나온 항목을 정리했다.
-> 관련 계획: `docs/superpowers/plans/2026-08-21-taskyard-phase0-spike.md`
+> 관련 계획: `intent/2026-08-21-taskyard-phase0-spike/plan.md`
 
 ## §16.0 완료 판정 결과
 
