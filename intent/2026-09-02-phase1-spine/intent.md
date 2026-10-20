@@ -1,7 +1,8 @@
 # Intent: Phase 1 척추 — 프로젝트·이슈에서 실행까지
 
 - Date: 2026-09-02
-- Status: retroactive — spec.md/plan.md에서 2026-10-20 재구성
+- Status: done — PR #3 merge 214843e (2026-09-03), "이슈에서 실행까지 척추 관통" b616fcc
+- Origin: retroactive — spec.md/plan.md에서 2026-10-20 재구성
 - Next: plan.md
 
 ## Problem

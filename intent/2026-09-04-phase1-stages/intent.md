@@ -1,7 +1,8 @@
 # Intent: Phase 1 — 산출물과 1단계(분석·설계)
 
 - Date: 2026-09-04
-- Status: retroactive — spec.md/plan.md에서 2026-10-20 재구성
+- Status: done — PR #11 merge 5e86ef4 (2026-09-04); 1단계→산출물→자동 2단계 인수 테스트 4f7bdf7
+- Origin: retroactive — spec.md/plan.md에서 2026-10-20 재구성
 - Next: plan.md
 
 ## Problem
